@@ -89,12 +89,37 @@ struct Job {
     dispatched: Instant,
 }
 
+/// What the handler asked for, on top of having failed.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum Directive {
+    /// Apply the task's own retry policy.
+    #[default]
+    Policy,
+    /// Skip the remaining attempts: this will not start working.
+    Reject,
+    /// Hand it back after this many milliseconds, still charged an attempt.
+    RetryAfter(u32),
+}
+
+impl Directive {
+    fn read(items: &[Value]) -> Directive {
+        match items.get(4).and_then(|v| v.as_str()) {
+            Some("reject") => Directive::Reject,
+            Some("retry") => {
+                Directive::RetryAfter(items.get(5).and_then(|v| v.as_u64()).unwrap_or(0) as u32)
+            }
+            _ => Directive::Policy,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct Outcome {
     ok: bool,
     result: Vec<u8>,
     error_type: String,
     traceback: String,
+    directive: Directive,
 }
 
 impl Outcome {
@@ -104,6 +129,7 @@ impl Outcome {
             result: Vec::new(),
             error_type: error_type.into(),
             traceback,
+            directive: Directive::Policy,
         }
     }
 }
@@ -283,6 +309,37 @@ impl Shared {
             .await;
     }
 
+    /// Publish how far a running task has got, under the same expiry as its
+    /// result. A progress record that outlives interest in the result is a leak
+    /// that reports on itself.
+    async fn keep_progress(&self, job: &Job, blob: Vec<u8>) {
+        if job.id.is_empty() {
+            return;
+        }
+        let ttl = self
+            .specs
+            .lock()
+            .unwrap()
+            .get(&job.name)
+            .map(|s| s.result_ttl_ms)
+            .unwrap_or(0);
+        if ttl == 0 {
+            return;
+        }
+        if self
+            .broker
+            .store_result(
+                &format!("progress:{}", job.id),
+                blob,
+                Duration::from_millis(ttl),
+            )
+            .await
+            .is_err()
+        {
+            self.counters.broker_errors.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// Retry with backoff while attempts remain, then dead-letter.
     ///
     /// `attempt` is what the broker counted, not what this process remembers,
@@ -290,8 +347,14 @@ impl Shared {
     async fn fail_job(&self, job: Job, outcome: Outcome) {
         let spec = self.specs.lock().unwrap().get(&job.name).cloned();
         let retries = spec.as_ref().map(|s| s.retries).unwrap_or(0);
-        if job.attempt <= retries {
-            let delay = backoff_for(spec.as_ref(), job.attempt, &job.id);
+        // A rejection skips whatever attempts are left: the handler is saying
+        // more of them would reach the same answer more slowly.
+        let rejected = outcome.directive == Directive::Reject;
+        if !rejected && job.attempt <= retries {
+            let delay = match outcome.directive {
+                Directive::RetryAfter(ms) => Duration::from_millis(u64::from(ms)),
+                _ => backoff_for(spec.as_ref(), job.attempt, &job.id),
+            };
             self.counters.retried.fetch_add(1, Ordering::Relaxed);
             if self.broker.retry(&job.receipt, delay).await.is_err() {
                 self.counters.broker_errors.fetch_add(1, Ordering::Relaxed);
@@ -797,7 +860,7 @@ async fn serve(shared: &Arc<Shared>, child: &mut ChildHandle, cfg: &Arc<Cfg>) ->
                             return Served { exit: Exit::Died, spare };
                         };
                         if let Some(job) = inflight.take().filter(|j| j.task_id == task_id) {
-                            let done = Outcome { ok: true, result: result.to_vec(), error_type: String::new(), traceback: String::new() };
+                            let done = Outcome { ok: true, result: result.to_vec(), error_type: String::new(), traceback: String::new(), directive: Directive::Policy };
                             shared.settle(job, done).await;
                         }
                         *tasks_done += 1;
@@ -807,10 +870,26 @@ async fn serve(shared: &Arc<Shared>, child: &mut ChildHandle, cfg: &Arc<Cfg>) ->
                             (items[1].as_u64(), items[2].as_str(), items[3].as_str()) else {
                             return Served { exit: Exit::Died, spare };
                         };
+                        let directive = Directive::read(&items);
                         if let Some(job) = inflight.take().filter(|j| j.task_id == task_id) {
-                            shared.settle(job, Outcome::nack(kind, tb.to_string())).await;
+                            let mut outcome = Outcome::nack(kind, tb.to_string());
+                            outcome.directive = directive;
+                            shared.settle(job, outcome).await;
                         }
                         *tasks_done += 1;
+                    }
+                    Some("Progress") => {
+                        // The child holds no broker connection by design, so
+                        // the only way its progress reaches one is through here.
+                        if let (Some(task_id), Some(blob)) =
+                            (items[1].as_u64(), items[2].as_slice())
+                        {
+                            if let Some(job) =
+                                inflight.as_ref().filter(|j| j.task_id == task_id)
+                            {
+                                shared.keep_progress(job, blob.to_vec()).await;
+                            }
+                        }
                     }
                     _ => return Served { exit: Exit::Died, spare },
                 }
@@ -869,15 +948,18 @@ async fn drain(shared: &Arc<Shared>, mut child: ChildHandle, cfg: &Cfg) {
                     Some("Ack") => {
                         if let (Some(task_id), Some(result)) = (items[1].as_u64(), items[2].as_slice()) {
                             if let Some(job) = child.inflight.take().filter(|j| j.task_id == task_id) {
-                                let done = Outcome { ok: true, result: result.to_vec(), error_type: String::new(), traceback: String::new() };
+                                let done = Outcome { ok: true, result: result.to_vec(), error_type: String::new(), traceback: String::new(), directive: Directive::Policy };
                                 shared.settle(job, done).await;
                             }
                         }
                     }
                     Some("Nack") => {
                         if let (Some(task_id), Some(kind), Some(tb)) = (items[1].as_u64(), items[2].as_str(), items[3].as_str()) {
+                            let directive = Directive::read(&items);
                             if let Some(job) = child.inflight.take().filter(|j| j.task_id == task_id) {
-                                shared.settle(job, Outcome::nack(kind, tb.to_string())).await;
+                                let mut outcome = Outcome::nack(kind, tb.to_string());
+                                outcome.directive = directive;
+                                shared.settle(job, outcome).await;
                             }
                         }
                     }

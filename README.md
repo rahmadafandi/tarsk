@@ -165,6 +165,29 @@ Both run in the worker, and `before_send` in the producer. Neither can run in th
 that process never imports your code, which is what keeps its footprint constant. For the same
 reason there is no "result stored" hook — the supervisor is what stores it.
 
+## Saying no, and saying how far along
+
+```python
+@app.task(retries=5)
+def parse(blob, ctx=Depends(Context)):
+    if not looks_like_json(blob):
+        raise Reject("this will never parse")      # straight to the dead letters
+    if upstream.is_cold():
+        raise Retry("warming up", delay=30)        # back to the queue, one attempt spent
+    ctx.set_progress({"rows": 0})
+```
+
+`Reject` skips whatever retries are left — spending five attempts to reach the same answer only
+delays the moment someone looks at it. `Retry` is still charged an attempt: a retry that costs
+nothing is an infinite loop with extra steps, and the thing being waited on is usually the
+thing least able to absorb one.
+
+`ctx.set_progress(value)` is readable through `app.result(task_id).progress()`, kept under the
+same TTL as the result. The worker has no broker connection — that is what keeps its imports
+down — so progress travels over the same socket as everything else, which also means a
+progress frame from a handler thread and an Ack from the event loop are serialised rather than
+interleaved.
+
 ## Scheduling
 
 `send_in(60, …)` runs a task once, later; `send_at(when)` takes a timezone-aware datetime.

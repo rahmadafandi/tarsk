@@ -18,7 +18,7 @@ from dataclasses import dataclass
 
 __all__ = [
     "App", "AsyncResult", "Context", "Depends", "Task", "TaskFailed", "TaskSpec",
-    "load_app",
+    "Reject", "Retry", "load_app",
 ]
 
 DEFAULT_TIMEOUT = 300.0  # seconds — spec §9, doubles as the hard cap
@@ -51,13 +51,30 @@ class TaskSpec:
 
 @dataclass(frozen=True, slots=True)
 class Context:
-    """What a middleware is told about the call it is wrapping."""
+    """What a middleware is told about the call it is wrapping.
+
+    Handlers can ask for it too, with `ctx=Depends(Context)`.
+    """
 
     name: str
     task_id: str
     attempt: int
     args: tuple
     kwargs: dict
+    #: Set by the worker. Sends progress to the supervisor, which is the only
+    #: process here holding a broker connection (spec §4.1).
+    _emit: object = None
+
+    def set_progress(self, value) -> None:
+        """Publish where this task has got to, readable via AsyncResult.
+
+        Only kept for tasks that set `result_ttl`, under the same expiry: a
+        progress record that outlives interest in the result is just a leak
+        that reports on itself.
+        """
+        if self._emit is None:
+            raise RuntimeError("set_progress is only available inside a running task")
+        self._emit(value)
 
 
 class Depends:
@@ -357,6 +374,28 @@ def load_app(spec: str) -> App:
     return app
 
 
+class Reject(Exception):
+    """Give up on this job now: no more retries, straight to the dead letters.
+
+    For work that will never succeed however many times it is tried — a payload
+    that cannot be parsed, a row that no longer exists. Spending the retry
+    budget on those only delays the moment someone looks at them.
+    """
+
+
+class Retry(Exception):
+    """Hand this job back, optionally after `delay` seconds.
+
+    Still charged an attempt. A retry that costs nothing is an infinite loop
+    with extra steps, and the thing being waited on is usually the thing least
+    able to absorb one.
+    """
+
+    def __init__(self, message: str = "", *, delay: float = 0.0):
+        super().__init__(message or f"retry in {delay}s")
+        self.delay = max(0.0, delay)
+
+
 class TaskFailed(Exception):
     """The handler raised, and the traceback came back with the result."""
 
@@ -387,6 +426,13 @@ class AsyncResult:
 
     def ready(self) -> bool:
         return self._fetch() is not None
+
+    def progress(self):
+        """The last value the task published, or None."""
+        from . import _proto
+
+        blob = self.app.producer().result(f"progress:{self.task_id}")
+        return None if blob is None else _proto.unpack_result(blob)
 
     def get(self, timeout: float = 30.0, poll: float = 0.05):
         """Block until the answer lands, then return it or raise `TaskFailed`.

@@ -13,7 +13,7 @@ import os
 import sys
 import traceback
 
-from . import Context, Task, load_app
+from . import Context, Reject, Retry, Task, load_app
 from . import _proto
 
 # Distinct exit code so the supervisor can tell "recycled after a sync timeout"
@@ -22,6 +22,27 @@ EXIT_SYNC_TIMEOUT = 75
 # A start hook raised. Distinct so the supervisor can say so rather than
 # reporting a child that simply never showed up.
 EXIT_STARTUP_FAILED = 78
+
+
+class Wire:
+    """Serialises every frame this child sends.
+
+    Progress can arrive from a handler running in a thread while the loop is
+    about to send an Ack. Two coroutines writing the same socket interleave
+    their bytes, and a torn frame is not a recoverable protocol error.
+    """
+
+    def __init__(self, writer):
+        self.writer = writer
+        self.lock = asyncio.Lock()
+
+    async def send(self, tag, *args):
+        async with self.lock:
+            await _proto.write(self.writer, tag, *args)
+
+    def send_threadsafe(self, loop, tag, *args):
+        """Block the calling thread until the frame is out."""
+        asyncio.run_coroutine_threadsafe(self.send(tag, *args), loop).result()
 
 
 async def _call(app, task: Task, ctx: Context, args: list, kwargs: dict):
@@ -35,8 +56,11 @@ async def _call(app, task: Task, ctx: Context, args: list, kwargs: dict):
     async def invoke():
         filled = dict(kwargs)
         for name, dep in task.depends.items():
-            if name not in filled:
-                filled[name] = await app.resolve(dep)
+            if name in filled:
+                continue
+            # Depends(Context) hands the handler its own call, rather than
+            # making it reach for a global to find out what it is running.
+            filled[name] = ctx if dep.provider is Context else await app.resolve(dep)
         if task.is_async:
             return await task.fn(*args, **filled)
         return await asyncio.to_thread(task.fn, *args, **filled)
@@ -88,17 +112,19 @@ async def main(socket_path: str, app_spec: str, child_id: int) -> None:
     except Exception:
         traceback.print_exc()
         sys.exit(EXIT_STARTUP_FAILED)
-    reader, writer = await asyncio.open_unix_connection(socket_path)
+    reader, raw_writer = await asyncio.open_unix_connection(socket_path)
+    wire = Wire(raw_writer)
+    writer = raw_writer  # kept for the shutdown path, which owns the socket
     # child_id is assigned by the supervisor before spawn, so it can match this
     # connection to the process it started — and to that process's RSS.
-    await _proto.write(writer, "Register", child_id, app.registry_hash(), app.registry_rows())
+    await wire.send("Register", child_id, app.registry_hash(), app.registry_rows())
 
     # ponytail: one slot per child, so Drain can only arrive while idle and
     # there is no in-flight bookkeeping. Multi-slot means N Readys plus a
     # separate reader task — add it when a child's task mix is I/O-bound
     # enough that one in-flight task wastes the interpreter it paid for.
     while True:
-        await _proto.write(writer, "Ready")
+        await wire.send("Ready")
         frame = await _proto.read(reader)
         if frame is None:
             await _shutdown(app, writer)
@@ -113,25 +139,42 @@ async def main(socket_path: str, app_spec: str, child_id: int) -> None:
         task_id, name, payload = args
         task = app.registry.get(name)
         if task is None:
-            await _proto.write(
-                writer, "Nack", task_id, "UnknownTask", f"no task named {name!r} in {app_spec}"
+            await wire.send(
+                "Nack", task_id, "UnknownTask", f"no task named {name!r} in {app_spec}", "", 0
             )
             continue
 
         try:
             call_args, call_kwargs = _proto.unpack_args(payload)
+            loop = asyncio.get_running_loop()
+
+            def emit(value, _id=task_id):
+                wire.send_threadsafe(loop, "Progress", _id, _proto.pack_result(value))
+
             ctx = Context(
                 name=name,
                 task_id=str(task_id),
                 attempt=1,
                 args=tuple(call_args),
                 kwargs=call_kwargs,
+                _emit=emit,
             )
             result = await _call(app, task, ctx, call_args, call_kwargs)
+        except Reject as exc:
+            # The handler knows this will never work. Skip the remaining
+            # attempts rather than spending them to reach the same answer.
+            await wire.send(
+                "Nack", task_id, "Reject", f"{type(exc).__name__}: {exc}", "reject", 0
+            )
+        except Retry as exc:
+            await wire.send(
+                "Nack", task_id, "Retry", f"{type(exc).__name__}: {exc}",
+                "retry", int(exc.delay * 1000),
+            )
         except TimeoutError:
-            await _proto.write(
-                writer, "Nack", task_id, "TimeoutError",
-                f"{name} exceeded timeout of {task.spec.timeout_ms / 1000}s",
+            await wire.send(
+                "Nack", task_id, "TimeoutError",
+                f"{name} exceeded timeout of {task.spec.timeout_ms / 1000}s", "", 0,
             )
             if not task.is_async:
                 # A Python thread cannot be interrupted (spec §4.5). The work
@@ -140,9 +183,11 @@ async def main(socket_path: str, app_spec: str, child_id: int) -> None:
                 await _die(writer, EXIT_SYNC_TIMEOUT)
         except Exception as exc:
             # Pre-formatted string — never reconstructed Rust-side (spec §4.2).
-            await _proto.write(writer, "Nack", task_id, type(exc).__name__, traceback.format_exc())
+            await wire.send(
+                "Nack", task_id, type(exc).__name__, traceback.format_exc(), "", 0
+            )
         else:
-            await _proto.write(writer, "Ack", task_id, _proto.pack_result(result))
+            await wire.send("Ack", task_id, _proto.pack_result(result))
 
 
 if __name__ == "__main__":

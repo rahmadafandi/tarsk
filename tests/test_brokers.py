@@ -271,6 +271,24 @@ def check_broker(url: str, label: str) -> None:
         stop_worker(worker)
         assert "absolute" in seen, f"{label}: send_at never arrived ({seen})"
 
+        # --- progress, published from inside a running task -------------
+        log.write_text("")
+        worker = start_worker(env, TARSK_LEASE_GRACE=1)
+        job = app.registry["reports"].send()
+        handle = app.result(job)
+        seen_progress = []
+        deadline = time.time() + 60
+        while time.time() < deadline and not handle.ready():
+            step = handle.progress()
+            if step and step not in seen_progress:
+                seen_progress.append(step)
+            time.sleep(0.05)
+        assert handle.get(timeout=30) == "finished", label
+        stop_worker(worker)
+        assert seen_progress, f"{label}: no progress was ever visible"
+        assert seen_progress == sorted(seen_progress, key=lambda s: s["step"]), seen_progress
+        assert seen_progress[-1]["of"] == 3, seen_progress
+
         # --- cron fires once a minute, once across the fleet ------------
         log.write_text("")
         # Two workers, so a schedule fired twice would show up as two ticks.

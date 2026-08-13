@@ -99,8 +99,31 @@ def test_retries_run_out():
     assert sup.stats["tasks_dead_lettered"] == 1, sup.stats
 
 
+def test_reject_skips_the_remaining_retries():
+    sup = Supervisor("tests.demo_app:app", children=1)
+    results = sup.run([("hopeless", (), {})])
+    kind, (error_type, _) = results[0]
+    assert (kind, error_type) == ("nack", "Reject"), results[0]
+    # retries=5, so the policy alone would have run it six times
+    assert sup.stats["task_retries"] == 0, sup.stats
+    assert sup.stats["tasks_dead_lettered"] == 1, sup.stats
+
+
+def test_retry_hands_the_job_back():
+    marker = Path(tempfile.gettempdir()) / "tarsk-retry-marker"
+    marker.unlink(missing_ok=True)
+    sup = Supervisor("tests.demo_app:app", children=1)
+    try:
+        results = sup.run([("asks_again", (str(marker),), {})])
+        assert results[0] == ("ack", 2), results[0]
+        assert sup.stats["task_retries"] == 1, sup.stats
+    finally:
+        marker.unlink(missing_ok=True)
+
+
 if __name__ == "__main__":
     for check in (test_registry_hash, test_timeout_cap, test_end_to_end,
-                  test_retry_then_succeed, test_retries_run_out):
+                  test_retry_then_succeed, test_retries_run_out,
+                  test_reject_skips_the_remaining_retries, test_retry_hands_the_job_back):
         check()
         print("ok", check.__name__)

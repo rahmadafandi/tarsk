@@ -4,7 +4,7 @@ import os
 import time
 from pathlib import Path
 
-from tarsk import App
+from tarsk import App, Context, Depends
 
 app = App(broker=os.environ.get("TARSK_BROKER"), default_timeout=30, max_timeout=30)
 
@@ -69,3 +69,12 @@ def explodes():
 def every_minute():
     _log("tick")
     return "tick"
+
+
+@app.task(name="reports", result_ttl=60)
+def reports(ctx=Depends(Context)):
+    """Publishes progress from a sync handler, i.e. from a worker thread."""
+    for step in range(1, 4):
+        ctx.set_progress({"step": step, "of": 3})
+        time.sleep(0.2)
+    return "finished"

@@ -5,7 +5,7 @@ import os
 import time
 from pathlib import Path
 
-from tarsk import App, Depends
+from tarsk import App, Context, Depends, Reject, Retry
 
 app = App(default_timeout=5, max_timeout=5)
 
@@ -117,3 +117,19 @@ def uses_pool(x, db=Depends(a_pool)):
 @app.task(name="wrapped_boom")
 def wrapped_boom(db=Depends(a_pool)):
     raise KeyError("through the onion")
+
+
+@app.task(name="hopeless", retries=5)
+def hopeless():
+    """Rejecting must beat the retry budget, not wait it out."""
+    raise Reject("this payload will never parse")
+
+
+@app.task(name="asks_again", retries=3)
+def asks_again(marker):
+    path = Path(marker)
+    tries = int(path.read_text()) if path.exists() else 0
+    path.write_text(str(tries + 1))
+    if tries == 0:
+        raise Retry("upstream is cold", delay=0)
+    return tries + 1

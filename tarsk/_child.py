@@ -7,6 +7,7 @@ codec (spec §4.1). Child RSS is therefore CPython + user code.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import functools
 import inspect
 import os
@@ -194,6 +195,17 @@ async def main(socket_path: str, app_spec: str, child_id: int, slots: int = 1) -
     # One Ready per free slot. At slots=1 this is the original strict
     # request/response loop; above it, the supervisor keeps as many tasks in
     # flight here as there are Readys outstanding.
+    if slots > 1:
+        # asyncio's default executor is min(32, cpu + 4) threads, so a sync
+        # handler would cap at that regardless of the slot count — 64 slots
+        # quietly running 20 at a time. Threads are cheap next to the
+        # interpreter they live in; match the number the caller asked for.
+        asyncio.get_running_loop().set_default_executor(
+            concurrent.futures.ThreadPoolExecutor(
+                max_workers=slots, thread_name_prefix="tarsk-task"
+            )
+        )
+
     running: set[asyncio.Task] = set()
     draining = False
     for _ in range(slots):

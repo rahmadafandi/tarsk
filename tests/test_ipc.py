@@ -78,6 +78,26 @@ def test_slots_overlap_inside_one_child():
     assert len(serial_results) == 4, serial_results
 
 
+def test_slots_overlap_sync_handlers_too():
+    """A sync handler holds a thread, and asyncio's default pool is small.
+
+    Without sizing the executor to the slot count, 24 slots would run
+    min(32, cpu + 4) at a time — silently, and only on sync handlers.
+    """
+    import time
+
+    jobs = [("blocks", (), {}) for _ in range(24)]
+    start = time.monotonic()
+    results = Supervisor("tests.demo_app:app", children=1, slots=24).run(jobs)
+    wall = time.monotonic() - start
+
+    assert len(results) == 24, results
+    assert all(r[0] == "ack" for r in results.values()), results
+    # 24 × 0.2s serialised is 4.8s; overlapped it is 0.2s plus interpreter
+    # startup. Anything past a second means the pool, not the slots, decided.
+    assert wall < 1.5, f"24 sync slots took {wall:.2f}s — the thread pool is the cap"
+
+
 def test_end_to_end():
     sup = Supervisor("tests.demo_app:app", children=2)
     results = sup.run(JOBS)
@@ -152,7 +172,7 @@ def test_retry_hands_the_job_back():
 
 
 if __name__ == "__main__":
-    for check in (test_slots_overlap_inside_one_child, test_registry_hash, test_timeout_cap, test_end_to_end,
+    for check in (test_slots_overlap_inside_one_child, test_slots_overlap_sync_handlers_too, test_registry_hash, test_timeout_cap, test_end_to_end,
                   test_retry_then_succeed, test_retries_run_out,
                   test_reject_skips_the_remaining_retries, test_retry_hands_the_job_back):
         check()

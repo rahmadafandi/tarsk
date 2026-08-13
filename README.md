@@ -146,6 +146,11 @@ whatever 64 tasks are holding, and a hard kill takes all 64 down together. Raise
 handlers that *wait* on other services and allocate little; leave it at 1 for handlers that
 allocate, which is the case the ceiling exists for.
 
+Sync handlers get slots too — they run in threads, and the pool is sized to the slot count
+rather than left at asyncio's default of `min(32, cpu + 4)`, which would otherwise cap
+`--slots 64` at twenty without saying so. Threads only overlap *waiting*: a sync handler that
+computes holds the GIL and gains nothing.
+
 `--hard-max-rss` is the exception, and it is off by default. Set it and a child that reaches it
 mid-task is killed rather than allowed to keep growing — the task is retried, and if it cannot
 fit it is dead-lettered instead of retried forever. It cannot make an oversized task succeed;

@@ -27,6 +27,13 @@ async def waits():
     return os.getpid()
 
 
+@app.task(name="blocks", timeout=4)
+def blocks():
+    """The same wait in a sync handler: it holds a thread, not a coroutine."""
+    time.sleep(0.2)
+    return os.getpid()
+
+
 @app.task(name="naps", timeout=0.3)
 async def naps():
     await asyncio.sleep(10)

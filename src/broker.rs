@@ -19,7 +19,7 @@ use tokio_postgres::NoTls;
 
 pub type Res<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-fn now_ms() -> u64 {
+pub fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -73,6 +73,15 @@ pub struct Delivery {
     pub payload: Vec<u8>,
     pub attempt: u32,
     pub receipt: Receipt,
+    /// When this became runnable, in milliseconds since the epoch — enqueue
+    /// time for an ordinary job, promotion time for a delayed one. Expiry is
+    /// measured from here rather than from enqueue, or `send_in(3600)` with a
+    /// five-minute expiry would be dead before it was ever due.
+    ///
+    /// Free on Redis: a stream id is `<millis>-<seq>`, and a delayed job only
+    /// enters the stream when the sweep promotes it. Zero means unknown, which
+    /// no expiry check treats as expired.
+    pub ready_at_ms: u64,
 }
 
 /// One parked failure, as a human needs to see it.
@@ -386,6 +395,7 @@ impl MemoryBroker {
             attempt: *attempt,
             receipt: Receipt::Memory { id },
             id: job.id.clone(),
+            ready_at_ms: 0,
         })
     }
 
@@ -521,6 +531,14 @@ fn entry_fields(entry: &redis::streams::StreamId) -> (String, Vec<u8>, u64) {
 
 fn entry_id(entry: &redis::streams::StreamId) -> String {
     entry.get("i").unwrap_or_default()
+}
+
+/// The millisecond in a Redis stream id, which is `<millis>-<seq>`.
+fn stream_id_ms(id: &str) -> u64 {
+    id.split('-')
+        .next()
+        .and_then(|m| m.parse().ok())
+        .unwrap_or(0)
 }
 
 fn revoked_key(queue: &str) -> String {
@@ -733,6 +751,7 @@ impl RedisBroker {
                     name,
                     payload,
                     attempt: entry.delivered_count.unwrap_or(1) as u32,
+                    ready_at_ms: stream_id_ms(&entry.id),
                     receipt: Receipt::Redis {
                         queue: queue.clone(),
                         id: entry.id,
@@ -1101,6 +1120,7 @@ impl RedisBroker {
                         name,
                         payload,
                         attempt: candidate.times_delivered as u32 + 1,
+                        ready_at_ms: stream_id_ms(&candidate.id),
                         receipt: Receipt::Redis {
                             queue: queue.clone(),
                             id: candidate.id,
@@ -1183,18 +1203,25 @@ alter table tarsk_dead add column if not exists timeout_ms integer not null defa
 /// Claiming and reclaiming are the same statement: a lease that has run out is
 /// indistinguishable from one that was never taken, so expiry needs no sweep.
 const PG_CLAIM: &str = "
+with picked as (
+    select id,
+           -- The moment this became runnable, captured before the update
+           -- overwrites it: lease_until is when a delayed job came due or a
+           -- lost lease lapsed, and null means it was runnable when written.
+           coalesce(lease_until, created_at) as ready_at
+      from tarsk_jobs
+     where queue = any($1) and (lease_until is null or lease_until < now())
+     order by id
+       for update skip locked
+     limit 1
+)
 update tarsk_jobs set
     lease_until = now() + make_interval(secs => timeout_ms / 1000.0 + $2::double precision),
     attempt     = attempt + 1,
     run_lease   = run_lease + 1
-where id = (
-    select id from tarsk_jobs
-    where queue = any($1) and (lease_until is null or lease_until < now())
-    order by id
-    for update skip locked
-    limit 1
-)
-returning id, name, payload, attempt, run_lease, job_id
+from picked
+where tarsk_jobs.id = picked.id
+returning tarsk_jobs.id, name, payload, attempt, run_lease, job_id, picked.ready_at
 ";
 
 pub struct PgBroker {
@@ -1253,11 +1280,16 @@ impl PgBroker {
                 .await?;
             if let Some(row) = rows.first() {
                 let run_lease: i64 = row.get(4);
+                let ready: std::time::SystemTime = row.get(6);
                 return Ok(Some(Delivery {
                     id: row.get(5),
                     name: row.get(1),
                     payload: row.get(2),
                     attempt: row.get::<_, i32>(3) as u32,
+                    ready_at_ms: ready
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0),
                     receipt: Receipt::Postgres {
                         row: row.get(0),
                         run_lease,

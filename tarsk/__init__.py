@@ -42,6 +42,10 @@ class TaskSpec:
     # cannot import their code — never has to parse anything.
     rate_per_sec: float = 0.0
     rate_burst: int = 0
+    # Milliseconds a job may wait after becoming runnable before it is dropped
+    # instead of run. Zero means never, which is the default: work that
+    # disappears by default would be a strange promise for this project.
+    expires_ms: int = 0
 
     def as_row(self) -> list:
         """Positional form that crosses the wire (spec §4.2)."""
@@ -55,6 +59,7 @@ class TaskSpec:
             self.cron,
             self.rate_per_sec,
             self.rate_burst,
+            self.expires_ms,
         ]
 
 
@@ -271,6 +276,7 @@ class App:
         result_ttl: float = 0.0,
         cron: str = "",
         rate_limit: str = "",
+        expires: float = 0.0,
     ):
         def decorate(fn):
             t = self.default_timeout if timeout is None else timeout
@@ -301,9 +307,11 @@ class App:
             # sees, rather than in the supervisor where it would be a task that
             # silently never runs.
             per_sec, burst = parse_rate(rate_limit) if rate_limit else (0.0, 0)
+            if expires < 0:
+                raise ValueError(f"{fn.__qualname__}: expires must not be negative")
             spec = TaskSpec(
                 task_name, int(t * 1000), retries, backoff, queue,
-                int(result_ttl * 1000), cron, per_sec, burst,
+                int(result_ttl * 1000), cron, per_sec, burst, int(expires * 1000),
             )
             task = Task(fn, spec, self)
             self.registry[task_name] = task

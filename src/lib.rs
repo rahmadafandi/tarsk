@@ -87,6 +87,8 @@ struct Job {
     /// Set when the Dispatch frame goes out, so the histogram measures what a
     /// caller would call the task's duration rather than the handler's.
     dispatched: Instant,
+    /// When the broker says this became runnable. Expiry is measured from here.
+    ready_at_ms: u64,
 }
 
 /// What the handler asked for, on top of having failed.
@@ -182,6 +184,7 @@ struct Counters {
     hard_killed: AtomicU64,
     retried: AtomicU64,
     rate_limited: AtomicU64,
+    expired: AtomicU64,
     dead_lettered: AtomicU64,
     cron_fired: AtomicU64,
     broker_errors: AtomicU64,
@@ -452,6 +455,7 @@ impl Shared {
             attempt: delivery.attempt,
             receipt: delivery.receipt,
             dispatched: Instant::now(),
+            ready_at_ms: delivery.ready_at_ms,
         }
     }
 }
@@ -483,6 +487,8 @@ struct Spec {
     /// broker round trip: the cost is paid only by tasks that asked for one.
     rate_per_sec: f64,
     rate_burst: u32,
+    /// Milliseconds a job may wait after becoming runnable. Zero is never.
+    expires_ms: u64,
 }
 
 /// Wait before the next attempt. Exponential from one second, capped so a
@@ -533,6 +539,7 @@ fn counter_list(counters: &Counters) -> Vec<(&'static str, u64)> {
         ("children_hard_killed", load(&counters.hard_killed)),
         ("task_retries", load(&counters.retried)),
         ("tasks_rate_limited", load(&counters.rate_limited)),
+        ("tasks_expired", load(&counters.expired)),
         ("tasks_dead_lettered", load(&counters.dead_lettered)),
         ("cron_fired", load(&counters.cron_fired)),
         ("broker_errors", load(&counters.broker_errors)),
@@ -588,6 +595,7 @@ async fn accept_loop(listener: UnixListener, shared: Arc<Shared>) {
                                 .to_string(),
                             rate_per_sec: fields.get(7).and_then(|v| v.as_f64()).unwrap_or(0.0),
                             rate_burst: fields.get(8).and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                            expires_ms: fields.get(9).and_then(|v| v.as_u64()).unwrap_or(0),
                         },
                     )),
                     _ => None,
@@ -873,6 +881,37 @@ async fn serve(shared: &Arc<Shared>, child: &mut ChildHandle, cfg: &Arc<Cfg>) ->
                         None => break,
                     }
                 };
+                // Too long in the queue to be worth running. Checked here
+                // rather than at enqueue, because the question is how long it
+                // waited, and that is only answerable at the moment something
+                // would have started it — including on a retry, since stale
+                // work is still stale the second time.
+                let expires_ms = shared
+                    .specs
+                    .lock()
+                    .unwrap()
+                    .get(&job.name)
+                    .map(|s| s.expires_ms)
+                    .unwrap_or(0);
+                if expires_ms > 0 && job.ready_at_ms > 0 {
+                    let waited = broker::now_ms().saturating_sub(job.ready_at_ms);
+                    if waited > expires_ms {
+                        shared.counters.expired.fetch_add(1, Ordering::Relaxed);
+                        shared
+                            .settle(
+                                job,
+                                Outcome::nack(
+                                    "Expired",
+                                    format!(
+                                        "waited {}ms for a worker, past its expires of {}ms",
+                                        waited, expires_ms
+                                    ),
+                                ),
+                            )
+                            .await;
+                        continue;
+                    }
+                }
                 // Over its rate: hand it back with the wait the bucket asked
                 // for, rather than hold this slot idle. The delay is what stops
                 // it being re-claimed immediately, and requeue is the same path

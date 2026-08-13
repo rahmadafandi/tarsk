@@ -48,6 +48,13 @@ def medium(tag):
     return tag
 
 
+@app.task(name="perishable", expires=2)
+def perishable(tag):
+    """Worth doing now, not worth doing later."""
+    _log(tag)
+    return tag
+
+
 @app.task(name="metered", rate_limit="5/s")
 def metered(tag):
     """Nothing slow: whatever paces this is the limiter, not the handler."""

@@ -327,6 +327,27 @@ def check_broker(url: str, label: str) -> None:
             stop_worker(worker)
         assert ticks == ["tick"], f"{label}: expected exactly one tick, got {ticks}"
 
+        # --- a job that waited too long is dropped, not run ---------------
+        #
+        # Enqueued with no worker running, so the wait is real queue time
+        # rather than something contrived. Both jobs are identical; only the
+        # gap before the worker starts differs.
+        log.write_text("")
+        app.registry["perishable"].send("stale")
+        time.sleep(3.0)                      # expires is 2s
+        app.registry["perishable"].send("fresh")
+        worker = start_worker(env, TARSK_LEASE_GRACE=1)
+        try:
+            deadline = time.time() + 30
+            while time.time() < deadline and "fresh" not in tags_in(log):
+                time.sleep(0.2)
+            time.sleep(1.0)                  # give the stale one every chance
+        finally:
+            stop_worker(worker)
+        ran = tags_in(log)
+        assert "fresh" in ran, f"{label}: the fresh job did not run: {ran}"
+        assert "stale" not in ran, f"{label}: a job three seconds past expires=2 still ran"
+
         # --- a rate limit holds across workers, not per worker ------------
         #
         # Four children with eight slots each is thirty-two things that could

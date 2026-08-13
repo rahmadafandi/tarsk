@@ -307,6 +307,31 @@ thread and the loop is free for the whole wait rather than the parts Python was 
 That is a thread hop rather than a native async client: 500 concurrent enqueues take 57ms, and
 the ceiling is asyncio's default executor rather than the network.
 
+## Expiry
+
+```python
+@app.task(expires=300)
+def refresh_dashboard(user_id): ...
+```
+
+Work that waited too long is dropped at the moment a worker would have started it, rather than
+run late. That is what an outage leaves behind: a backlog where the nine o'clock reminder is
+now being sent at three, and the abandoned-cart email is going to someone who checked out
+hours ago.
+
+**Measured from when the job became runnable, not from when it was enqueued.** Otherwise
+`send_in(3600)` on a task with `expires=300` would be dead before it was ever due — a trap
+worth not building. On Redis that costs nothing: a stream id already carries the millisecond it
+entered, and a delayed job only enters when the sweep promotes it.
+
+Checked at every dispatch, so a retry after the deadline is dropped too — stale work is still
+stale on the second attempt. A job already running is not interrupted. Drops are counted as
+`tarsk_tasks_expired_total` rather than passing for success.
+
+There is no default and no app-wide setting. How long a task stays worth doing is domain
+knowledge, and the asymmetry is one-sided: without expiry, work runs late and you can see it;
+with the wrong expiry, work disappears and you cannot.
+
 ## Rate limits
 
 ```python

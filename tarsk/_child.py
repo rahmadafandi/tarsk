@@ -7,13 +7,13 @@ codec (spec §4.1). Child RSS is therefore CPython + user code.
 from __future__ import annotations
 
 import asyncio
+import functools
+import inspect
 import os
 import sys
 import traceback
 
-import inspect
-
-from . import Task, load_app
+from . import Context, Task, load_app
 from . import _proto
 
 # Distinct exit code so the supervisor can tell "recycled after a sync timeout"
@@ -24,12 +24,33 @@ EXIT_SYNC_TIMEOUT = 75
 EXIT_STARTUP_FAILED = 78
 
 
-async def _call(task: Task, args: list, kwargs: dict):
-    """Run one task under its timeout (spec §4.5)."""
-    timeout = task.spec.timeout_ms / 1000
-    if task.is_async:
-        return await asyncio.wait_for(task.fn(*args, **kwargs), timeout)
-    return await asyncio.wait_for(asyncio.to_thread(task.fn, *args, **kwargs), timeout)
+async def _call(app, task: Task, ctx: Context, args: list, kwargs: dict):
+    """Run one task, through its middleware, under its timeout (spec §4.5).
+
+    The timeout covers the middleware too. A tracing layer that hangs holds the
+    lease exactly as a handler would, so bounding only the innermost call would
+    bound the wrong thing.
+    """
+
+    async def invoke():
+        filled = dict(kwargs)
+        for name, dep in task.depends.items():
+            if name not in filled:
+                filled[name] = await app.resolve(dep)
+        if task.is_async:
+            return await task.fn(*args, **filled)
+        return await asyncio.to_thread(task.fn, *args, **filled)
+
+    chain = invoke
+    for middleware in reversed(app.middlewares):
+        if hasattr(middleware, "execute"):
+            chain = functools.partial(_layer, middleware, ctx, chain)
+    return await asyncio.wait_for(chain(), task.spec.timeout_ms / 1000)
+
+
+async def _layer(middleware, ctx: Context, nxt):
+    result = middleware.execute(ctx, nxt)
+    return await result if inspect.isawaitable(result) else result
 
 
 async def _die(writer: asyncio.StreamWriter, code: int) -> None:
@@ -99,7 +120,14 @@ async def main(socket_path: str, app_spec: str, child_id: int) -> None:
 
         try:
             call_args, call_kwargs = _proto.unpack_args(payload)
-            result = await _call(task, call_args, call_kwargs)
+            ctx = Context(
+                name=name,
+                task_id=str(task_id),
+                attempt=1,
+                args=tuple(call_args),
+                kwargs=call_kwargs,
+            )
+            result = await _call(app, task, ctx, call_args, call_kwargs)
         except TimeoutError:
             await _proto.write(
                 writer, "Nack", task_id, "TimeoutError",

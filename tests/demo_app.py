@@ -5,7 +5,7 @@ import os
 import time
 from pathlib import Path
 
-from tarsk import App
+from tarsk import App, Depends
 
 app = App(default_timeout=5, max_timeout=5)
 
@@ -70,3 +70,50 @@ def opened():
 def closed():
     with open(HOOK_LOG, "a", buffering=1) as fh:
         fh.write(f"stop {os.getpid()}\n")
+
+
+# --- middleware and injection ------------------------------------------
+TRACE = Path(os.environ.get("TARSK_TRACE_LOG", "/dev/null"))
+
+
+def _note(line):
+    with open(TRACE, "a", buffering=1) as fh:
+        fh.write(line + "\n")
+
+
+class Recorder:
+    """An onion layer: it sees the call open and close, including failures."""
+
+    def __init__(self, tag):
+        self.tag = tag
+
+    async def execute(self, ctx, call):
+        _note(f"{self.tag}>{ctx.name}")
+        try:
+            return await call()
+        except Exception as exc:
+            _note(f"{self.tag}!{type(exc).__name__}")
+            raise
+        finally:
+            _note(f"{self.tag}<{ctx.name}")
+
+
+app.middleware(Recorder("outer"))
+app.middleware(Recorder("inner"))
+
+_opened = []
+
+
+def a_pool():
+    _opened.append(1)
+    return {"conn": len(_opened)}
+
+
+@app.task(name="uses_pool")
+def uses_pool(x, db=Depends(a_pool)):
+    return [x, db["conn"], len(_opened)]
+
+
+@app.task(name="wrapped_boom")
+def wrapped_boom(db=Depends(a_pool)):
+    raise KeyError("through the onion")

@@ -129,6 +129,34 @@ Hooks run before the worker registers, so whatever they open is inside the basel
 supervisor checks against the ceiling. A pool that does not fit is refused at startup rather
 than discovered as a worker that recycles instantly.
 
+## Middleware and injection
+
+```python
+class Trace:
+    async def execute(self, ctx, call):
+        with tracer.span(ctx.name):
+            return await call()
+
+app.middleware(Trace())
+
+@app.task()
+def charge(order_id, db=Depends(pool)):
+    ...
+```
+
+Middleware is an onion, not a pair of callbacks: you hold the call open, so a span or a
+transaction is the obvious shape rather than something reconstructed from two hooks. The
+timeout covers the middleware too — a tracing layer that hangs holds the lease exactly as a
+handler would.
+
+`Depends(provider)` resolves once per worker process by default, which is what a module-level
+global would have been, except `app.override(provider, fake)` can replace it in a test. Pass
+`scope="task"` to resolve per call.
+
+Both run in the worker, and `before_send` in the producer. Neither can run in the supervisor:
+that process never imports your code, which is what keeps its footprint constant. For the same
+reason there is no "result stored" hook — the supervisor is what stores it.
+
 ## Scheduling
 
 `send_in(60, …)` runs a task once, later; `send_at(when)` takes a timezone-aware datetime.

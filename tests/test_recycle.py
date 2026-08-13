@@ -140,11 +140,46 @@ def test_hooks_bracket_every_worker():
         os.environ.pop("TARSK_HOOK_LOG", None)
 
 
+def test_middleware_wraps_and_dependencies_inject():
+    """Layers nest outside-in and unwind inside-out, failures included.
+
+    The worker-scoped provider must resolve once for the process, not once per
+    task — that is the whole difference between it and a plain default value.
+    """
+    import tempfile
+
+    trace = Path(tempfile.mktemp(suffix=".trace"))
+    os.environ["TARSK_TRACE_LOG"] = str(trace)
+    try:
+        sup = Supervisor("tests.demo_app:app", children=1)
+        results = sup.run([
+            ("uses_pool", ("a",), {}),
+            ("uses_pool", ("b",), {}),
+            ("wrapped_boom", (), {}),
+        ])
+
+        # Injected, and the same instance both times: one provider call.
+        assert results[0] == ("ack", ["a", 1, 1]), results[0]
+        assert results[1] == ("ack", ["b", 1, 1]), results[1]
+        assert results[2][1][0] == "KeyError", results[2]
+
+        lines = trace.read_text().splitlines()
+        first = lines[: lines.index("inner<uses_pool") + 1]
+        assert first == [
+            "outer>uses_pool", "inner>uses_pool", "inner<uses_pool",
+        ], f"layers did not nest: {first}"
+        assert "inner!KeyError" in lines and "outer!KeyError" in lines, lines
+    finally:
+        trace.unlink(missing_ok=True)
+        os.environ.pop("TARSK_TRACE_LOG", None)
+
+
 if __name__ == "__main__":
     for check in (test_leaky_handler_is_bounded, test_recycling_is_overlapped,
                   test_baseline_above_ceiling_is_refused,
                   test_hard_ceiling_kills_and_dead_letters,
                   test_hard_ceiling_must_exceed_the_soft_one,
-                  test_hooks_bracket_every_worker):
+                  test_hooks_bracket_every_worker,
+                  test_middleware_wraps_and_dependencies_inject):
         check()
         print("ok", check.__name__)

@@ -16,7 +16,10 @@ import secrets
 import time
 from dataclasses import dataclass
 
-__all__ = ["App", "AsyncResult", "Task", "TaskFailed", "TaskSpec", "load_app"]
+__all__ = [
+    "App", "AsyncResult", "Context", "Depends", "Task", "TaskFailed", "TaskSpec",
+    "load_app",
+]
 
 DEFAULT_TIMEOUT = 300.0  # seconds — spec §9, doubles as the hard cap
 
@@ -46,12 +49,46 @@ class TaskSpec:
         ]
 
 
+@dataclass(frozen=True, slots=True)
+class Context:
+    """What a middleware is told about the call it is wrapping."""
+
+    name: str
+    task_id: str
+    attempt: int
+    args: tuple
+    kwargs: dict
+
+
+class Depends:
+    """A parameter the caller does not supply and the worker resolves.
+
+    `scope="worker"` resolves once per worker process and is reused — which in
+    this design is what a module-level global would have been, except it can be
+    replaced in a test. `scope="task"` resolves per call.
+    """
+
+    __slots__ = ("provider", "scope")
+
+    def __init__(self, provider, *, scope: str = "worker"):
+        if scope not in ("worker", "task"):
+            raise ValueError(f"scope must be 'worker' or 'task', got {scope!r}")
+        self.provider = provider
+        self.scope = scope
+
+
 class Task:
     def __init__(self, fn, spec: TaskSpec, app: "App"):
         self.fn = fn
         self.spec = spec
         self.app = app
         self.is_async = inspect.iscoroutinefunction(fn)
+        # Worked out once, at import, rather than on every dispatch.
+        self.depends = {
+            name: param.default
+            for name, param in inspect.signature(fn).parameters.items()
+            if isinstance(param.default, Depends)
+        }
         functools.update_wrapper(self, fn)
 
     def __call__(self, *args, **kwargs):
@@ -158,6 +195,9 @@ class App:
         self.registry: dict[str, Task] = {}
         self.start_hooks: list = []
         self.stop_hooks: list = []
+        self.middlewares: list = []
+        self._provided: dict = {}
+        self._overrides: dict = {}
         self._producer = None
 
     def task(
@@ -190,7 +230,7 @@ class App:
                 required = [
                     p for p in args.values()
                     if p.default is p.empty and p.kind not in (p.VAR_POSITIONAL, p.VAR_KEYWORD)
-                ]
+                ]  # a Depends is a default, so injected parameters do not count
                 if required:
                     raise ValueError(
                         f"{fn.__qualname__}: a cron task is called with no arguments, but "
@@ -231,6 +271,36 @@ class App:
         """
         self.stop_hooks.append(fn)
         return fn
+
+    def middleware(self, mw):
+        """Wrap every task this worker runs.
+
+        A middleware defines `execute(ctx, call)` and awaits `call()` to run the
+        rest — an onion, so tracing and transactions work by holding the call
+        open rather than by bracketing it with two callbacks.
+
+        Middleware runs in the worker, and on the producer side for
+        `before_send`. It cannot run in the supervisor: that process never
+        imports your code, which is what keeps its footprint a constant
+        (spec §4.1). There is no hook for "result stored" for the same reason.
+        """
+        self.middlewares.append(mw)
+        return mw
+
+    def override(self, provider, replacement):
+        """Swap what a `Depends` provider returns. For tests."""
+        self._overrides[provider] = replacement
+
+    async def resolve(self, dep: Depends):
+        provider = self._overrides.get(dep.provider, dep.provider)
+        if dep.scope == "worker" and provider in self._provided:
+            return self._provided[provider]
+        value = provider()
+        if inspect.isawaitable(value):
+            value = await value
+        if dep.scope == "worker":
+            self._provided[provider] = value
+        return value
 
     def producer(self):
         """Connection to the broker for enqueueing.

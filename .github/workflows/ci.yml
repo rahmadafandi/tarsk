@@ -61,17 +61,35 @@ jobs:
       matrix:
         include:
           - { os: ubuntu-24.04, target: x86_64 }
-          - { os: ubuntu-24.04, target: aarch64 }
+          # aarch64 cross-compiles through zig rather than the manylinux
+          # container's toolchain. rustls pulls in ring, whose ARM assembly the
+          # container's assembler rejects with `#error "ARM assembler must
+          # define __ARM_ARCH"`. zig cc gets the target flags right; verified by
+          # building this wheel on an x86_64 host before it was written here.
+          - { os: ubuntu-24.04, target: aarch64, zig: true }
           - { os: macos-14, target: universal2-apple-darwin }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Provide zig
+        if: matrix.zig
+        # maturin looks for a `zig` binary on PATH; the pip package is a Python
+        # module, so it needs a shim.
+        run: |
+          python -m pip install --quiet ziglang
+          mkdir -p "$HOME/.local/bin"
+          printf '#!/bin/sh\nexec %s -m ziglang "$@"\n' "$(which python)" > "$HOME/.local/bin/zig"
+          chmod +x "$HOME/.local/bin/zig"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist
+          args: --release --out dist ${{ matrix.zig && '--zig' || '' }}
+          # zig cross-compiles on the host and tags the wheel manylinux itself,
+          # so the container would only get in the way of finding it.
+          container: ${{ matrix.zig && 'off' || 'auto' }}
           manylinux: auto
       - uses: actions/upload-artifact@v4
         with:

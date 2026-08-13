@@ -92,6 +92,11 @@ their RSS, retires them, holds their leases and runs the schedule. A memory ceil
 held by something that does not have the problem — which is also why Celery could not enforce
 one from a master carrying 77 MB of your dependencies.
 
+Draining 10,000 no-op tasks across four worker processes, startup excluded: Celery 5.3s, taskiq
+1.4s, tarsk 0.6s — but tarsk has no broker yet and reads its queue from memory, so that last
+number is an upper bound rather than a result. Full table and caveats in
+[`bench/`](bench/README.md).
+
 ## What it does not claim
 
 **Not faster.** Dispatch costs microseconds; real handlers run for 50ms to minutes. With a 50ms

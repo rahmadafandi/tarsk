@@ -8,6 +8,7 @@ What this measures and why (spec §2 sets the terms):
   oom         tasks lost when the box enforces a hard memory limit
   gap         inter-task gaps caused by worker recycling
   throughput  tasks/sec, for a trivial handler and a realistic 50ms one
+  scale       time to drain 10 / 100 / 1k / 10k tasks, repeated, with spread
 
 Only `memory`, `oom` and `gap` test claims tarsk actually makes. `throughput`
 is here to be honest about the cost, not to win: tarsk has no broker yet
@@ -270,17 +271,19 @@ def base_env(log: Path) -> dict[str, str]:
     return env
 
 
-def celery_cmd(max_tasks_per_child: int | None) -> list[str]:
-    cmd = [PY, "-m", "celery", "-A", "bench.celery_app", "worker", "-c", "1", "-P", "prefork",
+def celery_cmd(max_tasks_per_child: int | None, workers: int = 1) -> list[str]:
+    cmd = [PY, "-m", "celery", "-A", "bench.celery_app", "worker", "-c", str(workers),
+           "-P", "prefork",
            "--loglevel", "error", "--without-gossip", "--without-mingle", "--without-heartbeat"]
     if max_tasks_per_child:
         cmd += ["--max-tasks-per-child", str(max_tasks_per_child)]
     return cmd
 
 
-def taskiq_cmd() -> list[str]:
-    return [PY, "-m", "taskiq", "worker", "bench.taskiq_app:broker", "--workers", "1",
-            "--max-async-tasks", "1", "--max-threadpool-threads", "1", "--log-level", "ERROR"]
+def taskiq_cmd(workers: int = 1) -> list[str]:
+    return [PY, "-m", "taskiq", "worker", "bench.taskiq_app:broker",
+            "--workers", str(workers), "--max-async-tasks", "1",
+            "--max-threadpool-threads", "1", "--log-level", "ERROR"]
 
 
 def tarsk_cmd(spec: dict, tmp: Path) -> list[str]:
@@ -343,6 +346,25 @@ def run_worker(cmd: list[str], env: dict, expected: int, log: Path, timeout: flo
     settled = 0
     last_progress = started
     stalled = False
+    # Read the completion log forward from where we left off. Re-parsing it
+    # whole twenty times a second turns the harness into the bottleneck at
+    # 10,000 tasks, which is exactly the size this is supposed to measure.
+    seen_ids: set = set()
+    offset = 0
+
+    def progress() -> int:
+        nonlocal offset
+        with open(log) as fh:
+            fh.seek(offset)
+            for line in fh:
+                if line.endswith("\n"):
+                    parts = line.split("\t")
+                    if parts:
+                        seen_ids.add(parts[0])
+                    offset += len(line)
+                else:
+                    break  # a half-written line; pick it up next time
+        return len(seen_ids)
 
     while time.time() < deadline and launches <= restarts:
         launches += 1
@@ -351,7 +373,7 @@ def run_worker(cmd: list[str], env: dict, expected: int, log: Path, timeout: flo
         sampler = Sampler(proc.pid)
         sampler.start()
         while time.time() < deadline:
-            done = len({row[0] for row in read_log(log)})
+            done = progress()
             if done > settled:
                 settled, last_progress = done, time.time()
             if done >= expected:
@@ -369,7 +391,7 @@ def run_worker(cmd: list[str], env: dict, expected: int, log: Path, timeout: flo
                  max(peaks[2], sampler.peak_root)]
         kill_tree(proc.pid)
         proc.wait()
-        if stalled or len({row[0] for row in read_log(log)}) >= expected:
+        if stalled or progress() >= expected:
             break
     wall = time.time() - started
 
@@ -395,7 +417,7 @@ def run_worker(cmd: list[str], env: dict, expected: int, log: Path, timeout: flo
 
 def case(framework: str, label: str, task: str, count: int, args: list, timeout: float,
          redis: Redis, tmp: Path, *, celery_mtpc=None, tarsk_kw=None, memory_max=None,
-         extra_env=None, restarts=0) -> Result:
+         extra_env=None, restarts=0, celery_workers=1, taskiq_workers=1) -> Result:
     log = tmp / f"{framework}-{label}-{task}.log".replace(" ", "_")
     log.unlink(missing_ok=True)
     log.touch()
@@ -410,10 +432,10 @@ def case(framework: str, label: str, task: str, count: int, args: list, timeout:
         redis.flush()
         if framework == "celery":
             submit_celery(task, count, args)
-            cmd = celery_cmd(celery_mtpc)
+            cmd = celery_cmd(celery_mtpc, celery_workers)
         else:
             submit_taskiq(task, count, args)
-            cmd = taskiq_cmd()
+            cmd = taskiq_cmd(taskiq_workers)
 
     result = run_worker(cmd, env, count, log, timeout, memory_max, restarts)
     result.framework, result.label = framework, label
@@ -646,6 +668,57 @@ def scenario_gap(redis: Redis, tmp: Path) -> None:
           rows, ["p50gap", "p99gap", "maxgap", "done"])
 
 
+def scenario_scale(redis: Redis, tmp: Path) -> None:
+    """Time to drain a queue, across four sizes, repeated.
+
+    Four worker processes each, one task at a time per process. Processes are
+    the axis tarsk scales on, so that is the axis held equal — see the note
+    below for what that hides.
+    """
+    counts = [10, 100, 1_000, 10_000]
+    repeats = int(os.environ.get("BENCH_REPEAT", "5"))
+    workers = 4
+    runtimes = {
+        "celery": dict(celery_workers=workers),
+        "taskiq": dict(taskiq_workers=workers),
+        "tarsk": dict(tarsk_kw={"children": workers}),
+    }
+
+    print(f"\n### Draining a queue — {workers} worker processes, {repeats} runs each\n")
+    print("Seconds from the first completion to the last, so worker startup is not counted "
+          "in\nthe figure; it is reported beside it. Every task is enqueued before the "
+          "worker starts.\n")
+    print("| runtime | tasks | min | median | p90 | max | startup (median) |")
+    print("|---|---|---|---|---|---|---|")
+    for name, kwargs in runtimes.items():
+        for count in counts:
+            works, boots = [], []
+            for _ in range(repeats):
+                result = case(name, f"scale-{count}", "noop", count, [], 300, redis, tmp,
+                              **kwargs)
+                if result.completed < count:
+                    works.append(float("nan"))
+                    continue
+                works.append(result.work)
+                boots.append(result.boot)
+            good = sorted(w for w in works if w == w)
+            if not good:
+                print(f"| {name} | {count:,} | did not drain | | | | |")
+                continue
+            print(f"| {name} | {count:,} | {good[0]:.3f} | {statistics.median(good):.3f} | "
+                  f"{quantile(good, 0.9):.3f} | {good[-1]:.3f} | "
+                  f"{statistics.median(boots):.2f} |")
+    print("\n**tarsk's rows are not comparable and are the least interesting here.** It has "
+          "no\nbroker yet, so it reads its queue from memory while the other two make a "
+          "Redis round\ntrip per task — which at these sizes is most of what is being "
+          "timed. Read the celery\nand taskiq columns against each other, and read tarsk's "
+          "as an upper bound on what a\nbroker will have to fit under.\n")
+    print("What is held equal is processes, not concurrency. taskiq can await thousands of "
+          "tasks\ninside one process and would pull away on anything I/O-bound; tarsk runs "
+          "one task per\nchild and cannot. That is a real limit, not a benchmark choice, "
+          "and a no-op handler is\nthe case that hides it.")
+
+
 def scenario_throughput(redis: Redis, tmp: Path) -> None:
     rows = [
         case("celery", "noop", "noop", 500, [], 300, redis, tmp),
@@ -674,6 +747,7 @@ SCENARIOS = {
     "oom": scenario_oom,
     "gap": scenario_gap,
     "throughput": scenario_throughput,
+    "scale": scenario_scale,
 }
 
 

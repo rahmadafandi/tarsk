@@ -198,6 +198,42 @@ child off the critical path, and never launching a second replacement while the 
 booting. The supervisor exports `recycles_prewarmed` and `wasted_spares` so this is checkable
 rather than assertable.
 
+### Draining a queue, by size
+
+`python bench/run.py scale` — four worker processes each, five runs per cell, no-op handler.
+Shaped after [s3rius's taskiq benchmark](https://gist.github.com/s3rius/91c39494fe1b96ad467cee671dfdf5ec),
+with startup pulled out of the figure rather than folded into it.
+
+| runtime | tasks | min | median | p90 | max | startup (median) |
+|---|---|---|---|---|---|---|
+| celery | 10 | 0.005 | 0.005 | 0.005 | 0.005 | 0.42 s |
+| celery | 100 | 0.047 | 0.052 | 0.053 | 0.053 | 0.37 s |
+| celery | 1,000 | 0.492 | 0.519 | 0.555 | 0.555 | 0.37 s |
+| celery | 10,000 | 5.059 | 5.306 | 5.538 | 5.538 | 0.37 s |
+| taskiq | 10 | 0.002 | 0.003 | 0.004 | 0.004 | 0.48 s |
+| taskiq | 100 | 0.012 | 0.012 | 0.017 | 0.017 | 0.47 s |
+| taskiq | 1,000 | 0.087 | 0.093 | 0.096 | 0.096 | 0.44 s |
+| taskiq | 10,000 | 1.337 | 1.415 | 1.486 | 1.486 | 0.55 s |
+| tarsk | 10 | 0.001 | 0.002 | 0.002 | 0.002 | 0.19 s |
+| tarsk | 100 | 0.008 | 0.009 | 0.012 | 0.012 | 0.18 s |
+| tarsk | 1,000 | 0.068 | 0.073 | 0.074 | 0.074 | 0.18 s |
+| tarsk | 10,000 | 0.606 | 0.617 | 0.654 | 0.654 | 0.20 s |
+
+**tarsk's rows are the least interesting here and are not comparable.** It has no broker yet,
+so it reads its queue from memory while the others make a Redis round trip per task — at these
+sizes, most of what is being timed. Read celery against taskiq; read tarsk as an upper bound on
+what a broker will have to fit under.
+
+Between the two that *are* comparable, taskiq drains 10,000 no-ops in 1.4s to Celery's 5.3s,
+and boots slower doing it: 0.48s against 0.37s. The original benchmark folds boot into the
+figure, which is most of why its N=10 row reads 0.46s against 1.78s — at ten tasks there is
+almost nothing but startup to measure.
+
+What is held equal here is **processes, not concurrency**. taskiq can await thousands of tasks
+inside one process and would pull away on anything I/O-bound; tarsk runs one task per child and
+cannot. That is a real limit rather than a benchmark choice — see the one-slot note in
+`tarsk/_child.py` — and a no-op handler is precisely the case that hides it.
+
 ### Throughput, single worker
 
 | runtime | tasks/sec | wall | startup | 

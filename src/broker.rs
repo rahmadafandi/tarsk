@@ -304,7 +304,11 @@ impl MemoryBroker {
 // ------------------------------------------------------------------- redis
 
 pub struct RedisBroker {
-    conn: tokio::sync::Mutex<redis::aio::MultiplexedConnection>,
+    /// Cloned per command rather than locked. A MultiplexedConnection is built
+    /// to be used concurrently — putting a mutex round it made every command
+    /// from every child queue behind one lock on a single-threaded runtime,
+    /// which is a bottleneck this driver invented for itself.
+    conn: redis::aio::MultiplexedConnection,
     consumer: String,
     queues: Vec<String>,
     /// Shortest timeout registered anywhere, the floor for the pending sweep.
@@ -408,7 +412,7 @@ impl RedisBroker {
             }
         }
         Ok(RedisBroker {
-            conn: tokio::sync::Mutex::new(conn),
+            conn,
             consumer: format!("tarsk-{}", std::process::id()),
             queues,
             min_timeout_ms: AtomicU64::new(u64::MAX),
@@ -421,7 +425,7 @@ impl RedisBroker {
     }
 
     async fn push(&self, job: NewJob, delay: Duration) -> Res<()> {
-        let mut conn = self.conn.lock().await;
+        let mut conn = self.conn.clone();
         if delay.is_zero() {
             let _: String = redis::cmd("XADD")
                 .arg(stream_key(&job.queue))
@@ -434,7 +438,7 @@ impl RedisBroker {
                 .arg(job.timeout_ms)
                 .arg("i")
                 .arg(&job.id)
-                .query_async(&mut *conn)
+                .query_async(&mut conn)
                 .await?;
             return Ok(());
         }
@@ -464,13 +468,13 @@ impl RedisBroker {
             .arg(&key)
             .arg(due)
             .arg(&id)
-            .query_async(&mut *conn)
+            .query_async(&mut conn)
             .await?;
         Ok(())
     }
 
     async fn claim_tick(&self, name: &str, minute: i64) -> Res<bool> {
-        let mut conn = self.conn.lock().await;
+        let mut conn = self.conn.clone();
         // NX is the whole election: one SET wins, the rest see the key. The TTL
         // only has to outlive the minute it guards.
         let won: Option<String> = redis::cmd("SET")
@@ -479,13 +483,13 @@ impl RedisBroker {
             .arg("NX")
             .arg("EX")
             .arg(120)
-            .query_async(&mut *conn)
+            .query_async(&mut conn)
             .await?;
         Ok(won.is_some())
     }
 
     async fn store_result(&self, id: &str, blob: Vec<u8>, ttl: Duration) -> Res<()> {
-        let mut conn = self.conn.lock().await;
+        let mut conn = self.conn.clone();
         // PX rather than a sweeper: an expiry the server enforces cannot be
         // forgotten by a worker that died holding the job of forgetting it.
         let _: redis::Value = redis::cmd("SET")
@@ -493,16 +497,16 @@ impl RedisBroker {
             .arg(blob)
             .arg("PX")
             .arg(ttl.as_millis().max(1) as u64)
-            .query_async(&mut *conn)
+            .query_async(&mut conn)
             .await?;
         Ok(())
     }
 
     async fn get_result(&self, id: &str) -> Res<Option<Vec<u8>>> {
-        let mut conn = self.conn.lock().await;
+        let mut conn = self.conn.clone();
         let blob: Option<Vec<u8>> = redis::cmd("GET")
             .arg(result_key(id))
-            .query_async(&mut *conn)
+            .query_async(&mut conn)
             .await?;
         Ok(blob)
     }
@@ -511,13 +515,13 @@ impl RedisBroker {
     async fn promote_due(&self) -> Res<usize> {
         let mut moved = 0;
         for queue in &self.queues {
-            let mut conn = self.conn.lock().await;
+            let mut conn = self.conn.clone();
             let promoted: usize = redis::Script::new(PROMOTE_DUE)
                 .key(delayed_key(queue))
                 .key(stream_key(queue))
                 .arg(now_ms())
                 .arg(128)
-                .invoke_async(&mut *conn)
+                .invoke_async(&mut conn)
                 .await?;
             moved += promoted;
         }
@@ -546,7 +550,7 @@ impl RedisBroker {
             }
         }
         let batch = self.prefetch.load(Ordering::Relaxed).max(1);
-        let mut conn = self.conn.lock().await;
+        let mut conn = self.conn.clone();
         let mut cmd = redis::cmd("XREADGROUP");
         cmd.arg("GROUP")
             .arg(REDIS_GROUP)
@@ -562,7 +566,7 @@ impl RedisBroker {
         for _ in &self.queues {
             cmd.arg(">"); // never-delivered only; our own backlog is in `recovered`
         }
-        let reply: Option<redis::streams::StreamReadReply> = cmd.query_async(&mut *conn).await?;
+        let reply: Option<redis::streams::StreamReadReply> = cmd.query_async(&mut conn).await?;
         let Some(reply) = reply else { return Ok(None) };
         // Everything the read returned is now in this consumer's PEL, so all of
         // it has to be accounted for: hand one out and hold the rest. Taking
@@ -618,7 +622,7 @@ impl RedisBroker {
             return Err("not a redis receipt".into());
         };
         let key = stream_key(queue);
-        let mut conn = self.conn.lock().await;
+        let mut conn = self.conn.clone();
         // XACK clears the pending entry; XDEL stops the stream growing forever.
         // Pipelined so a crash between them cannot leave the entry both
         // unacknowledged and deleted.
@@ -631,7 +635,7 @@ impl RedisBroker {
             .cmd("XDEL")
             .arg(&key)
             .arg(id)
-            .query_async(&mut *conn)
+            .query_async(&mut conn)
             .await?;
         Ok(())
     }
@@ -647,12 +651,12 @@ impl RedisBroker {
             return Err("not a redis receipt".into());
         };
         let key = stream_key(queue);
-        let mut conn = self.conn.lock().await;
+        let mut conn = self.conn.clone();
         let entries: redis::streams::StreamRangeReply = redis::cmd("XRANGE")
             .arg(&key)
             .arg(id)
             .arg(id)
-            .query_async(&mut *conn)
+            .query_async(&mut conn)
             .await?;
         let deadline = entries.ids.first().map(|e| entry_fields(e).2).unwrap_or(0)
             + self.grace_ms.load(Ordering::Relaxed);
@@ -676,7 +680,7 @@ impl RedisBroker {
             .arg("IDLE")
             .arg(idle)
             .arg("JUSTID") // no delivery-count bump: the reclaim will do that
-            .query_async(&mut *conn)
+            .query_async(&mut conn)
             .await?;
         Ok(())
     }
@@ -692,12 +696,12 @@ impl RedisBroker {
         };
         let key = stream_key(queue);
         let grave = format!("{key}:dead");
-        let mut conn = self.conn.lock().await;
+        let mut conn = self.conn.clone();
         let entries: redis::streams::StreamRangeReply = redis::cmd("XRANGE")
             .arg(&key)
             .arg(id)
             .arg(id)
-            .query_async(&mut *conn)
+            .query_async(&mut conn)
             .await?;
         let (name, payload, timeout_ms) = entries
             .ids
@@ -726,7 +730,7 @@ impl RedisBroker {
             .cmd("XDEL")
             .arg(&key)
             .arg(id)
-            .query_async(&mut *conn)
+            .query_async(&mut conn)
             .await?;
         Ok(())
     }
@@ -753,7 +757,7 @@ impl RedisBroker {
         let mut reclaimed = 0;
         for queue in &self.queues {
             let key = stream_key(queue);
-            let mut conn = self.conn.lock().await;
+            let mut conn = self.conn.clone();
             let pending: redis::streams::StreamPendingCountReply = redis::cmd("XPENDING")
                 .arg(&key)
                 .arg(REDIS_GROUP)
@@ -762,14 +766,14 @@ impl RedisBroker {
                 .arg("-")
                 .arg("+")
                 .arg(64)
-                .query_async(&mut *conn)
+                .query_async(&mut conn)
                 .await?;
             for candidate in pending.ids {
                 let entries: redis::streams::StreamRangeReply = redis::cmd("XRANGE")
                     .arg(&key)
                     .arg(&candidate.id)
                     .arg(&candidate.id)
-                    .query_async(&mut *conn)
+                    .query_async(&mut conn)
                     .await?;
                 let Some(entry) = entries.ids.first() else {
                     continue;
@@ -785,7 +789,7 @@ impl RedisBroker {
                     .arg(&self.consumer)
                     .arg(deadline)
                     .arg(&candidate.id)
-                    .query_async(&mut *conn)
+                    .query_async(&mut conn)
                     .await?;
                 if claimed.ids.is_empty() {
                     continue; // another supervisor got there first

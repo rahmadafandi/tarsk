@@ -378,6 +378,13 @@ tables when the spread exceeds 1.25×. Neither contaminated run had it yet, whic
 section exists rather than a footnote. On this machine the probe is 20ms when idle and reached
 30ms while a browser and a Kubernetes node were running.
 
+**GitHub Actions works**, and `.github/workflows/bench.yml` runs it on demand. A runner is a
+full VM with systemd, so the OOM table's memory scope is available — through `sudo -n` rather
+than `--user`, because the runner has no login session bus, and the harness now tries both and
+refuses to run that case unlimited if neither works. What a runner is not is a fixed machine: a
+private repository gets two cores against this laptop's sixteen, and each run lands on a
+different host. Read ratios within a run, never absolute numbers across runs.
+
 Take these on an idle machine. Google Colab is not one — beyond the shared CPU, it has no
 systemd user session for the OOM table's `systemd-run --scope MemoryMax=400M` and runs as root,
 which `initdb` refuses, so two tables would silently not exist.

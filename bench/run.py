@@ -283,6 +283,29 @@ def base_env(log: Path) -> dict[str, str]:
     return env
 
 
+def cgroup_prefix(memory_max: str) -> list[str] | None:
+    """How to run a command under a hard memory limit, or None if we cannot.
+
+    A user scope needs a login session's D-Bus, which a CI runner started from
+    a service does not have. A system scope needs root. Both are checked rather
+    than assumed, because the failure mode of guessing is a table that reports
+    what an *unlimited* worker did under a heading that says 400MB.
+    """
+    limits = ["-p", f"MemoryMax={memory_max}", "-p", "MemorySwapMax=0", "--"]
+    for candidate in (
+        ["systemd-run", "--user", "--scope", "-q", *limits],
+        ["sudo", "-n", "systemd-run", "--scope", "-q", *limits],
+    ):
+        probe_cmd = candidate + ["true"]
+        try:
+            done = subprocess.run(probe_cmd, capture_output=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if done.returncode == 0:
+            return candidate
+    return None
+
+
 def probe() -> float:
     """Time a fixed amount of pure-Python work, in seconds.
 
@@ -425,8 +448,16 @@ def run_worker(cmd: list[str], env: dict, expected: int, log: Path, timeout: flo
     runtime with more processes, and taskiq runs seven where tarsk runs five.
     """
     if memory_max:
-        cmd = ["systemd-run", "--user", "--scope", "-q", "-p", f"MemoryMax={memory_max}",
-               "-p", "MemorySwapMax=0", "--"] + cmd
+        prefix = cgroup_prefix(memory_max)
+        if prefix is None:
+            raise RuntimeError(
+                "no way to impose a memory limit here: `systemd-run --user` needs a user "
+                "session bus and `sudo -n systemd-run` needs passwordless sudo. On a CI "
+                "runner, either is usually one line of setup — see bench/README.md. "
+                "Refusing to run this case unlimited, which would silently measure "
+                "something else."
+            )
+        cmd = prefix + cmd
     started = time.time()
     deadline = started + timeout
     peaks = [0, 0, 0]

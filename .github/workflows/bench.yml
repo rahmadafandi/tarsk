@@ -1,0 +1,64 @@
+name: bench
+
+# Manual only. A benchmark on a shared runner is worth running when you want it,
+# not on every push: it takes about twenty minutes and its absolute numbers are
+# not comparable between runs on different machines.
+on:
+  workflow_dispatch:
+    inputs:
+      scenarios:
+        description: "scenarios to run, space separated (empty = all)"
+        required: false
+        default: ""
+
+jobs:
+  bench:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Report the machine
+        # Every absolute number below depends on these. A run with a different
+        # core count is a different experiment, not a later data point.
+        run: |
+          echo "cores: $(nproc)"
+          free -m | sed -n 2p
+          lscpu | grep -E "Model name|MHz" || true
+
+      - name: Install Redis and Postgres
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq redis-server postgresql
+          # The harness starts its own instances; the packages are only here for
+          # the binaries. Stop the ones apt started so they cannot be confused
+          # for the ones under test.
+          sudo systemctl stop redis-server postgresql || true
+          echo "$(ls -d /usr/lib/postgresql/*/bin | head -1)" >> "$GITHUB_PATH"
+
+      - name: Allow a memory-limited scope
+        # The runner is started from a service and has no user session bus, so
+        # `systemd-run --user` fails. The harness falls back to `sudo -n`, which
+        # is available here; this step only proves it before twenty minutes of
+        # work rather than after.
+        run: |
+          sudo -n systemd-run --scope -q -p MemoryMax=64M -p MemorySwapMax=0 -- true
+          echo "memory-limited scopes work"
+
+      - name: Build the extension
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install -q maturin celery taskiq taskiq-redis redis
+          .venv/bin/maturin develop --release
+
+      - name: Run the benchmark
+        run: .venv/bin/python bench/run.py ${{ inputs.scenarios }} | tee bench-output.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ github.sha }}
+          path: bench-output.md

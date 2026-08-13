@@ -1152,6 +1152,13 @@ async fn supervise(
     }
 
     let listener = UnixListener::bind(&cfg.socket)?;
+    // Belt and braces behind the 0700 directory: Linux enforces socket
+    // permissions, and the platforms that do not are covered by the directory.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&cfg.socket, std::fs::Permissions::from_mode(0o600));
+    }
     let cfg = Arc::new(cfg);
     let acceptor = tokio::spawn(accept_loop(listener, shared.clone()));
 
@@ -1351,6 +1358,15 @@ fn socket_dir() -> io::Result<std::path::PathBuf> {
         .unwrap_or(0);
     let dir = std::env::temp_dir().join(format!("tarsk-{}-{}", std::process::id(), stamp));
     std::fs::create_dir_all(&dir)?;
+    // 0700, or anyone with an account on the box can connect to the dispatch
+    // socket, register as a child, and be handed other people's task payloads —
+    // and have its Acks believed. A default umask leaves the directory
+    // traversable, which is enough.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    }
     Ok(dir)
 }
 
@@ -1598,4 +1614,24 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(run, m)?)?;
     m.add_function(wrap_pyfunction!(work, m)?)?;
     m.add_class::<Producer>()
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn socket_dir_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = socket_dir().unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        std::fs::remove_dir_all(&dir).ok();
+        // Group- or world-reachable means another account on the box can
+        // connect to the dispatch socket, register as a child, and be handed
+        // other people's task payloads.
+        assert_eq!(
+            mode, 0o700,
+            "socket dir must not be reachable by other users"
+        );
+    }
 }

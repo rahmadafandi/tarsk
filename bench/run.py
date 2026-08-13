@@ -271,8 +271,42 @@ def base_env(log: Path) -> dict[str, str]:
     return env
 
 
-def celery_cmd(max_tasks_per_child: int | None, workers: int = 1) -> list[str]:
-    cmd = [PY, "-m", "celery", "-A", "bench.celery_app", "worker", "-c", str(workers),
+def probe() -> float:
+    """Time a fixed amount of pure-Python work, in seconds.
+
+    Load average lags a minute and cannot separate "busy now" from "was busy".
+    This is direct: the same loop takes the same time on an idle machine, so a
+    run whose probe drifts from its neighbours was not measured under the same
+    conditions as them, whatever the numbers say.
+    """
+    start = time.perf_counter()
+    total = 0
+    for i in range(400_000):
+        total += i * i
+    return time.perf_counter() - start
+
+
+PROBES: list[float] = []
+
+
+def contamination() -> str | None:
+    """A line to print under a table when the machine did not hold still."""
+    if len(PROBES) < 2:
+        return None
+    spread = max(PROBES) / min(PROBES)
+    if spread < 1.25:
+        return None
+    return (f"**The machine drifted during this run**: an identical CPU probe took "
+            f"{min(PROBES) * 1000:.0f}ms at its fastest and {max(PROBES) * 1000:.0f}ms at "
+            f"its slowest, {spread:.1f}x apart. Rows measured at different times are not "
+            f"comparable with each other. Re-run on an idle machine before believing any "
+            f"ordering here.")
+
+
+def celery_cmd(max_tasks_per_child: int | None, workers: int | None = 1) -> list[str]:
+    """`workers=None` omits the flag, leaving the runtime's own default."""
+    cmd = [PY, "-m", "celery", "-A", "bench.celery_app", "worker",
+           *(["-c", str(workers)] if workers is not None else []),
            "-P", "prefork",
            "--loglevel", "error", "--without-gossip", "--without-mingle", "--without-heartbeat"]
     if max_tasks_per_child:
@@ -280,24 +314,32 @@ def celery_cmd(max_tasks_per_child: int | None, workers: int = 1) -> list[str]:
     return cmd
 
 
-def taskiq_cmd(workers: int = 1, module: str = "bench.taskiq_app",
+def taskiq_cmd(workers: int | None = 1, module: str = "bench.taskiq_app",
                async_tasks: int = 1) -> list[str]:
     """One task at a time per process by default, so process count is the axis.
 
     `async_tasks` lifts that, which is the whole point of the io scenario: it
     is the thing taskiq can do and tarsk cannot.
     """
+    if workers is None:
+        # No concurrency flags at all — taskiq's own defaults, 2 x 100.
+        return [PY, "-m", "taskiq", "worker", f"{module}:broker", "--log-level", "ERROR"]
     return [PY, "-m", "taskiq", "worker", f"{module}:broker",
             "--workers", str(workers), "--max-async-tasks", str(async_tasks),
             "--max-threadpool-threads", "1", "--log-level", "ERROR"]
 
 
-def tarsk_cmd(children: int, max_rss: int, max_tasks: int, hard_max_rss: int,
-              slots: int = 1) -> list[str]:
-    """The real worker against the real broker — the same one a user runs."""
+def tarsk_cmd(children: int | None, max_rss: int, max_tasks: int, hard_max_rss: int,
+              slots: int | None = 1) -> list[str]:
+    """The real worker against the real broker — the same one a user runs.
+
+    `children=None` / `slots=None` omit the flags, which is how the defaults
+    table gets tarsk's own answer rather than this harness's.
+    """
     cmd = [PY, "-m", "tarsk._cli", "worker", "--app", "bench.tarsk_app:app",
-           "--broker", REDIS_URL, "--children", str(children), "--lease-grace", "5",
-           "--slots", str(slots)]
+           "--broker", REDIS_URL, "--lease-grace", "5",
+           *(["--children", str(children)] if children is not None else []),
+           *(["--slots", str(slots)] if slots is not None else [])]
     if max_rss:
         cmd += ["--max-rss", str(max_rss)]
     if max_tasks:
@@ -477,6 +519,7 @@ def case(framework: str, label: str, task: str, count: int, args: list, timeout:
             submit_taskiq(task, count, args, taskiq_module)
             cmd = taskiq_cmd(taskiq_workers, taskiq_module, taskiq_async)
 
+    PROBES.append(probe())
     result = run_worker(cmd, env, count, log, timeout, memory_max, restarts, sample=sample)
     result.framework, result.label = framework, label
     return result
@@ -627,14 +670,19 @@ def scenario_memory(redis: Redis, tmp: Path) -> None:
         case("taskiq", "(no recycling available)", "leak", count, [leak], 300, redis, tmp),
         case("celery", f"--max-tasks-per-child={MTPC}", "leak", count, [leak], 300, redis, tmp,
              celery_mtpc=MTPC),
-        case("tarsk", "--max-rss=200MB", "leak", count, [leak], 300, redis, tmp,
-             tarsk_kw={"max_rss": CEILING}),
+        case("tarsk", "--max-rss=200MB --slots 1", "leak", count, [leak], 300, redis, tmp,
+             tarsk_kw={"max_rss": CEILING, "slots": 1}),
+        case("tarsk", "--max-rss=200MB (default 100 slots)", "leak", count, [leak], 300,
+             redis, tmp, tarsk_kw={"max_rss": CEILING, "slots": 100}),
     ]
     table(f"Bounded memory — {count} tasks, each retaining {leak}MB",
           f"Both limits aim at the same ~200MB budget: `--max-tasks-per-child={MTPC}` was "
           "chosen by dividing that budget by this workload's known leak rate. Celery bounds "
           "it tighter here, and that is the fair result to report — when you know the leak "
-          "per task, counting tasks works.", rows, ["peak", "done", "lost"])
+          "per task, counting tasks works.\n\nThe two tarsk rows are the same ceiling at "
+          "one slot and at the default eight. A slot is a task that can be allocating when "
+          "the ceiling is read, so the gap between those rows is what the default costs on "
+          "a workload that allocates.", rows, ["peak", "done", "lost"])
 
 
 def scenario_memory_workload_shift(redis: Redis, tmp: Path) -> None:
@@ -817,6 +865,40 @@ def scenario_io(redis: Redis, tmp: Path) -> None:
     print(f"\nThe 4-way floor is {floor4:.1f}s.\n")
 
 
+def scenario_defaults(redis: Redis, tmp: Path) -> None:
+    """Every runtime exactly as installed — no concurrency flags at all.
+
+    Every other table here pins concurrency so one axis is held equal. This one
+    does the opposite and asks what a person gets for typing the documented
+    command, which is what most people will actually run.
+    """
+    count = 2_000
+    repeats = int(os.environ.get("BENCH_REPEAT", "3"))
+    runtimes = {
+        "celery (-c = cores, 16 here)": dict(celery_workers=None),
+        "taskiq (2 workers × 100)": dict(taskiq_workers=None,
+                                         taskiq_module="bench.taskiq_stream_app"),
+        "tarsk (2 children × 100 slots)": dict(tarsk_kw={"children": None, "slots": None}),
+    }
+    print(f"\n### Out of the box — {count} tasks that each await 100ms\n")
+    print("No `-c`, no `--workers`, no `--children`, no `--slots`: whatever each runtime "
+          "does\nwhen told nothing. The I/O handler is used because a no-op would make this "
+          "a\nmeasure of dispatch rather than of the default concurrency.\n")
+    print("| runtime | median wall | peak tree RSS | completed |")
+    print("|---|---|---|---|")
+    for name, kwargs in runtimes.items():
+        framework = name.split()[0]
+        walls, peaks, done = [], [], count
+        for _ in range(repeats):
+            result = case(framework, "defaults", "io100", count, [], 300, redis, tmp, **kwargs)
+            done = min(done, result.completed)
+            if result.completed == count:
+                walls.append(result.work)
+            peaks.append(result.peak_total)
+        shown = f"{statistics.median(walls):.2f}s" if walls else "did not drain"
+        print(f"| {name} | {shown} | {max(peaks) // MB} MB | {done}/{count} |")
+
+
 def scenario_throughput(redis: Redis, tmp: Path) -> None:
     rows = [
         case("celery", "noop", "noop", 500, [], 300, redis, tmp),
@@ -846,6 +928,7 @@ SCENARIOS = {
     "throughput": scenario_throughput,
     "scale": scenario_scale,
     "io": scenario_io,
+    "defaults": scenario_defaults,
 }
 
 
@@ -859,6 +942,9 @@ def main() -> None:
         with Redis() as redis:
             for name in wanted:
                 SCENARIOS[name](redis, tmp)
+        warning = contamination()
+        if warning:
+            print(f"\n{warning}")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

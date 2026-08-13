@@ -140,6 +140,22 @@ def test_hooks_bracket_every_worker():
         os.environ.pop("TARSK_HOOK_LOG", None)
 
 
+def test_sync_middleware_is_refused():
+    """It would close whatever it wraps before the task ran. Measured, once."""
+    from tarsk import App
+
+    class Wrong:
+        def execute(self, ctx, call):  # not async
+            return call()
+
+    try:
+        App().middleware(Wrong())
+    except TypeError as exc:
+        assert "async def" in str(exc), exc
+    else:
+        raise AssertionError("a sync middleware must be refused, not silently reordered")
+
+
 def test_middleware_wraps_and_dependencies_inject():
     """Layers nest outside-in and unwind inside-out, failures included.
 
@@ -180,6 +196,7 @@ if __name__ == "__main__":
                   test_hard_ceiling_kills_and_dead_letters,
                   test_hard_ceiling_must_exceed_the_soft_one,
                   test_hooks_bracket_every_worker,
-                  test_middleware_wraps_and_dependencies_inject):
+                  test_middleware_wraps_and_dependencies_inject,
+                  test_sync_middleware_is_refused):
         check()
         print("ok", check.__name__)

@@ -279,11 +279,23 @@ class App:
         rest — an onion, so tracing and transactions work by holding the call
         open rather than by bracketing it with two callbacks.
 
+        `execute` must be async. A sync one cannot await the next layer, so
+        whatever it wraps closes before the task runs — the span shuts, the
+        transaction commits, and then the work happens. That is silent enough
+        to be worth refusing outright.
+
         Middleware runs in the worker, and on the producer side for
         `before_send`. It cannot run in the supervisor: that process never
         imports your code, which is what keeps its footprint a constant
         (spec §4.1). There is no hook for "result stored" for the same reason.
         """
+        execute = getattr(mw, "execute", None)
+        if execute is not None and not inspect.iscoroutinefunction(execute):
+            raise TypeError(
+                f"{type(mw).__name__}.execute must be `async def`: it has to await call() "
+                "to run the next layer. A sync one returns before the task does, so "
+                "anything it wraps closes too early."
+            )
         self.middlewares.append(mw)
         return mw
 

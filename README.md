@@ -149,6 +149,14 @@ transaction is the obvious shape rather than something reconstructed from two ho
 timeout covers the middleware too — a tracing layer that hangs holds the lease exactly as a
 handler would.
 
+`execute` must be `async def`, and a sync one is refused at registration rather than accepted:
+it cannot await the next layer, so everything it wraps would close before the task ran.
+
+Everything else takes either kind. Handlers, `on_start`, `on_stop` and `Depends` providers may
+be sync or async — but only sync *handlers* are moved to a thread. A sync hook or provider runs
+on the worker's event loop, which is harmless while a worker runs one task at a time and is the
+first thing to revisit if that changes.
+
 `Depends(provider)` resolves once per worker process by default, which is what a module-level
 global would have been, except `app.override(provider, fake)` can replace it in a test. Pass
 `scope="task"` to resolve per call.

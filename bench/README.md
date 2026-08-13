@@ -56,7 +56,7 @@ keeps several around.
 | runtime | coordinator (light → heavy) | runs your code (light → heavy) | coordinator imports it | whole tree, heavy (Rss / Pss) |
 |---|---|---|---|---|
 | celery | 55 → 77 MB (+22) | 55 → 77 MB (+22) | **yes** | 141 / **99** MB |
-| taskiq | 51 → 51 MB (+0) | 58 → 58 MB (+0) ⚠️ | no | 144 / **91** MB |
+| taskiq | 51 → 51 MB (+0) | 58 → 58 MB (+0) † | no | 144 / **91** MB |
 | tarsk | 27 → 27 MB (+0) | 24 → 58 MB (+33) | no | 85 / **59** MB |
 
 Celery's master imports your app and grows with it, then forks, so its children start from that
@@ -88,12 +88,25 @@ because a fresh tarsk child has almost nothing in it. Neither number is wrong; t
 different questions, and "how much does my dependency tree cost" only has an answer relative to
 a starting point.
 
-⚠️ The taskiq worker cell does not move, and the run-to-run figures for it are unstable —
-sometimes 58MB, sometimes no live process at all. Its worker does not survive an idle Redis
-read here (`redis.exceptions.TimeoutError`) and is respawned, so what gets sampled depends on
-where in that cycle the sample lands. The direct instrumentation above is the trustworthy
-reading for taskiq: +7MB, from 514 modules to 581. Earlier benchmarks on this page avoided the
-whole problem by preloading the queue, so the worker was never idle.
+† The taskiq worker cell does not move because steady-state RSS does not isolate the import
+for it: measured *at import*, the heavy module costs that process +7MB (52.3 → 59.4MB, 514 →
+581 modules), but its worker allocates a comparable amount after import regardless, so both
+configurations settle near 58MB a few seconds later. tarsk's child does almost nothing after
+importing, so its delta survives to steady state. Two runtimes, one measurement, different
+things measured — worth knowing before reading the column as a ranking.
+
+**A compatibility bug this scenario surfaced, since it changes how taskiq is run here.** With a
+plain URL, taskiq-redis 1.2.3 on redis-py 8.1.0 kills its worker every five seconds while idle.
+`ListQueueBroker.listen` calls `brpop()` with no timeout, intending to block; redis-py 8.x now
+applies a default 5-second socket read timeout even when the URL sets none, and raises
+`redis.exceptions.TimeoutError` — which `listen` does not catch, because it catches
+`ConnectionError` and in redis-py 8.x `TimeoutError` descends from `RedisError` instead. The
+generator dies, the worker dies, the process manager respawns it.
+
+`socket_timeout=None` fixes it (0 errors across 14 idle seconds, against a crash every 5), and
+this harness now passes it. Anything else would be benchmarking a version mismatch. The earlier
+scenarios on this page never saw it because they preload the queue, so the worker is never idle
+long enough.
 
 ### Footprint, after one trivial task### Footprint, after one trivial task
 

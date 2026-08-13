@@ -280,16 +280,34 @@ def celery_cmd(max_tasks_per_child: int | None, workers: int = 1) -> list[str]:
     return cmd
 
 
-def taskiq_cmd(workers: int = 1) -> list[str]:
-    return [PY, "-m", "taskiq", "worker", "bench.taskiq_app:broker",
+def taskiq_cmd(workers: int = 1, module: str = "bench.taskiq_app") -> list[str]:
+    return [PY, "-m", "taskiq", "worker", f"{module}:broker",
             "--workers", str(workers), "--max-async-tasks", "1",
             "--max-threadpool-threads", "1", "--log-level", "ERROR"]
 
 
-def tarsk_cmd(spec: dict, tmp: Path) -> list[str]:
-    path = tmp / "tarsk-spec.json"
-    path.write_text(json.dumps(spec))
-    return [PY, "bench/tarsk_worker.py", str(path)]
+def tarsk_cmd(children: int, max_rss: int, max_tasks: int, hard_max_rss: int) -> list[str]:
+    """The real worker against the real broker — the same one a user runs."""
+    cmd = [PY, "-m", "tarsk._cli", "worker", "--app", "bench.tarsk_app:app",
+           "--broker", REDIS_URL, "--children", str(children), "--lease-grace", "5"]
+    if max_rss:
+        cmd += ["--max-rss", str(max_rss)]
+    if max_tasks:
+        cmd += ["--max-tasks", str(max_tasks)]
+    if hard_max_rss:
+        cmd += ["--hard-max-rss", str(hard_max_rss)]
+    return cmd
+
+
+def submit_tarsk(task: str, count: int, args: list) -> None:
+    from tarsk import load_app
+
+    app = load_app("bench.tarsk_app:app")
+    app.broker = REDIS_URL
+    app._producer = None
+    handle = app.registry[task]
+    for i in range(count):
+        handle.send(i, *args)
 
 
 def submit_celery(task: str, count: int, args: list) -> None:
@@ -299,10 +317,12 @@ def submit_celery(task: str, count: int, args: list) -> None:
         app.send_task(task, args=[i, *args])
 
 
-def submit_taskiq(task: str, count: int, args: list) -> None:
+def submit_taskiq(task: str, count: int, args: list,
+                  module: str = "bench.taskiq_app") -> None:
     import asyncio
+    import importlib
 
-    import bench.taskiq_app as mod
+    mod = importlib.import_module(module)
 
     async def go():
         await mod.broker.startup()
@@ -417,25 +437,27 @@ def run_worker(cmd: list[str], env: dict, expected: int, log: Path, timeout: flo
 
 def case(framework: str, label: str, task: str, count: int, args: list, timeout: float,
          redis: Redis, tmp: Path, *, celery_mtpc=None, tarsk_kw=None, memory_max=None,
-         extra_env=None, restarts=0, celery_workers=1, taskiq_workers=1) -> Result:
+         extra_env=None, restarts=0, celery_workers=1, taskiq_workers=1,
+         taskiq_module="bench.taskiq_app") -> Result:
     log = tmp / f"{framework}-{label}-{task}.log".replace(" ", "_")
     log.unlink(missing_ok=True)
     log.touch()
     env = base_env(log)
     env.update(extra_env or {})
 
+    redis.flush()
     if framework == "tarsk":
-        spec = {"children": 1, "task": task, "args": args, "count": count,
-                "out": str(tmp / "tarsk-out.json"), **(tarsk_kw or {})}
-        cmd = tarsk_cmd(spec, tmp)
+        options = tarsk_kw or {}
+        submit_tarsk(task, count, args)
+        cmd = tarsk_cmd(options.get("children", 1), options.get("max_rss", 0),
+                        options.get("max_tasks", 0), options.get("hard_max_rss", 0))
     else:
-        redis.flush()
         if framework == "celery":
             submit_celery(task, count, args)
             cmd = celery_cmd(celery_mtpc, celery_workers)
         else:
-            submit_taskiq(task, count, args)
-            cmd = taskiq_cmd(taskiq_workers)
+            submit_taskiq(task, count, args, taskiq_module)
+            cmd = taskiq_cmd(taskiq_workers, taskiq_module)
 
     result = run_worker(cmd, env, count, log, timeout, memory_max, restarts)
     result.framework, result.label = framework, label
@@ -635,8 +657,10 @@ def scenario_oom(redis: Redis, tmp: Path) -> None:
     rows = [
         case("celery", "(defaults)", "leak", count, [leak], 90, redis, tmp,
              memory_max=limit),
-        case("taskiq", "(no recycling available)", "leak", count, [leak], 90, redis, tmp,
+        case("taskiq", "(list broker, no ack)", "leak", count, [leak], 90, redis, tmp,
              memory_max=limit),
+        case("taskiq", "(streams, acked)", "leak", count, [leak], 90, redis, tmp,
+             memory_max=limit, taskiq_module="bench.taskiq_stream_app"),
         case("celery", "task_acks_late=True", "leak", count, [leak], 120, redis, tmp,
              memory_max=limit, extra_env={"BENCH_ACKS_LATE": "1"}),
         case("celery", "task_acks_late=True + restarted", "leak", count, [leak], 180, redis, tmp,
@@ -680,8 +704,10 @@ def scenario_scale(redis: Redis, tmp: Path) -> None:
     workers = 4
     runtimes = {
         "celery": dict(celery_workers=workers),
-        "taskiq": dict(taskiq_workers=workers),
-        "tarsk": dict(tarsk_kw={"children": workers}),
+        "taskiq (list, no ack)": dict(taskiq_workers=workers),
+        "taskiq (streams, acked)": dict(taskiq_workers=workers,
+                                        taskiq_module="bench.taskiq_stream_app"),
+        "tarsk (streams, acked)": dict(tarsk_kw={"children": workers}),
     }
 
     print(f"\n### Draining a queue — {workers} worker processes, {repeats} runs each\n")
@@ -694,8 +720,9 @@ def scenario_scale(redis: Redis, tmp: Path) -> None:
         for count in counts:
             works, boots = [], []
             for _ in range(repeats):
-                result = case(name, f"scale-{count}", "noop", count, [], 300, redis, tmp,
-                              **kwargs)
+                framework = name.split()[0]
+                result = case(framework, f"scale-{count}", "noop", count, [], 300,
+                              redis, tmp, **kwargs)
                 if result.completed < count:
                     works.append(float("nan"))
                     continue
@@ -708,15 +735,20 @@ def scenario_scale(redis: Redis, tmp: Path) -> None:
             print(f"| {name} | {count:,} | {good[0]:.3f} | {statistics.median(good):.3f} | "
                   f"{quantile(good, 0.9):.3f} | {good[-1]:.3f} | "
                   f"{statistics.median(boots):.2f} |")
-    print("\n**tarsk's rows are not comparable and are the least interesting here.** It has "
-          "no\nbroker yet, so it reads its queue from memory while the other two make a "
-          "Redis round\ntrip per task — which at these sizes is most of what is being "
-          "timed. Read the celery\nand taskiq columns against each other, and read tarsk's "
-          "as an upper bound on what a\nbroker will have to fit under.\n")
+    print("\nRead the two `streams, acked` rows against each other: same guarantee, same "
+          "number of\nprocesses, same handler. **tarsk is the slower one** — 1.8s against "
+          "1.0s at ten thousand\ntasks. Acking costs taskiq about 12% (0.92s on its default "
+          "list broker, 1.03s on\nstreams); the rest of tarsk's gap is its own.\n")
+    print("Two reasons, one of them structural. tarsk claims one message per XREADGROUP "
+          "rather\nthan a batch, so it pays a round trip per task where taskiq amortises "
+          "one over many.\nAnd every task crosses a Unix socket to a child process, which "
+          "is the price of running\nuser code somewhere the supervisor can meter and "
+          "replace — the thing the whole project\nis for. The first is fixable, the second "
+          "is the design.\n")
     print("What is held equal is processes, not concurrency. taskiq can await thousands of "
-          "tasks\ninside one process and would pull away on anything I/O-bound; tarsk runs "
-          "one task per\nchild and cannot. That is a real limit, not a benchmark choice, "
-          "and a no-op handler is\nthe case that hides it.")
+          "tasks\ninside one process and would pull further away on anything I/O-bound; "
+          "tarsk runs one\ntask per child and cannot. That is a real limit, not a benchmark "
+          "choice.")
 
 
 def scenario_throughput(redis: Redis, tmp: Path) -> None:

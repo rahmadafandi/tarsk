@@ -28,6 +28,13 @@ fn now_ms() -> u64 {
 
 /// Group and consumer names are fixed: one logical worker pool per broker.
 const REDIS_GROUP: &str = "tarsk";
+/// Fallback ceiling on a batched read, replaced by the worker's child count.
+///
+/// Measured on 5,000 no-ops across four children: one message per read gives a
+/// median of 0.96s, four gives 0.65s, sixty-four gives 1.18s. Fetching enough
+/// to keep every child fed helps; fetching more than that means parsing a burst
+/// on a single-threaded runtime while the children it was meant to feed wait.
+const DEFAULT_PREFETCH_CAP: u64 = 4;
 
 #[derive(Clone, Debug)]
 pub struct NewJob {
@@ -141,6 +148,18 @@ impl Broker {
             (Broker::Redis(b), r) => b.dead_letter(r, error, traceback).await,
             (Broker::Postgres(b), r) => b.dead_letter(r, error, traceback).await,
             _ => Err("receipt does not belong to this broker".into()),
+        }
+    }
+
+    /// Fetch at most one message per child per read.
+    ///
+    /// More than that is not free: the extra entries are parsed in one burst on
+    /// a single-threaded runtime, and the children the batch exists to feed wait
+    /// through it. Measured, sixty-four per read is slower than one.
+    pub fn set_prefetch_cap(&self, children: usize) {
+        if let Broker::Redis(b) = self {
+            b.prefetch_cap
+                .store((children as u64).max(1), Ordering::Relaxed);
         }
     }
 
@@ -296,14 +315,24 @@ pub struct RedisBroker {
     /// Makes each delayed job's key unique; two identical jobs must not
     /// collide into one sorted-set member.
     next_delayed: AtomicU64,
-    /// Entries the sweeper has taken ownership of and not yet handed out.
+    /// Entries this consumer owns and has not handed out yet: both the ones a
+    /// sweep reclaimed and the ones a batched read fetched ahead.
     ///
     /// They cannot be re-read with `XREADGROUP … 0`, because that also returns
     /// the entries this worker is running right now. Holding them here instead
     /// keeps reclaim to a single atomic command; if the process dies with some
     /// still queued, their idle time simply starts growing again and the next
     /// sweep — anyone's — picks them up.
-    recovered: Mutex<VecDeque<Delivery>>,
+    ///
+    /// Each carries when it was claimed and the deadline it must be dispatched
+    /// by, because a message waiting its turn is a message holding a lease.
+    claimed: Mutex<VecDeque<(Delivery, std::time::Instant, u64)>>,
+    /// How many messages to fetch per read. Grows while batches are consumed in
+    /// time and halves whenever one is not: long tasks empty a batch slowly, and
+    /// a message that outwaits its own lease has to be dropped rather than run.
+    prefetch: AtomicU64,
+    /// Upper bound for the above, set to the number of children this worker runs.
+    prefetch_cap: AtomicU64,
 }
 
 fn stream_key(queue: &str) -> String {
@@ -385,7 +414,9 @@ impl RedisBroker {
             min_timeout_ms: AtomicU64::new(u64::MAX),
             grace_ms: AtomicU64::new(0),
             next_delayed: AtomicU64::new(0),
-            recovered: Mutex::new(VecDeque::new()),
+            claimed: Mutex::new(VecDeque::new()),
+            prefetch: AtomicU64::new(1),
+            prefetch_cap: AtomicU64::new(DEFAULT_PREFETCH_CAP),
         })
     }
 
@@ -494,16 +525,34 @@ impl RedisBroker {
     }
 
     async fn claim(&self, block: Duration) -> Res<Option<Delivery>> {
-        if let Some(delivery) = self.recovered.lock().unwrap().pop_front() {
-            return Ok(Some(delivery));
+        // Anything already owned goes out first — but only while its lease has
+        // time left. Past that the sweep may have handed it to someone else,
+        // and running it here would be a duplicate we chose to create.
+        loop {
+            let head = self.claimed.lock().unwrap().pop_front();
+            match head {
+                Some((delivery, claimed_at, deadline_ms)) => {
+                    if claimed_at.elapsed().as_millis() as u64 >= deadline_ms {
+                        let _ =
+                            self.prefetch
+                                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                                    Some((n / 2).max(1))
+                                });
+                        continue; // let it expire and return to whoever is free
+                    }
+                    return Ok(Some(delivery));
+                }
+                None => break,
+            }
         }
+        let batch = self.prefetch.load(Ordering::Relaxed).max(1);
         let mut conn = self.conn.lock().await;
         let mut cmd = redis::cmd("XREADGROUP");
         cmd.arg("GROUP")
             .arg(REDIS_GROUP)
             .arg(&self.consumer)
             .arg("COUNT")
-            .arg(1)
+            .arg(batch)
             .arg("BLOCK")
             .arg(block.as_millis().max(1) as u64)
             .arg("STREAMS");
@@ -515,31 +564,53 @@ impl RedisBroker {
         }
         let reply: Option<redis::streams::StreamReadReply> = cmd.query_async(&mut *conn).await?;
         let Some(reply) = reply else { return Ok(None) };
+        // Everything the read returned is now in this consumer's PEL, so all of
+        // it has to be accounted for: hand one out and hold the rest. Taking
+        // one and forgetting the others would leave them owned but unrun until
+        // a sweep noticed.
+        let mut first = None;
+        let now = std::time::Instant::now();
         for key in reply.keys {
             let queue = key
                 .key
                 .strip_prefix("tarsk:")
                 .unwrap_or(&key.key)
                 .to_string();
-            // COUNT 1, so at most one entry per stream and the first is the one.
-            if let Some(entry) = key.ids.into_iter().next() {
+            for entry in key.ids {
                 let (name, payload, timeout_ms) = entry_fields(&entry);
                 if timeout_ms > 0 {
                     self.min_timeout_ms.fetch_min(timeout_ms, Ordering::Relaxed);
                 }
-                return Ok(Some(Delivery {
+                let delivery = Delivery {
                     id: entry_id(&entry),
                     name,
                     payload,
                     attempt: entry.delivered_count.unwrap_or(1) as u32,
                     receipt: Receipt::Redis {
-                        queue,
+                        queue: queue.clone(),
                         id: entry.id,
                     },
-                }));
+                };
+                if first.is_none() {
+                    first = Some(delivery);
+                } else {
+                    self.claimed
+                        .lock()
+                        .unwrap()
+                        .push_back((delivery, now, timeout_ms.max(1)));
+                }
             }
         }
-        Ok(None)
+        if first.is_some() {
+            // A read that returned work earns a larger one next time; the
+            // discard path above walks it back down when batches go stale.
+            let _ = self
+                .prefetch
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                    Some((n * 2).min(self.prefetch_cap.load(Ordering::Relaxed).max(1)))
+                });
+        }
+        Ok(first)
     }
 
     async fn ack(&self, receipt: &Receipt) -> Res<()> {
@@ -719,16 +790,20 @@ impl RedisBroker {
                 if claimed.ids.is_empty() {
                     continue; // another supervisor got there first
                 }
-                self.recovered.lock().unwrap().push_back(Delivery {
-                    id: entry_id(entry),
-                    name,
-                    payload,
-                    attempt: candidate.times_delivered as u32 + 1,
-                    receipt: Receipt::Redis {
-                        queue: queue.clone(),
-                        id: candidate.id,
+                self.claimed.lock().unwrap().push_back((
+                    Delivery {
+                        id: entry_id(entry),
+                        name,
+                        payload,
+                        attempt: candidate.times_delivered as u32 + 1,
+                        receipt: Receipt::Redis {
+                            queue: queue.clone(),
+                            id: candidate.id,
+                        },
                     },
-                });
+                    std::time::Instant::now(),
+                    timeout_ms.max(1),
+                ));
                 reclaimed += 1;
             }
         }

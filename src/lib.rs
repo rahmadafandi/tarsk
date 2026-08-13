@@ -1127,6 +1127,7 @@ async fn supervise(
     Vec<i32>,
     Option<String>,
 )> {
+    broker.set_prefetch_cap(children);
     let batch = broker.drains_when_empty();
     let shared = Arc::new(Shared {
         broker,

@@ -1,0 +1,71 @@
+"""Task module for the broker integration tests."""
+
+import os
+import time
+from pathlib import Path
+
+from tarsk import App
+
+app = App(broker=os.environ.get("TARSK_BROKER"), default_timeout=30, max_timeout=30)
+
+
+def _log(tag):
+    with open(os.environ["TARSK_LOG"], "a", buffering=1) as fh:
+        fh.write(f"{tag}\t{os.getpid()}\n")
+
+
+@app.task(name="note")
+def note(tag):
+    _log(tag)
+    return tag
+
+
+@app.task(name="crash_once", retries=1)
+def crash_once(tag):
+    """Kill the child the first time, so the supervisor has to hand the job back."""
+    marker = Path(os.environ["TARSK_LOG"] + ".crashed")
+    if not marker.exists():
+        marker.touch()
+        os._exit(1)
+    _log(tag)
+    return tag
+
+
+@app.task(name="slow", timeout=8, retries=1)
+def slow(tag):
+    """In flight when the worker is killed, but short enough to finish on the
+    retry — a sleep longer than its own timeout would just time out forever."""
+    time.sleep(6)
+    _log(tag)
+    return tag
+
+
+@app.task(name="medium")
+def medium(tag):
+    """Runs long enough to still be in flight when the shutdown signal lands."""
+    time.sleep(6)
+    _log(tag)
+    return tag
+
+
+@app.task(name="always_fails", retries=1, backoff="none")
+def always_fails(tag):
+    _log(tag)
+    raise RuntimeError(f"{tag} never works")
+
+
+@app.task(name="answers", result_ttl=60)
+def answers(a, b):
+    """Opts into a stored result; everything else here throws its answer away."""
+    return {"sum": a + b, "pid": os.getpid()}
+
+
+@app.task(name="explodes", result_ttl=60)
+def explodes():
+    raise ValueError("this one was always going to")
+
+
+@app.task(name="every_minute", cron="* * * * *")
+def every_minute():
+    _log("tick")
+    return "tick"

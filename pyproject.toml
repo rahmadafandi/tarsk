@@ -1,0 +1,43 @@
+[project]
+name = "tarsk"
+version = "0.1.0"
+description = "Memory-bounded task queue for Python with a Rust runtime"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Rahmad Afandi", email = "rahmadafandiii@gmail.com" }]
+keywords = ["task-queue", "worker", "redis", "postgres", "rust", "memory"]
+dependencies = ["msgpack>=1.0"]
+
+classifiers = [
+    # Pre-release, and the trove classifier is the one place people look first.
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: System :: Distributed Computing",
+    "Typing :: Typed",
+    # The IPC is a Unix socket, so this is a fact about the code, not caution.
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS :: MacOS X",
+]
+
+[project.urls]
+Homepage = "https://github.com/rahmadafandi/tarsk"
+Source = "https://github.com/rahmadafandi/tarsk"
+Issues = "https://github.com/rahmadafandi/tarsk/issues"
+
+[project.scripts]
+tarsk = "tarsk._cli:main"
+
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[tool.maturin]
+module-name = "tarsk._core"
+python-source = "."
+features = ["pyo3/extension-module"]
+# Ship the marker: the annotations are useless to a caller without it.
+include = [{ path = "tarsk/py.typed", format = "sdist" }]

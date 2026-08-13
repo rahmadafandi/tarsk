@@ -1,0 +1,1486 @@
+//! tarsk supervisor core (spec §4.1, §4.2, §4.4).
+//!
+//! Owns child processes, the IPC socket, RSS monitoring, and overlap
+//! replacement. Never imports or executes user Python: the task registry
+//! arrives over the wire in `Register`, so this process stays a constant-RSS
+//! Rust process no matter what the user's app module drags in.
+//!
+//! Not here yet: broker (step 3), retry state machine (step 4), metrics
+//! (step 5). Jobs arrive as an in-memory list from the caller.
+
+mod broker;
+mod cron;
+mod metrics;
+
+use broker::{Broker, Delivery, NewJob, Receipt};
+use metrics::Metrics;
+
+use std::collections::HashMap;
+use std::io;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
+
+use pyo3::exceptions::PyValueError;
+use pyo3::prelude::*;
+use pyo3::types::PyBytes;
+use rmpv::Value;
+use sysinfo::{Pid, ProcessesToUpdate, System};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::UnixListener;
+use tokio::sync::{mpsc, oneshot, Notify};
+
+const MAX_FRAME: usize = 32 * 1024 * 1024;
+
+// ---------------------------------------------------------------- framing
+
+async fn read_frame(reader: &mut OwnedReadHalf) -> io::Result<Option<Vec<u8>>> {
+    let mut header = [0u8; 4];
+    match reader.read_exact(&mut header).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e),
+    }
+    let size = u32::from_be_bytes(header) as usize;
+    if size > MAX_FRAME {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame exceeds MAX_FRAME",
+        ));
+    }
+    let mut body = vec![0u8; size];
+    reader.read_exact(&mut body).await?;
+    Ok(Some(body))
+}
+
+async fn write_frame(writer: &mut OwnedWriteHalf, value: &Value) -> io::Result<()> {
+    let mut body = Vec::new();
+    rmpv::encode::write_value(&mut body, value)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    writer.write_all(&(body.len() as u32).to_be_bytes()).await?;
+    writer.write_all(&body).await?;
+    writer.flush().await
+}
+
+fn decode(body: &[u8]) -> Option<Vec<Value>> {
+    match rmpv::decode::read_value(&mut &body[..]).ok()? {
+        Value::Array(items) if !items.is_empty() => Some(items),
+        _ => None,
+    }
+}
+
+// ------------------------------------------------------------------ state
+
+struct Job {
+    task_id: u64,
+    name: String,
+    payload: Vec<u8>,
+    /// Attempt number as the broker counts it, not as we count it.
+    attempt: u32,
+    /// The producer's id for this job, and the key its result is filed under.
+    id: String,
+    /// What settles this delivery with whichever broker produced it.
+    receipt: Receipt,
+    /// Set when the Dispatch frame goes out, so the histogram measures what a
+    /// caller would call the task's duration rather than the handler's.
+    dispatched: Instant,
+}
+
+#[derive(Clone)]
+struct Outcome {
+    ok: bool,
+    result: Vec<u8>,
+    error_type: String,
+    traceback: String,
+}
+
+impl Outcome {
+    fn nack(error_type: &str, traceback: String) -> Self {
+        Outcome {
+            ok: false,
+            result: Vec::new(),
+            error_type: error_type.into(),
+            traceback,
+        }
+    }
+}
+
+struct Cfg {
+    app_spec: String,
+    python: String,
+    socket: String,
+    max_rss: u64,
+    max_tasks: u64,
+    max_lifetime: Option<Duration>,
+    poll: Duration,
+    drain_timeout: Duration,
+    term_grace: Duration,
+    connect_timeout: Duration,
+    spawn_cap: u64,
+    /// Start the replacement once the trigger is this many spawn-durations away.
+    warm_multiple: u32,
+    /// Retire a pre-warmed child that was never needed after this long.
+    spare_idle: Duration,
+    /// host:port for the Prometheus endpoint, when one is wanted.
+    metrics_addr: Option<String>,
+    /// Kill a child that reaches this, mid-task, rather than let it keep
+    /// growing. Zero disables it, which is the default: the soft ceiling never
+    /// loses work, and this one trades a task to protect the box.
+    hard_max_rss: u64,
+    /// Slack added to a job's own timeout before its lease counts as dead.
+    lease_grace: Duration,
+    /// How long a claim may wait for work before returning empty-handed.
+    claim_block: Duration,
+}
+
+#[derive(Default)]
+struct Counters {
+    rejected: AtomicU64,
+    spawns: AtomicU64,
+    recycles: AtomicU64,
+    prewarmed: AtomicU64,
+    wasted_spares: AtomicU64,
+    crashes: AtomicU64,
+    kills: AtomicU64,
+    hard_killed: AtomicU64,
+    retried: AtomicU64,
+    dead_lettered: AtomicU64,
+    cron_fired: AtomicU64,
+    broker_errors: AtomicU64,
+}
+
+/// Hands an accepted, registered connection to the slot that spawned it.
+/// None means the child was rejected and the slot should stop waiting.
+type Handoff = oneshot::Sender<Option<(OwnedReadHalf, OwnedWriteHalf)>>;
+
+struct Shared {
+    broker: Broker,
+    /// Only populated in batch mode. A worker draining a real broker runs for
+    /// weeks; keeping every outcome in a map would be a leak with a schedule.
+    results: Mutex<HashMap<u64, Outcome>>,
+    total: usize,
+    next_task_id: AtomicU64,
+    work: Notify,
+    done: AtomicBool,
+    registry: Mutex<Option<(u64, usize)>>, // (hash, task count) from the first child
+    /// Retry policy per task, learned from Register. The supervisor cannot read
+    /// the user's decorators (spec §4.1), so this is the only way it knows.
+    specs: Mutex<HashMap<String, Spec>>,
+    conns: Mutex<HashMap<u64, Handoff>>,
+    exits: Mutex<Vec<i32>>,
+    /// Set when the run cannot proceed at all, as opposed to a task failing.
+    fatal: Mutex<Option<String>>,
+    next_child_id: AtomicU64,
+    /// Observed cost of bringing a child up, in milliseconds. Pre-warming needs
+    /// to know this: how early to start is a question about wall-clock, and a
+    /// percentage of a limit answers a different question.
+    spawn_ms: AtomicU64,
+    counters: Counters,
+    metrics: Metrics,
+    /// Which trigger fired, per recycle — the leaky-handler demo needs to show
+    /// max_rss firing, not just that *something* recycled.
+    reasons: Mutex<HashMap<&'static str, u64>>,
+}
+
+impl Shared {
+    fn spawn_estimate(&self) -> Duration {
+        Duration::from_millis(self.spawn_ms.load(Ordering::Relaxed))
+    }
+
+    fn batch(&self) -> bool {
+        self.broker.drains_when_empty()
+    }
+
+    /// Abandon the run with a diagnosis. Marking it done unblocks every parked
+    /// slot, so the supervisor unwinds instead of retrying its way to a cap.
+    fn fail(&self, message: String) {
+        let mut fatal = self.fatal.lock().unwrap();
+        if fatal.is_none() {
+            *fatal = Some(message);
+        }
+        drop(fatal);
+        self.done.store(true, Ordering::SeqCst);
+        self.work.notify_waiters();
+    }
+
+    fn record(&self, task_id: u64, outcome: Outcome) {
+        if !self.batch() {
+            return;
+        }
+        let mut results = self.results.lock().unwrap();
+        results.entry(task_id).or_insert(outcome); // at-least-once: first wins
+        let settled = results.len();
+        drop(results);
+        if settled >= self.total {
+            self.done.store(true, Ordering::SeqCst);
+        }
+        self.work.notify_waiters();
+    }
+
+    /// The child answered. Success settles; failure enters the retry machine.
+    /// File the answer, if this task asked for one to be kept.
+    async fn keep_result(&self, job: &Job, outcome: &Outcome) {
+        if job.id.is_empty() {
+            return;
+        }
+        let ttl = self
+            .specs
+            .lock()
+            .unwrap()
+            .get(&job.name)
+            .map(|s| s.result_ttl_ms)
+            .unwrap_or(0);
+        if ttl == 0 {
+            return;
+        }
+        // Failures are stored too. Without them a caller waiting on a task that
+        // raised has nothing to wait for and learns about it by timing out.
+        let envelope = Value::Array(vec![
+            Value::Boolean(outcome.ok),
+            Value::Binary(outcome.result.clone()),
+            Value::from(outcome.error_type.as_str()),
+            Value::from(outcome.traceback.as_str()),
+        ]);
+        let mut blob = Vec::new();
+        if rmpv::encode::write_value(&mut blob, &envelope).is_err() {
+            return;
+        }
+        if self
+            .broker
+            .store_result(&job.id, blob, Duration::from_millis(ttl))
+            .await
+            .is_err()
+        {
+            self.counters.broker_errors.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    async fn settle(&self, job: Job, outcome: Outcome) {
+        if outcome.ok {
+            self.metrics
+                .observe(&job.name, true, job.dispatched.elapsed());
+            self.keep_result(&job, &outcome).await;
+            if self.broker.ack(&job.receipt).await.is_err() {
+                self.counters.broker_errors.fetch_add(1, Ordering::Relaxed);
+            }
+            self.record(job.task_id, outcome);
+            return;
+        }
+        self.metrics
+            .observe(&job.name, false, job.dispatched.elapsed());
+        self.fail_job(job, outcome).await;
+    }
+
+    /// A child died holding this job (spec §4.4) — same policy as any other
+    /// failure. A crash is not a special kind of failure, it is just one the
+    /// handler never got to report.
+    async fn give_back(&self, job: Job) {
+        let message = format!("{} did not survive its child", job.name);
+        self.fail_job(job, Outcome::nack("ChildDied", message))
+            .await;
+    }
+
+    /// Retry with backoff while attempts remain, then dead-letter.
+    ///
+    /// `attempt` is what the broker counted, not what this process remembers,
+    /// so a job that has been passed between workers still runs out of retries.
+    async fn fail_job(&self, job: Job, outcome: Outcome) {
+        let spec = self.specs.lock().unwrap().get(&job.name).cloned();
+        let retries = spec.as_ref().map(|s| s.retries).unwrap_or(0);
+        if job.attempt <= retries {
+            let delay = backoff_for(spec.as_ref(), job.attempt);
+            self.counters.retried.fetch_add(1, Ordering::Relaxed);
+            if self.broker.retry(&job.receipt, delay).await.is_err() {
+                self.counters.broker_errors.fetch_add(1, Ordering::Relaxed);
+            }
+            self.work.notify_waiters();
+            return;
+        }
+        self.counters.dead_lettered.fetch_add(1, Ordering::Relaxed);
+        self.keep_result(&job, &outcome).await;
+        if self
+            .broker
+            .dead_letter(&job.receipt, &outcome.error_type, &outcome.traceback)
+            .await
+            .is_err()
+        {
+            self.counters.broker_errors.fetch_add(1, Ordering::Relaxed);
+        }
+        self.record(job.task_id, outcome);
+    }
+
+    /// Take the next job, or None once there is nothing left to wait for.
+    ///
+    /// Batch mode never reports "no work" while a job is unaccounted for — a
+    /// crash redelivery can land after the queue drains, and a child that left
+    /// on an early Drain is not there to run it. Against a real broker there is
+    /// no such thing as finished: only a shutdown ends the wait.
+    async fn next_job(&self, lease: Duration, block: Duration) -> Option<Job> {
+        loop {
+            match self.broker.claim(lease, block).await {
+                Ok(Some(delivery)) => return Some(self.adopt(delivery)),
+                Ok(None) => {}
+                Err(_) => {
+                    self.counters.broker_errors.fetch_add(1, Ordering::Relaxed);
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+            if self.done.load(Ordering::SeqCst) {
+                return None;
+            }
+            if self.batch() {
+                // Nothing blocks in memory, so wait for a redelivery or for the
+                // last outstanding result to land.
+                let notified = self.work.notified();
+                if self.done.load(Ordering::SeqCst) {
+                    return None;
+                }
+                tokio::select! {
+                    _ = notified => {}
+                    _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                }
+            }
+        }
+    }
+
+    fn adopt(&self, delivery: Delivery) -> Job {
+        // In batch mode the memory broker's own id is the job's identity and
+        // survives redelivery, so results stay keyed to the job rather than to
+        // the attempt. Real brokers record nothing, so a counter is enough.
+        let task_id = match &delivery.receipt {
+            Receipt::Memory { id } => *id,
+            _ => self.next_task_id.fetch_add(1, Ordering::SeqCst),
+        };
+        Job {
+            task_id,
+            id: delivery.id,
+            name: delivery.name,
+            payload: delivery.payload,
+            attempt: delivery.attempt,
+            receipt: delivery.receipt,
+            dispatched: Instant::now(),
+        }
+    }
+}
+
+// ------------------------------------------------------------- child slots
+
+struct ChildHandle {
+    pid: u32,
+    proc: tokio::process::Child,
+    frames: mpsc::Receiver<Vec<u8>>,
+    writer: OwnedWriteHalf,
+    started: Instant,
+    tasks_done: u64,
+    inflight: Option<Job>,
+}
+
+#[derive(Clone)]
+struct Spec {
+    timeout_ms: u64,
+    retries: u32,
+    backoff: String,
+    /// Zero means the answer is thrown away, which is the default. A result
+    /// store with no expiry is a leak that moved from the worker to the broker.
+    result_ttl_ms: u64,
+    queue: String,
+    /// Five-field cron, empty when the task is only ever sent by hand.
+    cron: String,
+}
+
+/// Wait before the next attempt. Exponential from one second, capped so a
+/// backoff cannot outrun what a broker can express (see the Redis driver).
+fn backoff_for(spec: Option<&Spec>, attempt: u32) -> Duration {
+    let base = Duration::from_secs(1);
+    match spec.map(|s| s.backoff.as_str()) {
+        Some("none") => Duration::ZERO,
+        Some("fixed") => base,
+        _ => base * 2u32.pow(attempt.saturating_sub(1).min(6)),
+    }
+}
+
+/// A scheduled task takes no arguments: msgpack for `([], {})`, the same shape
+/// the producer sends.
+fn no_arguments() -> Vec<u8> {
+    let mut out = Vec::new();
+    let empty = Value::Array(vec![Value::Array(Vec::new()), Value::Map(Vec::new())]);
+    let _ = rmpv::encode::write_value(&mut out, &empty);
+    out
+}
+
+/// One definition of every counter, shared by the Python return value and the
+/// Prometheus text so the two can never drift.
+fn counter_list(counters: &Counters) -> Vec<(&'static str, u64)> {
+    let load = |value: &AtomicU64| value.load(Ordering::Relaxed);
+    vec![
+        ("children_rejected", load(&counters.rejected)),
+        ("children_spawned", load(&counters.spawns)),
+        ("children_recycled", load(&counters.recycles)),
+        ("children_recycled_prewarmed", load(&counters.prewarmed)),
+        ("spares_wasted", load(&counters.wasted_spares)),
+        ("children_crashed", load(&counters.crashes)),
+        ("children_killed", load(&counters.kills)),
+        ("children_hard_killed", load(&counters.hard_killed)),
+        ("task_retries", load(&counters.retried)),
+        ("tasks_dead_lettered", load(&counters.dead_lettered)),
+        ("cron_fired", load(&counters.cron_fired)),
+        ("broker_errors", load(&counters.broker_errors)),
+    ]
+}
+
+enum Exit {
+    Finished, // we sent Drain because the work is done
+    Recycle(&'static str),
+    /// Past the hard ceiling with work in flight. The only case where tarsk
+    /// kills a running task, and it is opt-in for exactly that reason.
+    OverHardLimit,
+    Died,
+}
+
+async fn accept_loop(listener: UnixListener, shared: Arc<Shared>) {
+    loop {
+        let Ok((stream, _)) = listener.accept().await else {
+            return;
+        };
+        let shared = shared.clone();
+        tokio::spawn(async move {
+            let (mut reader, writer) = stream.into_split();
+            let Ok(Some(body)) = read_frame(&mut reader).await else {
+                return;
+            };
+            let Some(items) = decode(&body) else { return };
+            if items[0].as_str() != Some("Register") || items.len() != 4 {
+                return;
+            }
+            let (Some(child_id), Some(hash)) = (items[1].as_u64(), items[2].as_u64()) else {
+                return;
+            };
+            let Value::Array(rows) = &items[3] else {
+                return;
+            };
+            let count = rows.len();
+            let specs: HashMap<String, Spec> = rows
+                .iter()
+                .filter_map(|row| match row {
+                    Value::Array(fields) if fields.len() >= 5 => Some((
+                        fields[0].as_str()?.to_string(),
+                        Spec {
+                            timeout_ms: fields[1].as_u64().unwrap_or(0),
+                            retries: fields[2].as_u64().unwrap_or(0) as u32,
+                            backoff: fields[3].as_str().unwrap_or("exp").to_string(),
+                            queue: fields[4].as_str().unwrap_or("default").to_string(),
+                            result_ttl_ms: fields.get(5).and_then(|v| v.as_u64()).unwrap_or(0),
+                            cron: fields
+                                .get(6)
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                        },
+                    )),
+                    _ => None,
+                })
+                .collect();
+
+            let mut registry = shared.registry.lock().unwrap();
+            let accepted = match *registry {
+                None => {
+                    *registry = Some((hash, count));
+                    if let Some(shortest) = specs
+                        .values()
+                        .map(|s| s.timeout_ms)
+                        .filter(|ms| *ms > 0)
+                        .min()
+                    {
+                        shared.broker.observe_min_timeout(shortest);
+                    }
+                    *shared.specs.lock().unwrap() = specs;
+                    true
+                }
+                // Stale child from a mid-rollout code change (spec §4.2).
+                Some((known, _)) => known == hash,
+            };
+            drop(registry);
+
+            let waiting = shared.conns.lock().unwrap().remove(&child_id);
+            if !accepted {
+                shared.counters.rejected.fetch_add(1, Ordering::Relaxed);
+                if let Some(tx) = waiting {
+                    let _ = tx.send(None);
+                }
+                return;
+            }
+            if let Some(tx) = waiting {
+                let _ = tx.send(Some((reader, writer)));
+            }
+        });
+    }
+}
+
+async fn spawn_child(shared: &Arc<Shared>, cfg: &Cfg) -> Option<ChildHandle> {
+    if shared.counters.spawns.fetch_add(1, Ordering::SeqCst) >= cfg.spawn_cap {
+        return None; // children are dying on startup; stop feeding the fire
+    }
+    let launched = Instant::now();
+    let child_id = shared.next_child_id.fetch_add(1, Ordering::SeqCst);
+    let (tx, rx) = oneshot::channel();
+    shared.conns.lock().unwrap().insert(child_id, tx);
+
+    let mut proc = tokio::process::Command::new(&cfg.python)
+        .arg("-m")
+        .arg("tarsk._child")
+        .arg(&cfg.socket)
+        .arg(&cfg.app_spec)
+        .arg(child_id.to_string())
+        .kill_on_drop(true)
+        .spawn()
+        .ok()?;
+    let pid = proc.id().unwrap_or(0);
+
+    let halves = match tokio::time::timeout(cfg.connect_timeout, rx).await {
+        Ok(Ok(Some(halves))) => halves,
+        _ => {
+            shared.conns.lock().unwrap().remove(&child_id);
+            let _ = proc.kill().await;
+            return None;
+        }
+    };
+    let (mut reader, writer) = halves;
+
+    // Frames arrive through a channel so the serve loop can select! on them:
+    // read_exact is not cancel-safe, mpsc::Receiver::recv is.
+    let (frame_tx, frames) = mpsc::channel(8);
+    tokio::spawn(async move {
+        while let Ok(Some(body)) = read_frame(&mut reader).await {
+            if frame_tx.send(body).await.is_err() {
+                return;
+            }
+        }
+    });
+
+    // A child whose imports alone clear the ceiling can never run a task: it
+    // would register, be recycled on its first Ready, and hand the same problem
+    // to its replacement forever. That is a misconfiguration, not a leak, and it
+    // deserves a diagnosis rather than a spawn loop.
+    if cfg.max_rss > 0 && pid != 0 {
+        let mut sys = System::new();
+        let key = Pid::from_u32(pid);
+        sys.refresh_processes(ProcessesToUpdate::Some(&[key]), false);
+        if let Some(baseline) = sys.process(key).map(|p| p.memory()) {
+            if baseline >= cfg.max_rss {
+                shared.fail(format!(
+                    "child baseline is {}MB but max_rss is {}MB: importing {} already \
+                     clears the ceiling before any task runs. Raise the ceiling above the \
+                     interpreter plus your task modules.",
+                    baseline / (1024 * 1024),
+                    cfg.max_rss / (1024 * 1024),
+                    cfg.app_spec,
+                ));
+                return None;
+            }
+        }
+    }
+
+    shared.spawn_ms.store(
+        launched.elapsed().as_millis().max(1) as u64,
+        Ordering::Relaxed,
+    );
+    Some(ChildHandle {
+        pid,
+        proc,
+        frames,
+        writer,
+        started: Instant::now(),
+        tasks_done: 0,
+        inflight: None,
+    })
+}
+
+async fn drain_owned(shared: Arc<Shared>, child: ChildHandle, cfg: Arc<Cfg>) {
+    drain(&shared, child, &cfg).await;
+}
+
+/// How close this child is to the nearest of its recycle triggers.
+struct Pressure {
+    trigger: Option<&'static str>,
+    /// Fraction of the closest limit already consumed; 0.0 when unlimited.
+    ratio: f64,
+    /// Whatever the RSS read cost us, handed on rather than taken twice.
+    rss: Option<u64>,
+}
+
+fn pressure(sys: &mut System, pid: u32, tasks_done: u64, started: Instant, cfg: &Cfg) -> Pressure {
+    let mut worst = (0.0f64, "");
+    let mut rss = None;
+    if cfg.max_tasks > 0 {
+        worst = (tasks_done as f64 / cfg.max_tasks as f64, "max_tasks");
+    }
+    if let Some(limit) = cfg.max_lifetime {
+        let ratio = started.elapsed().as_secs_f64() / limit.as_secs_f64();
+        if ratio > worst.0 {
+            worst = (ratio, "max_lifetime");
+        }
+    }
+    if pid != 0 {
+        // RSS is read by the parent (spec §4.4) — a thrashing child is the
+        // least reliable reporter of its own state.
+        let pid = Pid::from_u32(pid);
+        sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), false);
+        if let Some(proc) = sys.process(pid) {
+            let bytes = proc.memory();
+            rss = Some(bytes);
+            if cfg.max_rss > 0 {
+                let ratio = bytes as f64 / cfg.max_rss as f64;
+                if ratio > worst.0 {
+                    worst = (ratio, "max_rss");
+                }
+            }
+        }
+    }
+    Pressure {
+        trigger: (worst.0 >= 1.0).then_some(worst.1),
+        ratio: worst.0,
+        rss,
+    }
+}
+
+/// Should the replacement start now?
+///
+/// Project when the trigger will fire from how far this child has already
+/// travelled towards it, and start the replacement once that is only a few
+/// spawns away. A fixed percentage cannot do this job: 10% of a child that
+/// lives 100ms is nowhere near an interpreter startup, while 10% of one that
+/// lives an hour leaves a spare interpreter idling for six minutes.
+fn should_warm(pressure: &Pressure, elapsed: Duration, spawn: Duration, cfg: &Cfg) -> bool {
+    if pressure.ratio <= 0.0 {
+        return false;
+    }
+    let remaining = elapsed.as_secs_f64() * (1.0 - pressure.ratio) / pressure.ratio;
+    remaining <= spawn.as_secs_f64() * cfg.warm_multiple as f64
+}
+
+/// What `serve` handed back: why it stopped, and a replacement if one was
+/// started early enough to be ready.
+struct Served {
+    exit: Exit,
+    spare: Option<ChildHandle>,
+}
+
+/// Handle one child until it needs replacing, dies, or the work runs out.
+async fn serve(shared: &Arc<Shared>, child: &mut ChildHandle, cfg: &Arc<Cfg>) -> Served {
+    let ChildHandle {
+        pid,
+        frames,
+        writer,
+        started,
+        tasks_done,
+        inflight,
+        ..
+    } = child;
+    let mut sys = System::new();
+    let mut ticker = tokio::time::interval(cfg.poll);
+    // Carries Option so a failed spawn reports back instead of leaving a
+    // waiter hanging on a channel that will never produce.
+    let (spare_tx, mut spare_rx) = mpsc::channel::<Option<ChildHandle>>(1);
+    let mut spare: Option<ChildHandle> = None;
+    let mut spare_at: Option<Instant> = None;
+    let mut arming = false;
+
+    // Read the pressure, start the replacement if the trigger is close, and
+    // report the trigger if it has already fired.
+    macro_rules! check {
+        () => {{
+            let reading = pressure(&mut sys, *pid, *tasks_done, *started, cfg);
+            if let Some(bytes) = reading.rss {
+                shared.metrics.set_child_rss(*pid, bytes);
+            }
+            if spare.is_none()
+                && !arming
+                && reading.trigger.is_none()
+                && should_warm(&reading, started.elapsed(), shared.spawn_estimate(), cfg)
+            {
+                arming = true;
+                let (shared, cfg, tx) = (shared.clone(), cfg.clone(), spare_tx.clone());
+                tokio::spawn(async move {
+                    let _ = tx.send(spawn_child(&shared, &cfg).await).await;
+                });
+            }
+            reading
+        }};
+    }
+
+    loop {
+        tokio::select! {
+            Some(replacement) = spare_rx.recv() => {
+                arming = false;
+                if replacement.is_some() {
+                    spare = replacement;
+                    spare_at = Some(Instant::now());
+                }
+            }
+            frame = frames.recv() => {
+                let Some(body) = frame else { return Served { exit: Exit::Died, spare } };
+                let Some(items) = decode(&body) else { return Served { exit: Exit::Died, spare } };
+                match items[0].as_str() {
+                    Some("Ready") => {
+                        // Check the ceiling at the dispatch decision, not just on
+                        // the timer: between two ticks a child can run many short
+                        // tasks, and every one of them is unbudgeted growth. Here
+                        // the child is idle by definition, so overshoot is capped
+                        // at the peak allocation of a single task — which is the
+                        // floor for any design that refuses to kill running work.
+                        if let Some(reason) = check!().trigger {
+                            if spare.is_none() && arming {
+                                // A replacement is already starting. Waiting out
+                                // the rest of its startup beats launching a second
+                                // one from scratch — which costs a full spawn *and*
+                                // makes both slower by competing for the machine.
+                                spare = spare_rx.recv().await.flatten();
+                            }
+                            return Served { exit: Exit::Recycle(reason), spare };
+                        }
+                        // Parking here is safe: an idle child grows no RSS, and
+                        // next_job only returns None once nothing is outstanding.
+                        match shared.next_job(cfg.lease_grace, cfg.claim_block).await {
+                            Some(job) => {
+                                let dispatch = Value::Array(vec![
+                                    Value::from("Dispatch"),
+                                    Value::from(job.task_id),
+                                    Value::from(job.name.as_str()),
+                                    Value::Binary(job.payload.clone()),
+                                ]);
+                                *inflight = Some(job);
+                                if write_frame(writer, &dispatch).await.is_err() {
+                                    return Served { exit: Exit::Died, spare };
+                                }
+                            }
+                            None => {
+                                let _ = write_frame(writer, &Value::Array(vec![Value::from("Drain")])).await;
+                                return Served { exit: Exit::Finished, spare };
+                            }
+                        }
+                    }
+                    Some("Ack") => {
+                        let (Some(task_id), Some(result)) = (items[1].as_u64(), items[2].as_slice()) else {
+                            return Served { exit: Exit::Died, spare };
+                        };
+                        if let Some(job) = inflight.take().filter(|j| j.task_id == task_id) {
+                            let done = Outcome { ok: true, result: result.to_vec(), error_type: String::new(), traceback: String::new() };
+                            shared.settle(job, done).await;
+                        }
+                        *tasks_done += 1;
+                    }
+                    Some("Nack") => {
+                        let (Some(task_id), Some(kind), Some(tb)) =
+                            (items[1].as_u64(), items[2].as_str(), items[3].as_str()) else {
+                            return Served { exit: Exit::Died, spare };
+                        };
+                        if let Some(job) = inflight.take().filter(|j| j.task_id == task_id) {
+                            shared.settle(job, Outcome::nack(kind, tb.to_string())).await;
+                        }
+                        *tasks_done += 1;
+                    }
+                    _ => return Served { exit: Exit::Died, spare },
+                }
+            }
+            _ = ticker.tick() => {
+                // The trigger levelled off below its limit and the replacement
+                // we started is now just an idle interpreter. Let it go rather
+                // than hold a whole process against a recycle that may be hours
+                // away — the estimate will re-arm it when pressure returns.
+                if let (Some(idle), true) = (spare_at, spare.is_some()) {
+                    if idle.elapsed() > cfg.spare_idle {
+                        let stale = spare.take().expect("checked");
+                        spare_at = None;
+                        shared.counters.wasted_spares.fetch_add(1, Ordering::Relaxed);
+                        tokio::spawn(drain_owned(shared.clone(), stale, cfg.clone()));
+                    }
+                }
+                let reading = check!();
+                // The hard ceiling is the one that does not wait for a good
+                // moment. Draining an idle child gets there just as well and
+                // costs nothing, so only work in flight is worth killing over.
+                if cfg.hard_max_rss > 0 && reading.rss.is_some_and(|b| b >= cfg.hard_max_rss) {
+                    if spare.is_none() && arming {
+                        spare = spare_rx.recv().await.flatten();
+                    }
+                    let exit = if inflight.is_some() {
+                        Exit::OverHardLimit
+                    } else {
+                        Exit::Recycle("hard_max_rss")
+                    };
+                    return Served { exit, spare };
+                }
+                if let Some(reason) = reading.trigger {
+                    if spare.is_none() && arming {
+                        spare = spare_rx.recv().await.flatten();
+                    }
+                    return Served { exit: Exit::Recycle(reason), spare };
+                }
+            }
+        }
+    }
+}
+
+/// Drain, never kill outright (spec §4.4): stop dispatching, let in-flight
+/// work finish under a deadline, then escalate.
+async fn drain(shared: &Arc<Shared>, mut child: ChildHandle, cfg: &Cfg) {
+    let _ = write_frame(&mut child.writer, &Value::Array(vec![Value::from("Drain")])).await;
+
+    let deadline = tokio::time::Instant::now() + cfg.drain_timeout;
+    loop {
+        tokio::select! {
+            frame = child.frames.recv() => {
+                let Some(body) = frame else { break };
+                let Some(items) = decode(&body) else { break };
+                match items[0].as_str() {
+                    Some("Ack") => {
+                        if let (Some(task_id), Some(result)) = (items[1].as_u64(), items[2].as_slice()) {
+                            if let Some(job) = child.inflight.take().filter(|j| j.task_id == task_id) {
+                                let done = Outcome { ok: true, result: result.to_vec(), error_type: String::new(), traceback: String::new() };
+                                shared.settle(job, done).await;
+                            }
+                        }
+                    }
+                    Some("Nack") => {
+                        if let (Some(task_id), Some(kind), Some(tb)) = (items[1].as_u64(), items[2].as_str(), items[3].as_str()) {
+                            if let Some(job) = child.inflight.take().filter(|j| j.task_id == task_id) {
+                                shared.settle(job, Outcome::nack(kind, tb.to_string())).await;
+                            }
+                        }
+                    }
+                    _ => {} // a Ready from a child we are retiring is nothing to answer
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => break,
+        }
+    }
+    reap(shared, child, cfg).await;
+}
+
+async fn reap(shared: &Arc<Shared>, mut child: ChildHandle, cfg: &Cfg) {
+    // Before any of the early returns below: a retired child that stays in the
+    // gauge makes tarsk_child_rss_bytes_max monotone, which reads as a leak the
+    // ceiling failed to stop — the exact opposite of what happened.
+    shared.metrics.forget_child(child.pid);
+    if let Ok(Ok(status)) = tokio::time::timeout(cfg.term_grace, child.proc.wait()).await {
+        shared
+            .exits
+            .lock()
+            .unwrap()
+            .push(status.code().unwrap_or(-1));
+        if let Some(job) = child.inflight.take() {
+            shared.give_back(job).await;
+        }
+        return;
+    }
+    // SIGTERM, grace, SIGKILL.
+    shared.counters.kills.fetch_add(1, Ordering::Relaxed);
+    if child.pid != 0 {
+        unsafe { libc::kill(child.pid as i32, libc::SIGTERM) };
+    }
+    if tokio::time::timeout(cfg.term_grace, child.proc.wait())
+        .await
+        .is_err()
+    {
+        let _ = child.proc.kill().await;
+    }
+    if let Ok(status) = child.proc.wait().await {
+        shared
+            .exits
+            .lock()
+            .unwrap()
+            .push(status.code().unwrap_or(-1));
+    }
+    if let Some(job) = child.inflight.take() {
+        shared.give_back(job).await;
+    }
+}
+
+async fn slot(shared: Arc<Shared>, cfg: Arc<Cfg>) {
+    let Some(mut current) = spawn_child(&shared, &cfg).await else {
+        return;
+    };
+    loop {
+        let Served { exit, spare } = serve(&shared, &mut current, &cfg).await;
+        match exit {
+            Exit::Finished => {
+                reap(&shared, current, &cfg).await;
+                if let Some(unused) = spare {
+                    drain(&shared, unused, &cfg).await;
+                }
+                return;
+            }
+            Exit::OverHardLimit => {
+                // Take the job before reaping, so the crash path does not also
+                // claim it: this failure has a name worth putting in the DLQ.
+                let job = current.inflight.take();
+                shared.counters.hard_killed.fetch_add(1, Ordering::Relaxed);
+                *shared
+                    .reasons
+                    .lock()
+                    .unwrap()
+                    .entry("hard_max_rss")
+                    .or_insert(0) += 1;
+                if current.pid != 0 {
+                    unsafe { libc::kill(current.pid as i32, libc::SIGKILL) };
+                }
+                reap(&shared, current, &cfg).await;
+                if let Some(job) = job {
+                    let message = format!(
+                        "{} was killed at the hard memory ceiling of {} MB",
+                        job.name,
+                        cfg.hard_max_rss / (1024 * 1024)
+                    );
+                    shared
+                        .fail_job(job, Outcome::nack("HardMemoryLimit", message))
+                        .await;
+                }
+                if shared.done.load(Ordering::SeqCst) {
+                    if let Some(unused) = spare {
+                        drain(&shared, unused, &cfg).await;
+                    }
+                    return;
+                }
+                current = match spare {
+                    Some(next) => next,
+                    None => match spawn_child(&shared, &cfg).await {
+                        Some(next) => next,
+                        None => return,
+                    },
+                };
+            }
+            Exit::Died => {
+                shared.counters.crashes.fetch_add(1, Ordering::Relaxed);
+                reap(&shared, current, &cfg).await;
+                if shared.done.load(Ordering::SeqCst) {
+                    if let Some(unused) = spare {
+                        drain(&shared, unused, &cfg).await;
+                    }
+                    return;
+                }
+                current = match spare {
+                    Some(next) => next,
+                    None => match spawn_child(&shared, &cfg).await {
+                        Some(next) => next,
+                        None => return,
+                    },
+                };
+            }
+            Exit::Recycle(reason) => {
+                shared.counters.recycles.fetch_add(1, Ordering::Relaxed);
+                *shared.reasons.lock().unwrap().entry(reason).or_insert(0) += 1;
+                // Overlap replacement (spec §4.4). If the replacement was warmed
+                // in advance it is already registered, so the slot goes from old
+                // child to new one with nothing in between. Falling back to a
+                // spawn here means paying an interpreter startup with the slot
+                // empty — correct, but the stall the pre-warm exists to avoid.
+                let next = match spare {
+                    Some(next) => {
+                        shared.counters.prewarmed.fetch_add(1, Ordering::Relaxed);
+                        Some(next)
+                    }
+                    None => spawn_child(&shared, &cfg).await,
+                };
+                match next {
+                    Some(next) => {
+                        // Retiring the old child is not on the critical path: it
+                        // still has to finish its in-flight task and exit, and
+                        // making the slot wait for that is the same empty slot
+                        // the pre-warm just removed. Its Acks are still recorded
+                        // — drain() completes them from wherever it runs.
+                        tokio::spawn(drain_owned(shared.clone(), current, cfg.clone()));
+                        current = next;
+                    }
+                    None => {
+                        drain(&shared, current, &cfg).await;
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn supervise(
+    broker: Broker,
+    total: usize,
+    children: usize,
+    cfg: Cfg,
+) -> io::Result<(
+    Vec<(u64, Outcome)>,
+    HashMap<String, u64>,
+    Vec<i32>,
+    Option<String>,
+)> {
+    let batch = broker.drains_when_empty();
+    let shared = Arc::new(Shared {
+        broker,
+        results: Mutex::new(HashMap::new()),
+        total,
+        next_task_id: AtomicU64::new(0),
+        work: Notify::new(),
+        done: AtomicBool::new(batch && total == 0),
+        registry: Mutex::new(None),
+        specs: Mutex::new(HashMap::new()),
+        conns: Mutex::new(HashMap::new()),
+        exits: Mutex::new(Vec::new()),
+        fatal: Mutex::new(None),
+        next_child_id: AtomicU64::new(0),
+        spawn_ms: AtomicU64::new(250), // replaced by the first real measurement
+        counters: Counters::default(),
+        metrics: Metrics::default(),
+        reasons: Mutex::new(HashMap::new()),
+    });
+    if batch && total == 0 {
+        return Ok((Vec::new(), HashMap::new(), Vec::new(), None));
+    }
+
+    let listener = UnixListener::bind(&cfg.socket)?;
+    let cfg = Arc::new(cfg);
+    let acceptor = tokio::spawn(accept_loop(listener, shared.clone()));
+
+    // A worker against a real broker has no natural end, so a signal is the
+    // only thing that stops it — and it has to stop the way a recycle does,
+    // draining children rather than dropping their work.
+    let signals = (!batch).then(|| {
+        let shared = shared.clone();
+        tokio::spawn(async move {
+            let mut term =
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                    Ok(term) => term,
+                    Err(_) => return,
+                };
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = term.recv() => {}
+            }
+            shared.done.store(true, Ordering::SeqCst);
+            shared.work.notify_waiters();
+        })
+    });
+
+    // Only Redis needs a sweep: Postgres reclaims an expired lease inside the
+    // same statement that claims a fresh job.
+    let sweeper = (!batch).then(|| {
+        let shared = shared.clone();
+        let grace = cfg.lease_grace;
+        tokio::spawn(async move {
+            while !shared.done.load(Ordering::SeqCst) {
+                if shared.broker.reclaim_expired(grace).await.is_err() {
+                    shared
+                        .counters
+                        .broker_errors
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        })
+    });
+
+    let exporter = cfg.metrics_addr.clone().map(|addr| {
+        let shared = shared.clone();
+        tokio::spawn(metrics::serve(addr, move || {
+            let mut sys = System::new();
+            let me = Pid::from_u32(std::process::id());
+            sys.refresh_processes(ProcessesToUpdate::Some(&[me]), false);
+            let own = sys.process(me).map(|p| p.memory()).unwrap_or(0);
+            metrics::render(
+                &shared.metrics,
+                &counter_list(&shared.counters),
+                &shared.reasons.lock().unwrap(),
+                own,
+            )
+        }))
+    });
+
+    // Cron lives with the supervisor because that is the only process that has
+    // the registry and no user code in it.
+    let scheduler = (!batch).then(|| {
+        let shared = shared.clone();
+        tokio::spawn(async move {
+            let mut fired: Option<i64> = None;
+            while !shared.done.load(Ordering::SeqCst) {
+                let now = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                let minute = now / 60;
+                if fired != Some(minute) {
+                    fired = Some(minute);
+                    let due: Vec<(String, Spec)> = shared
+                        .specs
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|(_, spec)| !spec.cron.is_empty())
+                        .filter_map(|(name, spec)| {
+                            cron::parse(&spec.cron)
+                                .ok()
+                                .filter(|schedule| schedule.matches(minute * 60))
+                                .map(|_| (name.clone(), spec.clone()))
+                        })
+                        .collect();
+                    for (name, spec) in due {
+                        match shared.broker.claim_tick(&name, minute).await {
+                            Ok(true) => {}
+                            Ok(false) => continue, // another worker has this minute
+                            Err(_) => {
+                                shared
+                                    .counters
+                                    .broker_errors
+                                    .fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
+                        }
+                        let job = NewJob {
+                            id: format!("cron-{name}-{minute}"),
+                            queue: spec.queue.clone(),
+                            name: name.clone(),
+                            payload: no_arguments(),
+                            timeout_ms: spec.timeout_ms as u32,
+                        };
+                        if shared.broker.push(job, Duration::ZERO).await.is_err() {
+                            shared
+                                .counters
+                                .broker_errors
+                                .fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            shared.counters.cron_fired.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        })
+    });
+
+    let slots: Vec<_> = (0..children)
+        .map(|_| tokio::spawn(slot(shared.clone(), cfg.clone())))
+        .collect();
+    for handle in slots {
+        let _ = handle.await;
+    }
+    acceptor.abort();
+    if let Some(handle) = signals {
+        handle.abort();
+    }
+    if let Some(handle) = sweeper {
+        handle.abort();
+    }
+    if let Some(handle) = exporter {
+        handle.abort();
+    }
+    if let Some(handle) = scheduler {
+        handle.abort();
+    }
+
+    // A slot can give up (spawn cap, socket failure) with jobs outstanding.
+    // Say so rather than hanging or reporting a clean run.
+    if batch && !shared.done.load(Ordering::SeqCst) {
+        let settled = shared.results.lock().unwrap().len();
+        for task_id in 0..total as u64 {
+            if shared.results.lock().unwrap().contains_key(&task_id) {
+                continue;
+            }
+            shared.record(
+                task_id,
+                Outcome::nack("NoWorker", "every child slot gave up".into()),
+            );
+        }
+        let _ = settled;
+    }
+
+    let registry = shared.registry.lock().unwrap();
+    let mut stats: HashMap<String, u64> = counter_list(&shared.counters)
+        .into_iter()
+        .map(|(name, value)| (name.to_string(), value))
+        .collect();
+    stats.insert(
+        "registry_hash".to_string(),
+        registry.map(|r| r.0).unwrap_or(0),
+    );
+    stats.insert(
+        "registry_len".to_string(),
+        registry.map(|r| r.1 as u64).unwrap_or(0),
+    );
+    for (reason, count) in shared.reasons.lock().unwrap().iter() {
+        stats.insert(format!("recycle_{reason}"), *count);
+    }
+    drop(registry);
+
+    let mut outcomes: Vec<(u64, Outcome)> = shared
+        .results
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(k, v)| (*k, v.clone()))
+        .collect();
+    outcomes.sort_by_key(|(task_id, _)| *task_id);
+    let exits = shared.exits.lock().unwrap().clone();
+    let fatal = shared.fatal.lock().unwrap().clone();
+    Ok((outcomes, stats, exits, fatal))
+}
+
+// ----------------------------------------------------------- python facing
+
+fn io_err(err: Box<dyn std::error::Error + Send + Sync>) -> io::Error {
+    io::Error::other(err.to_string())
+}
+
+/// Scratch directory for the child socket. Torn down with the run.
+fn socket_dir() -> io::Result<std::path::PathBuf> {
+    let stamp = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!("tarsk-{}-{}", std::process::id(), stamp));
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_cfg(
+    app_spec: String,
+    python: String,
+    socket: String,
+    children: usize,
+    max_rss: u64,
+    max_tasks: u64,
+    max_lifetime: f64,
+    lease_grace: f64,
+    metrics_addr: Option<String>,
+    hard_max_rss: u64,
+    spawn_slack: u64,
+) -> Cfg {
+    Cfg {
+        app_spec,
+        python,
+        socket,
+        max_rss,
+        max_tasks,
+        max_lifetime: (max_lifetime > 0.0).then(|| Duration::from_secs_f64(max_lifetime)),
+        poll: Duration::from_millis(100),
+        drain_timeout: Duration::from_secs(30),
+        term_grace: Duration::from_secs(5),
+        connect_timeout: Duration::from_secs(30),
+        spawn_cap: 8 * children as u64 + spawn_slack + 8,
+        warm_multiple: 3,
+        spare_idle: Duration::from_secs(30),
+        // Each job leases for its own timeout; this is only the slack on top.
+        lease_grace: Duration::from_secs_f64(lease_grace.max(0.0)),
+        metrics_addr,
+        hard_max_rss,
+        claim_block: Duration::from_millis(250),
+    }
+}
+
+fn to_python(py: Python<'_>, outcomes: Vec<(u64, Outcome)>) -> PyResult<Vec<Py<PyAny>>> {
+    outcomes
+        .into_iter()
+        .map(|(task_id, o)| {
+            (
+                task_id,
+                o.ok,
+                PyBytes::new(py, &o.result),
+                o.error_type,
+                o.traceback,
+            )
+                .into_pyobject(py)
+                .map(|t| t.into_any().unbind())
+        })
+        .collect()
+}
+
+/// Outcomes, counters, and the exit code of every child that finished.
+type BatchResult = (Vec<Py<PyAny>>, HashMap<String, u64>, Vec<i32>);
+
+/// Batch mode: run a fixed list of jobs to completion over the memory broker.
+/// The tests and the benchmark harness live here; production goes through
+/// `work`, which never returns on its own.
+#[pyfunction]
+#[pyo3(signature = (app_spec, jobs, python, children=2, max_rss=0, max_tasks=0,
+                    max_lifetime=0.0, hard_max_rss=0))]
+#[allow(clippy::too_many_arguments)]
+fn run(
+    py: Python<'_>,
+    app_spec: String,
+    jobs: Vec<(String, Vec<u8>)>,
+    python: String,
+    children: usize,
+    max_rss: u64,
+    max_tasks: u64,
+    max_lifetime: f64,
+    hard_max_rss: u64,
+) -> PyResult<BatchResult> {
+    let dir = socket_dir()?;
+    let total = jobs.len();
+    let cfg = build_cfg(
+        app_spec,
+        python,
+        dir.join("sock").to_string_lossy().into_owned(),
+        children,
+        max_rss,
+        max_tasks,
+        max_lifetime,
+        30.0,
+        None,
+        hard_max_rss,
+        total as u64,
+    );
+
+    let outcome = py.detach(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .and_then(|rt| {
+                rt.block_on(async move {
+                    let broker = Broker::connect("memory://", Vec::new())
+                        .await
+                        .map_err(io_err)?;
+                    for (name, payload) in jobs {
+                        broker
+                            .push(
+                                NewJob {
+                                    id: String::new(), // batch mode keeps no results
+                                    queue: "default".into(),
+                                    name,
+                                    payload,
+                                    timeout_ms: 0,
+                                },
+                                Duration::ZERO,
+                            )
+                            .await
+                            .map_err(io_err)?;
+                    }
+                    supervise(broker, total, children, cfg).await
+                })
+            })
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+    let (outcomes, stats, exits, fatal) = outcome?;
+    if let Some(message) = fatal {
+        return Err(PyValueError::new_err(message));
+    }
+    Ok((to_python(py, outcomes)?, stats, exits))
+}
+
+/// Worker mode: consume `queues` from a real broker until SIGINT or SIGTERM.
+#[pyfunction]
+#[pyo3(signature = (app_spec, broker_url, queues, python, children=2, max_rss=0, max_tasks=0,
+                    max_lifetime=0.0, lease_grace=30.0, metrics_addr=None, hard_max_rss=0))]
+#[allow(clippy::too_many_arguments)]
+fn work(
+    py: Python<'_>,
+    app_spec: String,
+    broker_url: String,
+    queues: Vec<String>,
+    python: String,
+    children: usize,
+    max_rss: u64,
+    max_tasks: u64,
+    max_lifetime: f64,
+    lease_grace: f64,
+    metrics_addr: Option<String>,
+    hard_max_rss: u64,
+) -> PyResult<HashMap<String, u64>> {
+    let dir = socket_dir()?;
+    let cfg = build_cfg(
+        app_spec,
+        python,
+        dir.join("sock").to_string_lossy().into_owned(),
+        children,
+        max_rss,
+        max_tasks,
+        max_lifetime,
+        lease_grace,
+        metrics_addr,
+        hard_max_rss,
+        u64::MAX / 2, // no batch to bound the spawn cap against
+    );
+
+    let outcome = py.detach(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .and_then(|rt| {
+                rt.block_on(async move {
+                    let broker = Broker::connect(&broker_url, queues).await.map_err(io_err)?;
+                    supervise(broker, 0, children, cfg).await
+                })
+            })
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+    let (_, stats, _, fatal) = outcome?;
+    if let Some(message) = fatal {
+        return Err(PyValueError::new_err(message));
+    }
+    Ok(stats)
+}
+
+/// Producer handle. Holds its own runtime and connection so enqueueing from a
+/// web request is one round trip, not a reconnect.
+#[pyclass]
+struct Producer {
+    runtime: tokio::runtime::Runtime,
+    broker: Broker,
+}
+
+#[pymethods]
+impl Producer {
+    #[new]
+    fn new(broker_url: String) -> PyResult<Self> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let broker = runtime
+            .block_on(Broker::connect(&broker_url, Vec::new()))
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(Producer { runtime, broker })
+    }
+
+    /// `delay` in seconds; zero enqueues immediately.
+    #[pyo3(signature = (id, queue, name, payload, timeout_ms, delay=0.0))]
+    #[allow(clippy::too_many_arguments)] // a pyo3 entry point, not a call site
+    fn send(
+        &self,
+        py: Python<'_>,
+        id: String,
+        queue: String,
+        name: String,
+        payload: Vec<u8>,
+        timeout_ms: u32,
+        delay: f64,
+    ) -> PyResult<()> {
+        let job = NewJob {
+            id,
+            queue,
+            name,
+            payload,
+            timeout_ms,
+        };
+        let delay = Duration::from_secs_f64(delay.max(0.0));
+        py.detach(|| self.runtime.block_on(self.broker.push(job, delay)))
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+
+    /// The stored envelope for `id`, or None while it is unfinished, was never
+    /// kept, or has expired — three states the caller has to tell apart from
+    /// context, because the broker cannot.
+    fn result(&self, py: Python<'_>, id: String) -> PyResult<Option<Py<PyAny>>> {
+        let found = py
+            .detach(|| self.runtime.block_on(self.broker.get_result(&id)))
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        match found {
+            Some(blob) => Ok(Some(PyBytes::new(py, &blob).into_any().unbind())),
+            None => Ok(None),
+        }
+    }
+}
+
+#[pymodule]
+fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(run, m)?)?;
+    m.add_function(wrap_pyfunction!(work, m)?)?;
+    m.add_class::<Producer>()
+}

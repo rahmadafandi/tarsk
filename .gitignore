@@ -1,0 +1,7 @@
+/docs/
+/target/
+/.venv/
+__pycache__/
+*.py[cod]
+*.so
+/demo/out*/

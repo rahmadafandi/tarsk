@@ -153,9 +153,15 @@ impl Broker {
 
     /// Fetch at most one message per child per read.
     ///
-    /// More than that is not free: the extra entries are parsed in one burst on
-    /// a single-threaded runtime, and the children the batch exists to feed wait
-    /// through it. Measured, sixty-four per read is slower than one.
+    /// Sixty-four per read measures the same as four, so this is not chosen for
+    /// speed — it is chosen because a claimed message holds a lease whether or
+    /// not a child is free to run it, and a buffer deeper than the children can
+    /// drain is just leases ageing in memory.
+    ///
+    /// An earlier version of this comment said sixty-four was slower than one.
+    /// It was, while the driver held a mutex round its Redis connection: a large
+    /// batch parsed in one burst blocked every other command. That mutex is
+    /// gone, and the effect went with it.
     pub fn set_prefetch_cap(&self, children: usize) {
         if let Broker::Redis(b) = self {
             b.prefetch_cap

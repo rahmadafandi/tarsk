@@ -58,7 +58,7 @@ changes. From [`bench/`](bench/README.md), same configuration, different workloa
 | | leak 20MB/task | leak 40MB/task | payload-dependent 2–80MB |
 |---|---|---|---|
 | celery `--max-tasks-per-child=6` | **170 MB** | 290 MB | 335 MB |
-| tarsk `--max-rss=200MB` | 205 MB | **225 MB** | **247 MB** |
+| tarsk `--max-rss=200MB` | 205 MB | **224 MB** | **247 MB** |
 
 Celery wins the first column, and that is the honest result: when the leak per task is known
 and constant, dividing the budget by it works. It is the other two columns that tarsk was
@@ -69,12 +69,12 @@ trigger fires, so the slot never goes empty:
 
 | | p50 gap | p99 gap | max gap |
 |---|---|---|---|
-| celery `--max-tasks-per-child=20` | 5.7 ms | 152 ms | 159 ms |
-| tarsk `--max-tasks=20` | 5.9 ms | 11 ms | **11 ms** |
-| taskiq (no recycling at all) | 6.3 ms | 7 ms | 7 ms |
+| celery `--max-tasks-per-child=20` | 5.7 ms | 156 ms | 162 ms |
+| tarsk `--max-tasks=20` | 6.0 ms | 10 ms | **12 ms** |
+| taskiq (no recycling at all) | 6.1 ms | 7 ms | 7 ms |
 
 And the worker that runs your code is smaller, because it imports your tasks and nothing else —
-no broker driver, no scheduler: 27 MB against Celery's 49 MB and taskiq's 58 MB.
+no broker driver, no scheduler: 27 MB against Celery's 49 MB and taskiq's 57 MB.
 
 Your imports land in one process here, and the supervisor is not it:
 
@@ -93,9 +93,11 @@ held by something that does not have the problem — which is also why Celery co
 one from a master carrying 77 MB of your dependencies.
 
 Draining 10,000 no-op tasks across four worker processes, same Redis and same at-least-once
-guarantee, startup excluded: Celery 5.3s, taskiq 1.56s, tarsk 1.55s. tarsk and taskiq are a
-tie — the spread within either is wider than the gap between them. Full tables in
-[`bench/`](bench/README.md).
+guarantee, startup excluded: Celery 5.1s, taskiq 1.48s, tarsk 0.95s. That gap is recent and it
+is not a clever optimisation — the Redis driver used to hold a mutex round its own connection,
+serialising every command from every child, and removing it is the whole difference. A no-op
+handler is also the case most favourable to whoever dispatches fastest, and nobody runs one.
+Full tables in [`bench/`](bench/README.md).
 
 ## What it does not claim
 

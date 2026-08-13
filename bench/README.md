@@ -126,7 +126,7 @@ long enough.
 |---|---|---|
 | tarsk | **27 MB** | 44 MB |
 | celery | 49 MB | 104 MB |
-| taskiq | 58 MB | 144 MB |
+| taskiq | 57 MB | 138 MB |
 
 The tarsk child is CPython plus the user's task module and nothing else — no broker driver,
 no scheduler (spec §4.1). The tree column includes the supervisor / master, and is summed Rss,
@@ -157,7 +157,7 @@ than at it.
 | | leak raised to 40MB | payload-dependent 2–80MB |
 |---|---|---|
 | celery `--max-tasks-per-child=6` | 290 MB | 335 MB |
-| tarsk `--max-rss=200MB` | 225 MB | 247 MB |
+| tarsk `--max-rss=200MB` | 224 MB | 247 MB |
 
 Nothing was reconfigured between this table and the last one. A task count encodes an
 assumption about bytes per task that nothing enforces; when the assumption expires, so does
@@ -168,13 +168,13 @@ floor for any design that refuses to kill running work.
 
 | runtime | completed | lost | executions | restarts | max gap | peak RSS |
 |---|---|---|---|---|---|---|
-| celery (defaults) | 16/30 | **14** | 16 | 0 | 9 ms | 368 MB |
-| taskiq (list, no ack) | 15/30 | **15** | 15 | 0 | 7 ms | 358 MB |
-| taskiq (streams, acked) | 15/30 | **15** | 15 | 0 | 8 ms | 366 MB |
-| celery `task_acks_late=True` | 16/30 | **14** | 16 | 0 | 9 ms | 369 MB |
-| celery `task_acks_late=True` + restarted | 29/30 | **1** | 29 | 1 | 2410 ms | 369 MB |
-| celery `--max-tasks-per-child=6` (tuned) | 30/30 | 0 | 30 | 0 | 179 ms | 170 MB |
-| tarsk `--max-rss=200MB` | 30/30 | 0 | 30 | 0 | 13 ms | 205 MB |
+| celery (defaults) | 16/30 | **14** | 16 | 0 | 8 ms | 368 MB |
+| taskiq (list, no ack) | 15/30 | **15** | 15 | 0 | 9 ms | 358 MB |
+| taskiq (streams, acked) | 15/30 | **15** | 15 | 0 | 8 ms | 358 MB |
+| celery `task_acks_late=True` | 16/30 | **14** | 16 | 0 | 12 ms | 368 MB |
+| celery `task_acks_late=True` + restarted | 29/30 | **1** | 29 | 1 | 2452 ms | 369 MB |
+| celery `--max-tasks-per-child=6` (tuned) | 30/30 | 0 | 30 | 0 | 171 ms | 170 MB |
+| tarsk `--max-rss=200MB` | 30/30 | 0 | 30 | 0 | 13 ms | 204 MB |
 
 **An acknowledgement only helps if something survives to notice.** taskiq's streams broker acks
 and still loses 15 of 30 here, exactly as its unacked list broker does, for the same reason
@@ -190,9 +190,9 @@ A correctly tuned Celery ties tarsk here. The difference is what you had to know
 
 | runtime | p50 gap | p99 gap | max gap |
 |---|---|---|---|
-| celery `--max-tasks-per-child=20` | 6.2 ms | 171 ms | 173 ms |
-| tarsk `--max-tasks=20` | 6.0 ms | 10 ms | 11 ms |
-| taskiq (no recycling available) | 6.7 ms | 7 ms | 7 ms |
+| celery `--max-tasks-per-child=20` | 5.7 ms | 156 ms | 162 ms |
+| tarsk `--max-tasks=20` | 6.0 ms | 10 ms | 12 ms |
+| taskiq (no recycling available) | 6.1 ms | 7 ms | 7 ms |
 
 Recycling costs tarsk essentially nothing: it sits with taskiq, which never recycles at all.
 Getting there took three fixes, not one — starting the replacement early enough (projected from
@@ -209,26 +209,33 @@ with startup pulled out of the figure rather than folded into it.
 
 | runtime | 10 | 100 | 1,000 | 10,000 | startup |
 |---|---|---|---|---|---|
-| celery | 0.005 | 0.053 | 0.559 | 5.317 | 0.36 s |
-| taskiq (list, no ack) | 0.003 | 0.012 | 0.094 | 1.455 | 0.47 s |
-| taskiq (streams, acked) | 0.007 | 0.072 | 0.176 | 1.564 | 0.55 s |
-| tarsk (streams, acked) | 0.004 | 0.016 | 0.184 | 1.551 | 0.15 s |
+| celery | 0.005 | 0.048 | 0.494 | 5.106 | 0.33 s |
+| taskiq (list, no ack) | 0.002 | 0.012 | 0.090 | 0.853 | 0.43 s |
+| taskiq (streams, acked) | 0.005 | 0.030 | 0.134 | 1.479 | 0.47 s |
+| tarsk (streams, acked) | 0.005 | 0.014 | 0.120 | **0.945** | 0.16 s |
 
 Median seconds from first completion to last, five runs a cell.
 
 The two `streams, acked` rows are the like-for-like pair — same guarantee, same process count,
-same handler — and **they are a tie**. The spread inside a single cell is wider than the gap
-between them: tarsk's five runs at ten thousand span 1.20–1.75s, taskiq's list broker spans
-1.22–1.51s. An earlier version of this page read an ordering out of one set of five runs and
-said tarsk led at ten thousand and trailed at one thousand. Seven independent runs put the
-winner on either side depending on the run. Celery is the only clear result here, at roughly
-three times the other two.
+same handler. **tarsk is the faster one at ten thousand**, 0.95s against 1.48s, and the two
+sets of five runs do not overlap: tarsk's slowest is 1.27s, taskiq's fastest 1.44s.
 
-**Acking is not what separates them.** It costs taskiq about 50% on its own — 1.46s on its
-default list broker against 1.56s on streams at ten thousand, and 0.09s against 0.18s at one
-thousand — and tarsk pays that too. What tarsk pays on top is a Unix socket round trip per
-task, because the handler runs in a child the supervisor can meter and replace. That is the
-design, not an overhead waiting to be removed.
+That is a change, and the cause is not a clever optimisation. This page used to report a tie,
+and the reason for the tie was a mutex the Redis driver held round its own connection — every
+command from every child queued behind one lock on a single-threaded runtime. A
+`MultiplexedConnection` is built to be used concurrently. The lock was a bottleneck the driver
+had invented for itself, and removing it is the entire difference between 1.55s and 0.95s.
+
+Two earlier versions of this page read an ordering out of five noisy runs and had to retract
+it, so the separation being clean this time is worth stating plainly rather than assuming.
+What has not changed: a no-op handler is the case most favourable to whoever dispatches
+fastest, and nobody runs one.
+
+**Acking is not free for either.** taskiq's own list broker against its own stream broker is
+the cleanest measure — 0.85s against 1.48s at ten thousand — and tarsk pays that cost too,
+plus a Unix socket round trip per task, about 63µs, because the handler runs in a child the
+supervisor can meter and replace. That cost did not go away. It stopped being buried under a
+larger one.
 
 taskiq's default `ListQueueBroker` is `BRPOP` with no acknowledgement — at-most-once, and a
 killed worker loses what it held. Comparing it against an acked broker compares different
@@ -247,27 +254,33 @@ processes, which taskiq has. With sampling on, tarsk's thousand-task cell read 0
 
 #### How big a batch
 
-The Redis driver used to claim one message per `XREADGROUP`. Batching helps, but only up to the
-number of children — measured on 5,000 no-ops across four, seven runs each:
+The Redis driver used to claim one message per `XREADGROUP`. Batching helps — measured on 5,000
+no-ops across four children, seven runs each:
 
-| messages per read | median |
-|---|---|
-| 1 | 0.96 s |
-| 4 (one per child) | **0.65 s** |
-| 64 | 1.18 s |
+| messages per read | median | spread |
+|---|---|---|
+| 1 | 0.56 s | 0.50–0.68 |
+| 4 (one per child) | 0.48 s | 0.42–0.96 |
+| 64 | 0.46 s | 0.44–0.74 |
 
-Sixty-four is slower than not batching at all: the extra entries are parsed in one burst on a
-single-threaded runtime while the children the batch exists to feed wait through it. The cap is
-now the child count. Three runs could not tell these apart — the spread within a configuration
-is nearly 2× — which is why the table says seven.
+Claiming one at a time is measurably worse. Four and sixty-four are not distinguishable — the
+spread within either is wider than the gap between them — so the cap stays at the child count
+for a reason that is not speed: a claimed message holds a lease whether or not a child is free
+to run it, and a buffer deeper than the children can drain is just leases ageing in memory.
+
+This table used to say sixty-four was **slower than not batching at all**, at 1.18s against
+0.96s. That was true, and it was an artefact of the mutex described above: a large batch parsed
+in one burst blocked every other Redis command. The mutex is gone and so is the effect. The
+conclusion happened to survive — the cap is still the child count — but the reason given for it
+was wrong.
 
 ### Throughput, single worker
 
 | runtime | no-op | 50 ms handler | startup |
 |---|---|---|---|
-| celery | 1,853/s | 20/s | 0.26 s |
-| taskiq | 2,793/s | 19/s | 0.47 s |
-| tarsk | 2,748/s | 19/s | 0.18 s |
+| celery | 1,696/s | 20/s | 0.29 s |
+| taskiq | 2,488/s | 19/s | 0.50 s |
+| tarsk | 2,726/s | 19/s | 0.14 s |
 
 All three read the same Redis. Rate and wall cover first completion to last; **startup is
 separate on purpose**. Folding it in turns a 500-task row into a boot-time contest — it was 51%

@@ -744,15 +744,22 @@ def scenario_scale(redis: Redis, tmp: Path) -> None:
                   f"{quantile(good, 0.9):.3f} | {good[-1]:.3f} | "
                   f"{statistics.median(boots):.2f} |")
     print("\nThe two `streams, acked` rows are the like-for-like pair: same guarantee, same "
-          "process\ncount, same handler. **They are a tie, and the spread inside each cell "
-          "is wider than\nthe distance between them.** An earlier version of this table "
-          "read an ordering out of\nfive runs; seven independent ones put the winner on "
-          "either side depending on the run.\nCelery is the only clear result here, at "
-          "roughly three times the other two.\n")
-    print("Acking costs taskiq about 50% by itself (its list broker against its stream "
-          "broker),\nand tarsk pays that too. What tarsk pays on top is a Unix socket "
-          "round trip per task,\nbecause the handler runs in a child the supervisor can "
-          "meter and replace — the design,\nnot an overhead waiting to be removed.\n")
+          "process\ncount, same handler. Read those two against each other and ignore "
+          "everything else.\n")
+    print("These rows moved. tarsk used to tie taskiq here, and the reason was a mutex the "
+          "Redis\ndriver held round its connection — every command from every child "
+          "queued behind one\nlock on a single-threaded runtime. A MultiplexedConnection "
+          "is built for concurrent use;\nthe lock was a bottleneck the driver invented for "
+          "itself. Removing it is the whole gap.\n")
+    print("Two earlier versions of this page read an ordering out of five noisy runs and had "
+          "to\nretract it, so: the separation is clean this time, with no overlap between "
+          "the two\nsets — but a no-op handler is the case most favourable to whoever "
+          "dispatches fastest,\nand it is not the case anyone runs in production.\n")
+    print("Acking is not free for either. taskiq's own list broker against its stream "
+          "broker is the\ncleanest measure of it, and tarsk pays the same cost plus a Unix "
+          "socket round trip per\ntask — about 63µs — because the handler runs in a child "
+          "the supervisor can meter and\nreplace. That cost did not go away; it stopped "
+          "being buried under a larger one.\n")
     print("What is held equal is processes, not concurrency. taskiq can await thousands of "
           "tasks\ninside one process and would pull away on anything I/O-bound; tarsk runs "
           "one task per\nchild and cannot. That is a real limit, not a benchmark choice, "

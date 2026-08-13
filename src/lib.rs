@@ -160,6 +160,14 @@ struct Cfg {
     lease_grace: Duration,
     /// How long a claim may wait for work before returning empty-handed.
     claim_block: Duration,
+    /// Tasks a single child may have in flight at once.
+    ///
+    /// One is the default and the reason the ceiling is precise: a child with
+    /// nothing running cannot grow, so RSS read at a dispatch decision bounds
+    /// overshoot to a single task's peak. Raising this trades that precision
+    /// for concurrency, and is worth it only when handlers wait rather than
+    /// allocate — see the io table in bench/README.md.
+    slots: usize,
 }
 
 #[derive(Default)]
@@ -381,6 +389,19 @@ impl Shared {
     /// crash redelivery can land after the queue drains, and a child that left
     /// on an early Drain is not there to run it. Against a real broker there is
     /// no such thing as finished: only a shutdown ends the wait.
+    /// One claim attempt. Never parks, so it is safe to call from a frame loop
+    /// that still owes itself the reading of an Ack.
+    async fn try_job(&self, lease: Duration) -> Option<Job> {
+        match self.broker.claim(lease, Duration::from_millis(0)).await {
+            Ok(Some(delivery)) => Some(self.adopt(delivery)),
+            Ok(None) => None,
+            Err(_) => {
+                self.counters.broker_errors.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
+    }
+
     async fn next_job(&self, lease: Duration, block: Duration) -> Option<Job> {
         loop {
             match self.broker.claim(lease, block).await {
@@ -438,7 +459,7 @@ struct ChildHandle {
     writer: OwnedWriteHalf,
     started: Instant,
     tasks_done: u64,
-    inflight: Option<Job>,
+    inflight: HashMap<u64, Job>,
 }
 
 #[derive(Clone)]
@@ -610,6 +631,7 @@ async fn spawn_child(shared: &Arc<Shared>, cfg: &Cfg) -> Option<ChildHandle> {
         .arg(&cfg.socket)
         .arg(&cfg.app_spec)
         .arg(child_id.to_string())
+        .arg(cfg.slots.to_string())
         .kill_on_drop(true)
         .spawn()
         .ok()?;
@@ -687,7 +709,7 @@ async fn spawn_child(shared: &Arc<Shared>, cfg: &Cfg) -> Option<ChildHandle> {
         writer,
         started: Instant::now(),
         tasks_done: 0,
-        inflight: None,
+        inflight: HashMap::new(),
     })
 }
 
@@ -754,6 +776,15 @@ fn should_warm(pressure: &Pressure, elapsed: Duration, spawn: Duration, cfg: &Cf
     remaining <= spawn.as_secs_f64() * cfg.warm_multiple as f64
 }
 
+/// What filling this child's free slots achieved.
+enum Fill {
+    Sent,
+    Empty,
+    Dead,
+    /// The run is shutting down and nothing is outstanding.
+    Done,
+}
+
 /// What `serve` handed back: why it stopped, and a replacement if one was
 /// started early enough to be ready.
 struct Served {
@@ -780,6 +811,8 @@ async fn serve(shared: &Arc<Shared>, child: &mut ChildHandle, cfg: &Arc<Cfg>) ->
     let mut spare: Option<ChildHandle> = None;
     let mut spare_at: Option<Instant> = None;
     let mut arming = false;
+    // Slots this child has advertised with a Ready and we have not filled.
+    let mut free: usize = 0;
 
     // Read the pressure, start the replacement if the trigger is close, and
     // report the trigger if it has already fired.
@@ -804,6 +837,47 @@ async fn serve(shared: &Arc<Shared>, child: &mut ChildHandle, cfg: &Arc<Cfg>) ->
         }};
     }
 
+    // Parking inside the frame loop is only safe while this child has nothing
+    // outstanding: with more than one slot, an Ack that would end the batch may
+    // be sitting unread in the very channel the park is keeping us out of.
+    // Empty child, park (that is the original behaviour and the shutdown path);
+    // busy child, take what is there and leave the slot free otherwise.
+    macro_rules! fill {
+        () => {{
+            let mut outcome = Fill::Empty;
+            while free > 0 {
+                let job = if inflight.is_empty() {
+                    match shared.next_job(cfg.lease_grace, cfg.claim_block).await {
+                        Some(job) => job,
+                        None => {
+                            outcome = Fill::Done;
+                            break;
+                        }
+                    }
+                } else {
+                    match shared.try_job(cfg.lease_grace).await {
+                        Some(job) => job,
+                        None => break,
+                    }
+                };
+                let dispatch = Value::Array(vec![
+                    Value::from("Dispatch"),
+                    Value::from(job.task_id),
+                    Value::from(job.name.as_str()),
+                    Value::Binary(job.payload.clone()),
+                ]);
+                inflight.insert(job.task_id, job);
+                free -= 1;
+                if write_frame(writer, &dispatch).await.is_err() {
+                    outcome = Fill::Dead;
+                    break;
+                }
+                outcome = Fill::Sent;
+            }
+            outcome
+        }};
+    }
+
     loop {
         tokio::select! {
             Some(replacement) = spare_rx.recv() => {
@@ -820,10 +894,14 @@ async fn serve(shared: &Arc<Shared>, child: &mut ChildHandle, cfg: &Arc<Cfg>) ->
                     Some("Ready") => {
                         // Check the ceiling at the dispatch decision, not just on
                         // the timer: between two ticks a child can run many short
-                        // tasks, and every one of them is unbudgeted growth. Here
-                        // the child is idle by definition, so overshoot is capped
-                        // at the peak allocation of a single task — which is the
-                        // floor for any design that refuses to kill running work.
+                        // tasks, and every one of them is unbudgeted growth.
+                        //
+                        // With one slot the child is idle here by definition, so
+                        // overshoot is capped at one task's peak — the floor for
+                        // any design that refuses to kill running work. With more
+                        // slots it is capped at the peak of whatever is still in
+                        // flight, which is the price of the concurrency and the
+                        // reason slots defaults to one.
                         if let Some(reason) = check!().trigger {
                             if spare.is_none() && arming {
                                 // A replacement is already starting. Waiting out
@@ -834,22 +912,11 @@ async fn serve(shared: &Arc<Shared>, child: &mut ChildHandle, cfg: &Arc<Cfg>) ->
                             }
                             return Served { exit: Exit::Recycle(reason), spare };
                         }
-                        // Parking here is safe: an idle child grows no RSS, and
-                        // next_job only returns None once nothing is outstanding.
-                        match shared.next_job(cfg.lease_grace, cfg.claim_block).await {
-                            Some(job) => {
-                                let dispatch = Value::Array(vec![
-                                    Value::from("Dispatch"),
-                                    Value::from(job.task_id),
-                                    Value::from(job.name.as_str()),
-                                    Value::Binary(job.payload.clone()),
-                                ]);
-                                *inflight = Some(job);
-                                if write_frame(writer, &dispatch).await.is_err() {
-                                    return Served { exit: Exit::Died, spare };
-                                }
-                            }
-                            None => {
+                        free += 1;
+                        match fill!() {
+                            Fill::Sent | Fill::Empty => {}
+                            Fill::Dead => return Served { exit: Exit::Died, spare },
+                            Fill::Done => {
                                 let _ = write_frame(writer, &Value::Array(vec![Value::from("Drain")])).await;
                                 return Served { exit: Exit::Finished, spare };
                             }
@@ -859,7 +926,7 @@ async fn serve(shared: &Arc<Shared>, child: &mut ChildHandle, cfg: &Arc<Cfg>) ->
                         let (Some(task_id), Some(result)) = (items[1].as_u64(), items[2].as_slice()) else {
                             return Served { exit: Exit::Died, spare };
                         };
-                        if let Some(job) = inflight.take().filter(|j| j.task_id == task_id) {
+                        if let Some(job) = inflight.remove(&task_id) {
                             let done = Outcome { ok: true, result: result.to_vec(), error_type: String::new(), traceback: String::new(), directive: Directive::Policy };
                             shared.settle(job, done).await;
                         }
@@ -871,7 +938,7 @@ async fn serve(shared: &Arc<Shared>, child: &mut ChildHandle, cfg: &Arc<Cfg>) ->
                             return Served { exit: Exit::Died, spare };
                         };
                         let directive = Directive::read(&items);
-                        if let Some(job) = inflight.take().filter(|j| j.task_id == task_id) {
+                        if let Some(job) = inflight.remove(&task_id) {
                             let mut outcome = Outcome::nack(kind, tb.to_string());
                             outcome.directive = directive;
                             shared.settle(job, outcome).await;
@@ -884,9 +951,7 @@ async fn serve(shared: &Arc<Shared>, child: &mut ChildHandle, cfg: &Arc<Cfg>) ->
                         if let (Some(task_id), Some(blob)) =
                             (items[1].as_u64(), items[2].as_slice())
                         {
-                            if let Some(job) =
-                                inflight.as_ref().filter(|j| j.task_id == task_id)
-                            {
+                            if let Some(job) = inflight.get(&task_id) {
                                 shared.keep_progress(job, blob.to_vec()).await;
                             }
                         }
@@ -907,6 +972,11 @@ async fn serve(shared: &Arc<Shared>, child: &mut ChildHandle, cfg: &Arc<Cfg>) ->
                         tokio::spawn(drain_owned(shared.clone(), stale, cfg.clone()));
                     }
                 }
+                if free > 0 && !inflight.is_empty() {
+                    if let Fill::Dead = fill!() {
+                        return Served { exit: Exit::Died, spare };
+                    }
+                }
                 let reading = check!();
                 // The hard ceiling is the one that does not wait for a good
                 // moment. Draining an idle child gets there just as well and
@@ -915,7 +985,7 @@ async fn serve(shared: &Arc<Shared>, child: &mut ChildHandle, cfg: &Arc<Cfg>) ->
                     if spare.is_none() && arming {
                         spare = spare_rx.recv().await.flatten();
                     }
-                    let exit = if inflight.is_some() {
+                    let exit = if !inflight.is_empty() {
                         Exit::OverHardLimit
                     } else {
                         Exit::Recycle("hard_max_rss")
@@ -947,7 +1017,7 @@ async fn drain(shared: &Arc<Shared>, mut child: ChildHandle, cfg: &Cfg) {
                 match items[0].as_str() {
                     Some("Ack") => {
                         if let (Some(task_id), Some(result)) = (items[1].as_u64(), items[2].as_slice()) {
-                            if let Some(job) = child.inflight.take().filter(|j| j.task_id == task_id) {
+                            if let Some(job) = child.inflight.remove(&task_id) {
                                 let done = Outcome { ok: true, result: result.to_vec(), error_type: String::new(), traceback: String::new(), directive: Directive::Policy };
                                 shared.settle(job, done).await;
                             }
@@ -956,7 +1026,7 @@ async fn drain(shared: &Arc<Shared>, mut child: ChildHandle, cfg: &Cfg) {
                     Some("Nack") => {
                         if let (Some(task_id), Some(kind), Some(tb)) = (items[1].as_u64(), items[2].as_str(), items[3].as_str()) {
                             let directive = Directive::read(&items);
-                            if let Some(job) = child.inflight.take().filter(|j| j.task_id == task_id) {
+                            if let Some(job) = child.inflight.remove(&task_id) {
                                 let mut outcome = Outcome::nack(kind, tb.to_string());
                                 outcome.directive = directive;
                                 shared.settle(job, outcome).await;
@@ -983,7 +1053,7 @@ async fn reap(shared: &Arc<Shared>, mut child: ChildHandle, cfg: &Cfg) {
             .lock()
             .unwrap()
             .push(status.code().unwrap_or(-1));
-        if let Some(job) = child.inflight.take() {
+        for (_, job) in std::mem::take(&mut child.inflight) {
             shared.give_back(job).await;
         }
         return;
@@ -1006,7 +1076,7 @@ async fn reap(shared: &Arc<Shared>, mut child: ChildHandle, cfg: &Cfg) {
             .unwrap()
             .push(status.code().unwrap_or(-1));
     }
-    if let Some(job) = child.inflight.take() {
+    for (_, job) in std::mem::take(&mut child.inflight) {
         shared.give_back(job).await;
     }
 }
@@ -1026,9 +1096,12 @@ async fn slot(shared: Arc<Shared>, cfg: Arc<Cfg>) {
                 return;
             }
             Exit::OverHardLimit => {
-                // Take the job before reaping, so the crash path does not also
-                // claim it: this failure has a name worth putting in the DLQ.
-                let job = current.inflight.take();
+                // Take the jobs before reaping, so the crash path does not also
+                // claim them: this failure has a name worth putting in the DLQ.
+                // With more than one slot the kill takes every task the child
+                // held, not only the one that grew — they were sharing a
+                // process, which is what a slot count buys and costs.
+                let killed = std::mem::take(&mut current.inflight);
                 shared.counters.hard_killed.fetch_add(1, Ordering::Relaxed);
                 *shared
                     .reasons
@@ -1040,7 +1113,7 @@ async fn slot(shared: Arc<Shared>, cfg: Arc<Cfg>) {
                     unsafe { libc::kill(current.pid as i32, libc::SIGKILL) };
                 }
                 reap(&shared, current, &cfg).await;
-                if let Some(job) = job {
+                for (_, job) in killed {
                     let message = format!(
                         "{} was killed at the hard memory ceiling of {} MB",
                         job.name,
@@ -1383,6 +1456,7 @@ fn build_cfg(
     metrics_addr: Option<String>,
     hard_max_rss: u64,
     spawn_slack: u64,
+    slots: usize,
 ) -> Cfg {
     Cfg {
         app_spec,
@@ -1403,6 +1477,7 @@ fn build_cfg(
         metrics_addr,
         hard_max_rss,
         claim_block: Duration::from_millis(250),
+        slots: slots.max(1),
     }
 }
 
@@ -1430,7 +1505,7 @@ type BatchResult = (Vec<Py<PyAny>>, HashMap<String, u64>, Vec<i32>);
 /// The tests and the benchmark harness live here; production goes through
 /// `work`, which never returns on its own.
 #[pyfunction]
-#[pyo3(signature = (app_spec, jobs, python, children=2, max_rss=0, max_tasks=0,
+#[pyo3(signature = (app_spec, jobs, python, children=2, slots=1, max_rss=0, max_tasks=0,
                     max_lifetime=0.0, hard_max_rss=0))]
 #[allow(clippy::too_many_arguments)]
 fn run(
@@ -1439,6 +1514,7 @@ fn run(
     jobs: Vec<(String, Vec<u8>)>,
     python: String,
     children: usize,
+    slots: usize,
     max_rss: u64,
     max_tasks: u64,
     max_lifetime: f64,
@@ -1458,6 +1534,7 @@ fn run(
         None,
         hard_max_rss,
         total as u64,
+        slots,
     );
 
     let outcome = py.detach(move || {
@@ -1498,7 +1575,7 @@ fn run(
 
 /// Worker mode: consume `queues` from a real broker until SIGINT or SIGTERM.
 #[pyfunction]
-#[pyo3(signature = (app_spec, broker_url, queues, python, children=2, max_rss=0, max_tasks=0,
+#[pyo3(signature = (app_spec, broker_url, queues, python, children=2, slots=1, max_rss=0, max_tasks=0,
                     max_lifetime=0.0, lease_grace=30.0, metrics_addr=None, hard_max_rss=0))]
 #[allow(clippy::too_many_arguments)]
 fn work(
@@ -1508,6 +1585,7 @@ fn work(
     queues: Vec<String>,
     python: String,
     children: usize,
+    slots: usize,
     max_rss: u64,
     max_tasks: u64,
     max_lifetime: f64,
@@ -1528,6 +1606,7 @@ fn work(
         metrics_addr,
         hard_max_rss,
         u64::MAX / 2, // no batch to bound the spawn cap against
+        slots,
     );
 
     let outcome = py.detach(move || {

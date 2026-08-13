@@ -20,6 +20,13 @@ async def boom():
     raise ValueError("kaboom")
 
 
+@app.task(name="waits", timeout=4)
+async def waits():
+    """Awaits without allocating — the shape a slot count exists for."""
+    await asyncio.sleep(0.2)
+    return os.getpid()
+
+
 @app.task(name="naps", timeout=0.3)
 async def naps():
     await asyncio.sleep(10)

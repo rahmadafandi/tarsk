@@ -48,6 +48,36 @@ def test_timeout_cap():
         raise AssertionError("timeout above max_timeout must be rejected at registration")
 
 
+def test_slots_overlap_inside_one_child():
+    """Four awaiting tasks, one child: concurrent, or the slot count is a lie."""
+    import time
+
+    jobs = [("waits", (), {}) for _ in range(4)]
+
+    start = time.monotonic()
+    serial = Supervisor("tests.demo_app:app", children=1, slots=1)
+    serial_results = serial.run(jobs)
+    serial_wall = time.monotonic() - start
+
+    start = time.monotonic()
+    parallel = Supervisor("tests.demo_app:app", children=1, slots=4)
+    parallel_results = parallel.run(jobs)
+    parallel_wall = time.monotonic() - start
+
+    assert len(parallel_results) == 4, parallel_results
+    assert all(r[0] == "ack" for r in parallel_results.values()), parallel_results
+    # All four ran in the same process — this is concurrency, not more children.
+    assert len({r[1] for r in parallel_results.values()}) == 1, parallel_results
+
+    # Four 0.2s waits: 0.8s serialised, ~0.2s overlapped. Interpreter startup is
+    # in both figures, so compare them against each other rather than a constant.
+    assert parallel_wall < serial_wall - 0.3, (
+        f"slots=4 took {parallel_wall:.2f}s against slots=1 at {serial_wall:.2f}s — "
+        "the tasks did not overlap"
+    )
+    assert len(serial_results) == 4, serial_results
+
+
 def test_end_to_end():
     sup = Supervisor("tests.demo_app:app", children=2)
     results = sup.run(JOBS)
@@ -122,7 +152,7 @@ def test_retry_hands_the_job_back():
 
 
 if __name__ == "__main__":
-    for check in (test_registry_hash, test_timeout_cap, test_end_to_end,
+    for check in (test_slots_overlap_inside_one_child, test_registry_hash, test_timeout_cap, test_end_to_end,
                   test_retry_then_succeed, test_retries_run_out,
                   test_reject_skips_the_remaining_retries, test_retry_hands_the_job_back):
         check()

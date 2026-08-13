@@ -106,12 +106,12 @@ handler tarsk, Celery and taskiq all reach 19–20 tasks/s — identical, as the
 drains a no-op queue faster than both, and anyone selling a task queue on that number is
 selling the wrong thing.
 
-**Not for work that mostly waits.** One task per child is the design, and it is the wrong shape
-for I/O-bound handlers. 500 tasks that each await 100ms: taskiq finishes in 0.21s using 320MB,
-tarsk in 1.78s using 812MB — **8.5× slower on 2.5× the memory**. taskiq buys a concurrent slot
-with a coroutine; tarsk buys one with a whole interpreter. If your handlers mostly wait on
-other services, use taskiq. The ceiling this project is built around is only worth its price
-when your handlers allocate.
+**Not precise and concurrent at once.** One task per child is the default, and it is what makes
+the ceiling exact — a child with nothing running cannot grow. For handlers that wait rather
+than allocate, `--slots N` runs N at a time in one child: 500 tasks each awaiting 100ms take
+0.15s on 127MB, against taskiq's 0.20s on 319MB and 12.7s for tarsk at one slot. The cost is
+the precision above — overshoot becomes the peak of whatever is in flight, not of one task. Set
+it high for work that waits, leave it at 1 for work that allocates.
 
 **Not a hard ceiling regardless of task size.** The ceiling is read while a child is idle, so a
 child never *starts* a task it cannot afford — but a handler that allocates 300MB will allocate
@@ -138,6 +138,13 @@ something read off your `App`.
 
 Recycle triggers: `--max-rss`, `--max-tasks`, `--max-lifetime`, whichever comes first. A child
 is drained, never killed outright: it finishes what it is holding.
+
+`--slots N` lets one child hold N tasks at once, and it costs precision in exactly the place
+this project claims it. At one slot — the default — the ceiling is read while the child has
+nothing running, so overshoot is bounded by a single task's peak. At 64 slots it is bounded by
+whatever 64 tasks are holding, and a hard kill takes all 64 down together. Raise it for
+handlers that *wait* on other services and allocate little; leave it at 1 for handlers that
+allocate, which is the case the ceiling exists for.
 
 `--hard-max-rss` is the exception, and it is off by default. Set it and a child that reaches it
 mid-task is killed rather than allowed to keep growing — the task is retried, and if it cannot

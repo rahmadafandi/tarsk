@@ -36,6 +36,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="redis://…, postgres://… (or TARSK_BROKER)")
     worker.add_argument("--queues", default="default", help="comma separated")
     worker.add_argument("--children", type=int, default=2)
+    worker.add_argument("--slots", type=int, default=1,
+                        help="tasks in flight per child. 1 keeps the memory ceiling "
+                             "precise; raise it only for handlers that wait")
     worker.add_argument("--max-rss", type=parse_size, default=0,
                         help="recycle a child above this, e.g. 400MB")
     worker.add_argument("--hard-max-rss", type=parse_size, default=0,
@@ -60,6 +63,7 @@ def main(argv: list[str] | None = None) -> int:
     supervisor = Supervisor(
         args.app,
         children=args.children,
+        slots=args.slots,
         max_rss=args.max_rss,
         max_tasks=args.max_tasks,
         max_lifetime=args.max_lifetime,

@@ -276,32 +276,39 @@ was wrong.
 
 ### Waiting, not working — 500 tasks that each await 100ms
 
-The case tarsk is worst at, and the one every other table here avoids. Nothing computes;
-everything waits, which is what most real task queue work does — call an API, query a database,
-wait for a webhook.
+Nothing computes; everything waits, which is what most real task queue work does — call an API,
+query a database, wait for a webhook.
 
 | runtime | wall | vs. the 4-way floor | peak tree RSS | completed |
 |---|---|---|---|---|
-| celery, 4 processes | 12.61s | 1.01× | 251 MB | 500/500 |
-| taskiq, 4 processes × 1 | 12.59s | 1.01× | 318 MB | 500/500 |
-| tarsk, 4 children | 12.61s | 1.01× | **124 MB** | 500/500 |
-| celery, 32 processes | 1.55s | 0.12× | 1,628 MB | 500/500 |
-| **taskiq, 4 processes × 64** | **0.21s** | 0.02× | 320 MB | 500/500 |
-| tarsk, 32 children | 1.78s | 0.14× | 812 MB | 500/500 |
+| celery, 4 processes | 12.63s | 1.01× | 251 MB | 500/500 |
+| taskiq, 4 processes × 1 | 12.64s | 1.01× | 318 MB | 500/500 |
+| tarsk, 4 children | 12.70s | 1.02× | **125 MB** | 500/500 |
+| celery, 32 processes | 1.58s | 0.13× | 1,628 MB | 500/500 |
+| taskiq, 4 processes × 64 | 0.20s | 0.02× | 319 MB | 500/500 |
+| tarsk, 32 children | 1.64s | 0.13× | 812 MB | 500/500 |
+| **tarsk, 4 children × 64 slots** | **0.15s** | 0.01× | **127 MB** | 500/500 |
 
 Held to one task per process, all three land on the arithmetic floor of 12.5s and the only
-difference is footprint, where tarsk wins. Then concurrency is allowed, and the model decides
-the result: **taskiq drains the queue 8.5× faster than tarsk while using 2.5× less memory.**
+difference is footprint. Buying concurrency with processes is the expensive way: 32 children
+costs 812MB to reach 1.64s, and Celery's 32 processes cost 1,628MB to reach much the same.
 
-That is not a tuning gap. taskiq buys a concurrent slot with a coroutine, costing kilobytes;
-tarsk buys one with an interpreter, costing 27MB. To match taskiq's 0.21s, tarsk would need
-256 children — roughly 6.9GB. It was not run.
+`--slots 64` buys it with coroutines instead, and that row is the whole point of running this
+table: **0.15s on 127MB against taskiq's 0.20s on 319MB.** Same concurrency model now, and
+tarsk's advantage is the one it always had — a child that imports your tasks and no broker
+driver is a smaller process to have 64 of. Three runs each: tarsk 0.15 / 0.16 / 0.16, taskiq
+0.20 / 0.20 / 0.20.
 
-The one-slot-per-child design is what makes the rest of this page possible: a supervisor can
-read a child's RSS and retire it between tasks precisely because there is exactly one task to
-be between. Nothing here is free, and this is the bill.
+**This is not free, and what it costs is the thing this page is otherwise about.** At one slot
+the ceiling is read while the child has nothing running, so overshoot is bounded by a single
+task's peak. At 64 it is bounded by whatever 64 tasks are holding, and `--hard-max-rss` takes
+all 64 down together rather than one. That is why the default is 1: handlers that wait should
+raise it, handlers that allocate are exactly the case the precision exists for.
 
-If your handlers mostly wait, use taskiq. If they mostly allocate, that is what tarsk is for.
+An earlier version of this section reported this row as a loss tarsk could not fix, and called
+one task per child "the design, not a tuning gap". The measurement was right and the conclusion
+was wrong — the one-slot loop was a default, and the note left in `tarsk/_child.py` already
+said what multi-slot needed — N Readys and a reader task. It took about an hour.
 
 ### Throughput, single worker
 

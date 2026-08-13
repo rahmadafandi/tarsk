@@ -117,7 +117,64 @@ async def _shutdown(app, writer) -> None:
         traceback.print_exc()
 
 
-async def main(socket_path: str, app_spec: str, child_id: int) -> None:
+async def _one(app, wire: Wire, app_spec: str, task_id: int, name: str, payload) -> None:
+    """Run a single dispatched task and report it. Never raises."""
+    task = app.registry.get(name)
+    if task is None:
+        await wire.send(
+            "Nack", task_id, "UnknownTask", f"no task named {name!r} in {app_spec}", "", 0
+        )
+        return
+
+    try:
+        call_args, call_kwargs = _proto.unpack_args(payload)
+        loop = asyncio.get_running_loop()
+
+        def emit(value, _id=task_id):
+            wire.send_threadsafe(loop, "Progress", _id, _proto.pack_result(value))
+
+        ctx = Context(
+            name=name,
+            task_id=str(task_id),
+            attempt=1,
+            args=tuple(call_args),
+            kwargs=call_kwargs,
+            _emit=emit,
+        )
+        result = await _call(app, task, ctx, call_args, call_kwargs)
+    except Reject as exc:
+        # The handler knows this will never work. Skip the remaining attempts
+        # rather than spending them to reach the same answer.
+        await wire.send("Nack", task_id, "Reject", f"{type(exc).__name__}: {exc}", "reject", 0)
+    except Retry as exc:
+        await wire.send(
+            "Nack", task_id, "Retry", f"{type(exc).__name__}: {exc}",
+            "retry", int(exc.delay * 1000),
+        )
+    except TimeoutError:
+        await wire.send(
+            "Nack", task_id, "TimeoutError",
+            f"{name} exceeded timeout of {task.spec.timeout_ms / 1000}s", "", 0,
+        )
+        if not task.is_async:
+            # A Python thread cannot be interrupted (spec §4.5). The work we
+            # just timed out on is still running and still holds whatever we
+            # killed it for, so the process has to go — and with more than one
+            # slot it takes its siblings with it. Their leases expire and the
+            # supervisor redelivers them; that is the cost of sharing a process.
+            raise _SyncTimeout
+    except Exception as exc:
+        # Pre-formatted string — never reconstructed Rust-side (spec §4.2).
+        await wire.send("Nack", task_id, type(exc).__name__, traceback.format_exc(), "", 0)
+    else:
+        await wire.send("Ack", task_id, _proto.pack_result(result))
+
+
+class _SyncTimeout(Exception):
+    """A sync handler outlived its timeout, so this process cannot continue."""
+
+
+async def main(socket_path: str, app_spec: str, child_id: int, slots: int = 1) -> None:
     app = load_app(app_spec)
     # Before Register, so whatever a hook opens is inside the baseline the
     # supervisor measures against the ceiling. A pool that does not fit should
@@ -134,78 +191,48 @@ async def main(socket_path: str, app_spec: str, child_id: int) -> None:
     # connection to the process it started — and to that process's RSS.
     await wire.send("Register", child_id, app.registry_hash(), app.registry_rows())
 
-    # ponytail: one slot per child, so Drain can only arrive while idle and
-    # there is no in-flight bookkeeping. Multi-slot means N Readys plus a
-    # separate reader task — add it when a child's task mix is I/O-bound
-    # enough that one in-flight task wastes the interpreter it paid for.
-    while True:
+    # One Ready per free slot. At slots=1 this is the original strict
+    # request/response loop; above it, the supervisor keeps as many tasks in
+    # flight here as there are Readys outstanding.
+    running: set[asyncio.Task] = set()
+    draining = False
+    for _ in range(slots):
         await wire.send("Ready")
+
+    async def run_and_report(task_id, name, payload):
+        try:
+            await _one(app, wire, app_spec, task_id, name, payload)
+        except _SyncTimeout:
+            # Nothing above is awaiting this task, so the exit has to happen
+            # here — letting it settle into the task object would leave the
+            # process running with the thread it could not interrupt.
+            await _die(writer, EXIT_SYNC_TIMEOUT)
+        if not draining:
+            await wire.send("Ready")
+
+    while True:
         frame = await _proto.read(reader)
         if frame is None:
-            await _shutdown(app, writer)
-            return  # supervisor went away
+            break  # supervisor went away
         tag, args = frame
         if tag == "Drain":
-            await _shutdown(app, writer)
-            return
+            draining = True
+            break
         if tag != "Dispatch":
             raise RuntimeError(f"unexpected frame from supervisor: {tag!r}")
+        job = asyncio.create_task(run_and_report(*args))
+        running.add(job)
+        job.add_done_callback(running.discard)
 
-        task_id, name, payload = args
-        task = app.registry.get(name)
-        if task is None:
-            await wire.send(
-                "Nack", task_id, "UnknownTask", f"no task named {name!r} in {app_spec}", "", 0
-            )
-            continue
-
-        try:
-            call_args, call_kwargs = _proto.unpack_args(payload)
-            loop = asyncio.get_running_loop()
-
-            def emit(value, _id=task_id):
-                wire.send_threadsafe(loop, "Progress", _id, _proto.pack_result(value))
-
-            ctx = Context(
-                name=name,
-                task_id=str(task_id),
-                attempt=1,
-                args=tuple(call_args),
-                kwargs=call_kwargs,
-                _emit=emit,
-            )
-            result = await _call(app, task, ctx, call_args, call_kwargs)
-        except Reject as exc:
-            # The handler knows this will never work. Skip the remaining
-            # attempts rather than spending them to reach the same answer.
-            await wire.send(
-                "Nack", task_id, "Reject", f"{type(exc).__name__}: {exc}", "reject", 0
-            )
-        except Retry as exc:
-            await wire.send(
-                "Nack", task_id, "Retry", f"{type(exc).__name__}: {exc}",
-                "retry", int(exc.delay * 1000),
-            )
-        except TimeoutError:
-            await wire.send(
-                "Nack", task_id, "TimeoutError",
-                f"{name} exceeded timeout of {task.spec.timeout_ms / 1000}s", "", 0,
-            )
-            if not task.is_async:
-                # A Python thread cannot be interrupted (spec §4.5). The work
-                # we just timed out on is still running and still holds
-                # whatever we killed it for, so the process has to go.
-                await _die(writer, EXIT_SYNC_TIMEOUT)
-        except Exception as exc:
-            # Pre-formatted string — never reconstructed Rust-side (spec §4.2).
-            await wire.send(
-                "Nack", task_id, type(exc).__name__, traceback.format_exc(), "", 0
-            )
-        else:
-            await wire.send("Ack", task_id, _proto.pack_result(result))
+    # Whatever is still in flight owns a lease; finishing it is cheaper than
+    # letting the supervisor time it out and redeliver.
+    if running:
+        await asyncio.gather(*running, return_exceptions=True)
+    await _shutdown(app, writer)
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 4:
-        sys.exit("usage: python -m tarsk._child <socket-path> <module:app> <child-id>")
-    asyncio.run(main(sys.argv[1], sys.argv[2], int(sys.argv[3])))
+    if len(sys.argv) not in (4, 5):
+        sys.exit("usage: python -m tarsk._child <socket-path> <module:app> <child-id> [slots]")
+    slots = int(sys.argv[4]) if len(sys.argv) == 5 else 1
+    asyncio.run(main(sys.argv[1], sys.argv[2], int(sys.argv[3]), slots))

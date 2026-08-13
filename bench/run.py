@@ -292,10 +292,12 @@ def taskiq_cmd(workers: int = 1, module: str = "bench.taskiq_app",
             "--max-threadpool-threads", "1", "--log-level", "ERROR"]
 
 
-def tarsk_cmd(children: int, max_rss: int, max_tasks: int, hard_max_rss: int) -> list[str]:
+def tarsk_cmd(children: int, max_rss: int, max_tasks: int, hard_max_rss: int,
+              slots: int = 1) -> list[str]:
     """The real worker against the real broker — the same one a user runs."""
     cmd = [PY, "-m", "tarsk._cli", "worker", "--app", "bench.tarsk_app:app",
-           "--broker", REDIS_URL, "--children", str(children), "--lease-grace", "5"]
+           "--broker", REDIS_URL, "--children", str(children), "--lease-grace", "5",
+           "--slots", str(slots)]
     if max_rss:
         cmd += ["--max-rss", str(max_rss)]
     if max_tasks:
@@ -465,7 +467,8 @@ def case(framework: str, label: str, task: str, count: int, args: list, timeout:
         options = tarsk_kw or {}
         submit_tarsk(task, count, args)
         cmd = tarsk_cmd(options.get("children", 1), options.get("max_rss", 0),
-                        options.get("max_tasks", 0), options.get("hard_max_rss", 0))
+                        options.get("max_tasks", 0), options.get("hard_max_rss", 0),
+                        options.get("slots", 1))
     else:
         if framework == "celery":
             submit_celery(task, count, args)
@@ -791,6 +794,7 @@ def scenario_io(redis: Redis, tmp: Path) -> None:
         ("celery, 32 processes", dict(celery_workers=32)),
         ("taskiq, 4 processes × 64", dict(taskiq_workers=4, taskiq_async=64)),
         ("tarsk, 32 children", dict(tarsk_kw={"children": 32})),
+        ("tarsk, 4 children × 64", dict(tarsk_kw={"children": 4, "slots": 64})),
     ]:
         framework = label.split(",")[0]
         rows.append(case(framework, label.split(", ")[1], "io100", count, [], 300,

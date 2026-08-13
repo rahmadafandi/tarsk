@@ -23,6 +23,7 @@ class Supervisor:
         self,
         app_spec: str,
         children: int = 2,
+        slots: int = 1,
         max_rss: int = 0,          # bytes, 0 = unbounded
         max_tasks: int = 0,        # 0 = unlimited
         max_lifetime: float = 0.0, # seconds, 0 = unlimited
@@ -36,6 +37,7 @@ class Supervisor:
             )
         self.app_spec = app_spec
         self.children = children
+        self.slots = slots
         self.max_rss = max_rss
         self.max_tasks = max_tasks
         self.max_lifetime = max_lifetime
@@ -57,6 +59,7 @@ class Supervisor:
             packed,
             self.python,
             self.children,
+            self.slots,
             self.max_rss,
             self.max_tasks,
             self.max_lifetime,
@@ -89,6 +92,7 @@ class Supervisor:
             queues,
             self.python,
             self.children,
+            self.slots,
             self.max_rss,
             self.max_tasks,
             self.max_lifetime,

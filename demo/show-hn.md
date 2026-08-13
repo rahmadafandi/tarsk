@@ -31,10 +31,11 @@ One hour, 72,001 tasks, a handler that frees nothing: 66 recycles, peak 400 MB
 against a 400 MB ceiling, zero tasks lost, nothing killed. The trough held at 27.9 MB
 over the first half hour and 28.1 MB over the second, so nothing survives a recycle.
 
-What it does not claim: it is not faster where it counts. It does drain a
-no-op queue about 1.5x faster than taskiq at ten thousand tasks -- but with a
-50 ms handler, Tarsk, Celery and taskiq all reach 19-20 tasks/s, identical, as
-they should be. Dispatch costs microseconds and real handlers do not. Nor is the ceiling absolute: it is read while
+What it does not claim: speed, and not I/O-bound work at all. It drains a no-op
+queue about 1.5x faster than taskiq, but with a 50 ms handler all three reach
+19-20 tasks/s, identical, as they should be. And 500 tasks that each await
+100ms take taskiq 0.21s to Tarsk's 1.78s -- one task per child is what makes
+the ceiling enforceable, and it costs an interpreter per concurrent slot. Nor is the ceiling absolute: it is read while
 a child is idle, so a child never starts a task it cannot afford, but a handler that
 allocates 300 MB will allocate it. Overshoot is one task's peak, not zero. A ceiling
 that killed running work could not make an oversized task fit -- it would only turn
@@ -143,6 +144,12 @@ which flattered every figure. Against the same Redis with the same at-least-once
 tarsk drains ten thousand no-ops in 0.95s to taskiq's 1.48s. That lead came from deleting a
 mutex the driver never needed rather than from the architecture — this page reported a tie
 until the commit that removed it. None of it changes above 50 ms, which is where handlers live.
+
+**This is useless for I/O-bound work.**
+Correct, and measured rather than conceded: 500 tasks each awaiting 100ms take taskiq 0.21s on
+320MB and tarsk 1.78s on 812MB. One task per child is what lets a supervisor read RSS and
+retire a worker between tasks, and it costs an interpreter per concurrent slot where taskiq
+costs a coroutine. Handlers that wait belong on taskiq. This is for handlers that allocate.
 
 **A ceiling that can be exceeded isn't a ceiling.**
 It is read while a child is idle, so overshoot is bounded by one task's peak allocation rather

@@ -12,5 +12,6 @@ app = App(
 )
 
 for _name, _fn in (("leak", handlers.leak), ("noop", handlers.noop),
-                   ("work5", handlers.work5), ("work50", handlers.work50)):
+                   ("work5", handlers.work5), ("work50", handlers.work50),
+                   ("io100", handlers.io100)):
     app.task(name=_name)(_fn)

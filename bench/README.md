@@ -274,6 +274,35 @@ in one burst blocked every other Redis command. The mutex is gone and so is the 
 conclusion happened to survive — the cap is still the child count — but the reason given for it
 was wrong.
 
+### Waiting, not working — 500 tasks that each await 100ms
+
+The case tarsk is worst at, and the one every other table here avoids. Nothing computes;
+everything waits, which is what most real task queue work does — call an API, query a database,
+wait for a webhook.
+
+| runtime | wall | vs. the 4-way floor | peak tree RSS | completed |
+|---|---|---|---|---|
+| celery, 4 processes | 12.61s | 1.01× | 251 MB | 500/500 |
+| taskiq, 4 processes × 1 | 12.59s | 1.01× | 318 MB | 500/500 |
+| tarsk, 4 children | 12.61s | 1.01× | **124 MB** | 500/500 |
+| celery, 32 processes | 1.55s | 0.12× | 1,628 MB | 500/500 |
+| **taskiq, 4 processes × 64** | **0.21s** | 0.02× | 320 MB | 500/500 |
+| tarsk, 32 children | 1.78s | 0.14× | 812 MB | 500/500 |
+
+Held to one task per process, all three land on the arithmetic floor of 12.5s and the only
+difference is footprint, where tarsk wins. Then concurrency is allowed, and the model decides
+the result: **taskiq drains the queue 8.5× faster than tarsk while using 2.5× less memory.**
+
+That is not a tuning gap. taskiq buys a concurrent slot with a coroutine, costing kilobytes;
+tarsk buys one with an interpreter, costing 27MB. To match taskiq's 0.21s, tarsk would need
+256 children — roughly 6.9GB. It was not run.
+
+The one-slot-per-child design is what makes the rest of this page possible: a supervisor can
+read a child's RSS and retire it between tasks precisely because there is exactly one task to
+be between. Nothing here is free, and this is the bill.
+
+If your handlers mostly wait, use taskiq. If they mostly allocate, that is what tarsk is for.
+
 ### Throughput, single worker
 
 | runtime | no-op | 50 ms handler | startup |

@@ -280,9 +280,15 @@ def celery_cmd(max_tasks_per_child: int | None, workers: int = 1) -> list[str]:
     return cmd
 
 
-def taskiq_cmd(workers: int = 1, module: str = "bench.taskiq_app") -> list[str]:
+def taskiq_cmd(workers: int = 1, module: str = "bench.taskiq_app",
+               async_tasks: int = 1) -> list[str]:
+    """One task at a time per process by default, so process count is the axis.
+
+    `async_tasks` lifts that, which is the whole point of the io scenario: it
+    is the thing taskiq can do and tarsk cannot.
+    """
     return [PY, "-m", "taskiq", "worker", f"{module}:broker",
-            "--workers", str(workers), "--max-async-tasks", "1",
+            "--workers", str(workers), "--max-async-tasks", str(async_tasks),
             "--max-threadpool-threads", "1", "--log-level", "ERROR"]
 
 
@@ -445,6 +451,7 @@ def run_worker(cmd: list[str], env: dict, expected: int, log: Path, timeout: flo
 
 def case(framework: str, label: str, task: str, count: int, args: list, timeout: float,
          redis: Redis, tmp: Path, *, celery_mtpc=None, tarsk_kw=None, memory_max=None,
+         taskiq_async=1,
          extra_env=None, restarts=0, celery_workers=1, taskiq_workers=1,
          taskiq_module="bench.taskiq_app", sample=True) -> Result:
     log = tmp / f"{framework}-{label}-{task}.log".replace(" ", "_")
@@ -465,7 +472,7 @@ def case(framework: str, label: str, task: str, count: int, args: list, timeout:
             cmd = celery_cmd(celery_mtpc, celery_workers)
         else:
             submit_taskiq(task, count, args, taskiq_module)
-            cmd = taskiq_cmd(taskiq_workers, taskiq_module)
+            cmd = taskiq_cmd(taskiq_workers, taskiq_module, taskiq_async)
 
     result = run_worker(cmd, env, count, log, timeout, memory_max, restarts, sample=sample)
     result.framework, result.label = framework, label
@@ -766,6 +773,46 @@ def scenario_scale(redis: Redis, tmp: Path) -> None:
           "and a no-op handler is\nthe case that hides it.")
 
 
+def scenario_io(redis: Redis, tmp: Path) -> None:
+    """The case tarsk is worst at, measured rather than conceded in prose.
+
+    500 tasks that each await 100ms. Nothing computes; everything waits, which
+    is what most real task queue work does. A runtime that overlaps tasks
+    inside one process needs one process; tarsk needs one child per concurrent
+    task, and a child is 27MB.
+    """
+    count = 500
+    per_task = 0.1
+    rows = []
+    for label, kwargs in [
+        ("celery, 4 processes", dict(celery_workers=4)),
+        ("taskiq, 4 processes × 1", dict(taskiq_workers=4)),
+        ("tarsk, 4 children", dict(tarsk_kw={"children": 4})),
+        ("celery, 32 processes", dict(celery_workers=32)),
+        ("taskiq, 4 processes × 64", dict(taskiq_workers=4, taskiq_async=64)),
+        ("tarsk, 32 children", dict(tarsk_kw={"children": 32})),
+    ]:
+        framework = label.split(",")[0]
+        rows.append(case(framework, label.split(", ")[1], "io100", count, [], 300,
+                         redis, tmp, **kwargs))
+        rows[-1].label = label
+
+    print(f"\n### Waiting, not working — {count} tasks that each await {per_task * 1000:.0f}ms\n")
+    print("The floor is arithmetic: with N tasks in flight, "
+          f"{count} × {per_task:.1f}s / N.\nBeating it is impossible; how close a runtime "
+          "gets, and what it spends to get there,\nis the whole table.\n")
+    print("| runtime | wall | vs. the 4-way floor | peak tree RSS | completed |")
+    print("|---|---|---|---|---|")
+    floor4 = count * per_task / 4
+    for row in rows:
+        wall = row.work if row.completed == count else float("nan")
+        vs = f"{wall / floor4:.2f}×" if wall == wall else "—"
+        shown = f"{wall:.2f}s" if wall == wall else "did not drain"
+        print(f"| {row.label} | {shown} | {vs} | {row.peak_total // MB} MB | "
+              f"{row.completed}/{count} |")
+    print(f"\nThe 4-way floor is {floor4:.1f}s.\n")
+
+
 def scenario_throughput(redis: Redis, tmp: Path) -> None:
     rows = [
         case("celery", "noop", "noop", 500, [], 300, redis, tmp),
@@ -794,6 +841,7 @@ SCENARIOS = {
     "gap": scenario_gap,
     "throughput": scenario_throughput,
     "scale": scenario_scale,
+    "io": scenario_io,
 }
 
 

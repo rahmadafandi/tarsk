@@ -8,6 +8,7 @@ the same cost everywhere.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import resource
 import sys
@@ -63,6 +64,31 @@ def noop(task_id: int) -> int:
 def work5(task_id: int) -> int:
     started = time.time()
     time.sleep(0.005)
+    record(task_id, started)
+    return os.getpid()
+
+
+async def io100(task_id: int) -> int:
+    """100ms of waiting, not working — the case a task queue actually runs.
+
+    Awaits rather than sleeps, so a runtime that can overlap tasks inside one
+    process is free to. This is the handler tarsk's one-task-per-child model
+    cannot absorb, which is why it is here.
+    """
+    started = time.time()
+    await asyncio.sleep(0.1)
+    record(task_id, started)
+    return os.getpid()
+
+
+def io100_blocking(task_id: int) -> int:
+    """The same wait for a runtime with no async task support (Celery prefork).
+
+    Not an equivalent handler — a blocking sleep occupies a process where the
+    awaited one does not. That difference is the measurement, not a flaw in it.
+    """
+    started = time.time()
+    time.sleep(0.1)
     record(task_id, started)
     return os.getpid()
 

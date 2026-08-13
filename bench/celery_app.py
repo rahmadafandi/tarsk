@@ -24,3 +24,5 @@ app.task(name="leak")(handlers.leak)
 app.task(name="noop")(handlers.noop)
 app.task(name="work5")(handlers.work5)
 app.task(name="work50")(handlers.work50)
+# Celery prefork cannot run a coroutine task; this is the blocking equivalent.
+app.task(name="io100")(handlers.io100_blocking)

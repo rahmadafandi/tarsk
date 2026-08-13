@@ -102,10 +102,16 @@ Full tables in [`bench/`](bench/README.md).
 ## What it does not claim
 
 **Not faster.** Dispatch costs microseconds; real handlers run for 50ms to minutes. With a 50ms
-handler tarsk, Celery and taskiq all reach 19–20 tasks/s — identical, as they should be. On
-no-op throughput taskiq edges it, and every task here crosses a Unix socket to a child, which
-is the price of the ceiling above. Anyone
-selling a task queue on throughput benchmarks is selling the wrong thing.
+handler tarsk, Celery and taskiq all reach 19–20 tasks/s — identical, as they should be. tarsk
+drains a no-op queue faster than both, and anyone selling a task queue on that number is
+selling the wrong thing.
+
+**Not for work that mostly waits.** One task per child is the design, and it is the wrong shape
+for I/O-bound handlers. 500 tasks that each await 100ms: taskiq finishes in 0.21s using 320MB,
+tarsk in 1.78s using 812MB — **8.5× slower on 2.5× the memory**. taskiq buys a concurrent slot
+with a coroutine; tarsk buys one with a whole interpreter. If your handlers mostly wait on
+other services, use taskiq. The ceiling this project is built around is only worth its price
+when your handlers allocate.
 
 **Not a hard ceiling regardless of task size.** The ceiling is read while a child is idle, so a
 child never *starts* a task it cannot afford — but a handler that allocates 300MB will allocate

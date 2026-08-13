@@ -144,12 +144,11 @@ this project claims it. At one slot the ceiling is read while the child has noth
 overshoot is bounded by a single task's peak. At 64 it is bounded by whatever 64 tasks are
 holding, and a hard kill takes all 64 down together.
 
-**The default follows `--max-rss`**: one slot when a ceiling is set, eight when none is. A
-ceiling is a request for precision, and precision is exactly what the second slot spends —
-but without one there is nothing to protect and a single slot is just a slow default. For
-comparison, taskiq runs 200 tasks at once out of the box and Celery one per core. The worker
-prints which rule it used, because otherwise adding `--max-rss` would cut throughput eightfold
-with nothing on screen to explain it.
+**The default is 8 slots**, whatever else is set. One flag quietly changing another flag's
+default is worse than either number being wrong, and a default that needs a line of runtime
+output to explain itself is the wrong default. What the worker does print, when `--max-rss` and
+several slots are both in play, is what that combination means: the ceiling still fires, but
+several tasks are running when it does, so overshoot is their peak rather than one task's.
 
 Raise it for handlers that *wait* and allocate little; set it to 1 for handlers that allocate,
 which is the case the ceiling exists for. For a mix, run one worker per queue rather than

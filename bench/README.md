@@ -124,7 +124,7 @@ long enough.
 
 | runtime | worker RSS | tree RSS |
 |---|---|---|
-| tarsk | **27 MB** | 44 MB |
+| tarsk | **27 MB** | 52 MB |
 | celery | 49 MB | 104 MB |
 | taskiq | 57 MB | 138 MB |
 
@@ -146,11 +146,19 @@ this page used to claim.
 | celery (no recycling) | 849 MB |
 | taskiq (no recycling available) | 858 MB |
 | celery `--max-tasks-per-child=6` | **170 MB** |
-| tarsk `--max-rss=200MB` | 205 MB |
+| tarsk `--max-rss=200MB --slots 1` | 205 MB |
+| tarsk `--max-rss=200MB` (default 100 slots) | **826 MB** |
 
 Celery wins this one. When the leak per task is known and constant, dividing the budget by it
 is a perfectly good bound — and a tighter one, because it stops short of the budget rather
 than at it.
+
+**The two tarsk rows are the same ceiling at one slot and at the default hundred**, and the
+second one is not a looser bound — it is barely a bound at all. 826MB against 849MB for no
+recycling whatsoever. With a hundred slots the child is handed a hundred tasks before any of
+them has allocated anything, so the ceiling is first read long after the damage. A slot is a
+task that can be allocating when the ceiling is read; the default is chosen for handlers that
+wait, and this workload does the opposite. `--slots 1` is what the rest of this page measures.
 
 ### The same configurations, different workloads
 
@@ -310,6 +318,26 @@ one task per child "the design, not a tuning gap". The measurement was right and
 was wrong — the one-slot loop was a default, and the note left in `tarsk/_child.py` already
 said what multi-slot needed — N Readys and a reader task. It took about an hour.
 
+### Out of the box — 2,000 tasks that each await 100ms
+
+No `-c`, no `--workers`, no `--children`, no `--slots`: whatever each runtime does when told
+nothing. Every other table here pins concurrency so one axis is held equal. This one asks what
+a person gets for typing the documented command.
+
+| runtime | median wall | peak tree RSS | completed |
+|---|---|---|---|
+| celery (`-c` = cores, 16 here) | 12.72s | 841 MB | 2000/2000 |
+| taskiq (2 workers × 100) | 1.36s | 210 MB | 2000/2000 |
+| **tarsk (2 children × 100 slots)** | **0.98s** | **78 MB** | 2000/2000 |
+
+The I/O handler is deliberate: a no-op would make this a measure of dispatch rather than of the
+default concurrency, and the default concurrency is the whole question.
+
+Read this against the two tarsk rows in the memory table above. The same default that wins here
+is the one that lets a leaky workload reach 826MB under a 200MB ceiling. tarsk ships tuned for
+handlers that wait, and a handler that allocates needs `--slots 1` — which is the configuration
+every other table on this page uses.
+
 ### Throughput, single worker
 
 | runtime | no-op | 50 ms handler | startup |
@@ -324,6 +352,23 @@ of Celery's figure, 59% of tarsk's and 77% of taskiq's when this table still did
 
 With a 50 ms handler all three land on 19–20/s, which is the row that matters and the whole of
 spec §2's argument: dispatch overhead disappears behind any handler doing real work.
+
+## When these numbers were taken
+
+The speed tables (`scale`, `throughput`) and the memory tables came from different runs,
+because two full runs in a row produced throughput a third of the first for all three runtimes
+at once and scale figures three times worse. Nothing had changed in any of them — the machine
+was in use. Memory figures are unaffected by CPU contention and the sleep-bound tables barely
+notice it; dispatch throughput notices nothing else.
+
+`bench/run.py` now times an identical pure-Python loop before each case and says so under the
+tables when the spread exceeds 1.25×. Neither contaminated run had it yet, which is why this
+section exists rather than a footnote. On this machine the probe is 20ms when idle and reached
+30ms while a browser and a Kubernetes node were running.
+
+Take these on an idle machine. Google Colab is not one — beyond the shared CPU, it has no
+systemd user session for the OOM table's `systemd-run --scope MemoryMax=400M` and runs as root,
+which `initdb` refuses, so two tables would silently not exist.
 
 ## Known limits of these numbers
 

@@ -300,6 +300,34 @@ def check_broker(url: str, label: str) -> None:
             stop_worker(worker)
         assert ticks == ["tick"], f"{label}: expected exactly one tick, got {ticks}"
 
+        # --- a queued job can be cancelled while the worker is running ----
+        #
+        # Ordering matters: the cancellation is sent *after* the worker is up
+        # and already chewing through the queue, which is when a caller would
+        # actually send it. Cancelling before the worker starts would test the
+        # easy half.
+        log.write_text("")
+        first = app.registry["medium"].send("running")   # occupies the child
+        doomed = [app.registry["note"].send(f"cancelled-{i}") for i in range(5)]
+        alive = [app.registry["note"].send(f"kept-{i}") for i in range(5)]
+        worker = start_worker(env, TARSK_LEASE_GRACE=1)
+        try:
+            time.sleep(1.0)                              # worker is on `medium`
+            for job_id in doomed:
+                app.cancel(job_id)
+            deadline = time.time() + 40
+            while time.time() < deadline and len(tags_in(log)) < 6:
+                time.sleep(0.2)
+        finally:
+            stop_worker(worker)
+        ran = tags_in(log)
+        assert not [t for t in ran if t.startswith("cancelled-")], \
+            f"{label}: cancelled jobs ran anyway: {ran}"
+        assert len([t for t in ran if t.startswith("kept-")]) == 5, \
+            f"{label}: cancelling took uncancelled jobs with it: {ran}"
+        assert "running" in ran, f"{label}: the in-flight job did not finish: {ran}"
+        del first, alive
+
         # --- retries run out, job is dead-lettered ----------------------
         log.write_text("")
         # Count the delta: earlier phases have already parked a job in there.

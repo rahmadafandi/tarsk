@@ -208,6 +208,11 @@ struct Shared {
     /// Set when the run cannot proceed at all, as opposed to a task failing.
     fatal: Mutex<Option<String>>,
     next_child_id: AtomicU64,
+    /// Job ids cancelled by a caller, refreshed from the broker on a timer.
+    ///
+    /// Checked where the ceiling is checked — at the dispatch decision — so a
+    /// cancellation costs nothing per task and takes effect within one refresh.
+    revoked: Mutex<std::collections::HashSet<String>>,
     /// Observed cost of bringing a child up, in milliseconds. Pre-warming needs
     /// to know this: how early to start is a question about wall-clock, and a
     /// percentage of a limit answers a different question.
@@ -860,6 +865,17 @@ async fn serve(shared: &Arc<Shared>, child: &mut ChildHandle, cfg: &Arc<Cfg>) ->
                         None => break,
                     }
                 };
+                if shared.revoked.lock().unwrap().contains(&job.id) {
+                    // Settled, not run. The delivery still has to be acked or
+                    // the lease would expire and hand it back for another go.
+                    shared
+                        .settle(
+                            job,
+                            Outcome::nack("Cancelled", "cancelled before it started".into()),
+                        )
+                        .await;
+                    continue;
+                }
                 let dispatch = Value::Array(vec![
                     Value::from("Dispatch"),
                     Value::from(job.task_id),
@@ -1215,6 +1231,7 @@ async fn supervise(
         exits: Mutex::new(Vec::new()),
         fatal: Mutex::new(None),
         next_child_id: AtomicU64::new(0),
+        revoked: Mutex::new(std::collections::HashSet::new()),
         spawn_ms: AtomicU64::new(250), // replaced by the first real measurement
         counters: Counters::default(),
         metrics: Metrics::default(),
@@ -1252,6 +1269,28 @@ async fn supervise(
             }
             shared.done.store(true, Ordering::SeqCst);
             shared.work.notify_waiters();
+        })
+    });
+
+    // Cancellations are pulled as a set on a timer, not asked about per job.
+    // A second of latency on a cancel is nothing next to a broker round trip
+    // on the dispatch path of every task, almost all of which are not
+    // cancelled. Batch mode skips it: there is no one to cancel from.
+    let revoker = (!batch).then(|| {
+        let shared = shared.clone();
+        tokio::spawn(async move {
+            while !shared.done.load(Ordering::SeqCst) {
+                match shared.broker.revoked_all().await {
+                    Ok(ids) => *shared.revoked.lock().unwrap() = ids.into_iter().collect(),
+                    Err(_) => {
+                        shared
+                            .counters
+                            .broker_errors
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
         })
     });
 
@@ -1361,6 +1400,9 @@ async fn supervise(
         handle.abort();
     }
     if let Some(handle) = sweeper {
+        handle.abort();
+    }
+    if let Some(handle) = revoker {
         handle.abort();
     }
     if let Some(handle) = exporter {
@@ -1689,6 +1731,22 @@ impl Producer {
             Some(blob) => Ok(Some(PyBytes::new(py, &blob).into_any().unbind())),
             None => Ok(None),
         }
+    }
+
+    /// Cancel a job so it is never dispatched.
+    ///
+    /// Takes effect within a second — the supervisor pulls cancellations on a
+    /// timer rather than asking per job. A job already running is not
+    /// interrupted; see `App.cancel` for why.
+    #[pyo3(signature = (id, queue="default", ttl=86400.0))]
+    fn cancel(&self, py: Python<'_>, id: &str, queue: &str, ttl: f64) -> PyResult<()> {
+        py.detach(|| {
+            self.runtime.block_on(
+                self.broker
+                    .revoke(queue, id, (ttl.max(0.0) * 1000.0) as u64),
+            )
+        })
+        .map_err(|e| PyValueError::new_err(e.to_string()))
     }
 
     /// Parked failures, oldest first.

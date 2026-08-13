@@ -289,6 +289,30 @@ queue for it: Postgres already has a visibility timer, and Redis has the idle cl
 sweep reads. What runs out of retries lands in `tarsk:{queue}:dead` or the `tarsk_dead` table,
 with the error and traceback.
 
+## Cancelling, and what is in the dead letters
+
+```
+tarsk cancel <id>                     # stops it before it starts
+tarsk dead list                       # what the retries gave up on
+tarsk dead show <id>                  # its traceback
+tarsk dead replay <id>                # put it back on the queue
+tarsk dead purge
+```
+
+`app.cancel(task_id)` is the same thing from Python, and `AsyncResult.cancel()` from a handle.
+It takes effect within a second: the supervisor pulls cancellations as a set on a timer rather
+than asking the broker about every job it is about to run, which would put a round trip on the
+dispatch path of every task to answer "no" for almost all of them.
+
+**A job that has already started is not interrupted.** The supervisor could tell the child to
+drop it, but a handler that has begun has usually begun doing the thing you wanted stopped —
+written the row, called the API — and a queue that reports "cancelled" for work that
+half-happened is worse than one that admits it finished.
+
+Neither command needs `--app`. A cancellation is an id and a dead letter is a name, a payload
+and a traceback; none of them needs your code to be importable, which matters exactly when the
+reason the tasks died is that it is not.
+
 ## Metrics
 
 `--metrics HOST:PORT` serves Prometheus text from the supervisor. Nothing is sampled for the

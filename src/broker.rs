@@ -151,6 +151,39 @@ impl Broker {
         }
     }
 
+    /// Mark a job id as cancelled for `ttl_ms`, so it is never dispatched.
+    ///
+    /// The TTL has to outlive the job it is cancelling: a delayed task due next
+    /// week needs a cancellation that is still there next week. It is the
+    /// caller's number because only the caller knows how far ahead it queued.
+    pub async fn revoke(&self, queue: &str, id: &str, ttl_ms: u64) -> Res<()> {
+        match self {
+            Broker::Memory(b) => b.revoke(id, ttl_ms),
+            Broker::Redis(b) => b.revoke(queue, id, ttl_ms).await,
+            Broker::Postgres(b) => b.revoke(queue, id, ttl_ms).await,
+        }
+    }
+
+    /// Every id cancelled and not yet expired, across the queues this broker
+    /// was opened on — which it knows and the supervisor does not.
+    ///
+    /// Read as a set on a timer rather than asked per job: a lookup at every
+    /// dispatch would put a broker round trip on the path of every task, to
+    /// answer "no" for almost all of them.
+    pub async fn revoked_all(&self) -> Res<Vec<String>> {
+        match self {
+            Broker::Memory(b) => Ok(b.revoked()),
+            Broker::Redis(b) => {
+                let mut out = Vec::new();
+                for queue in &b.queues {
+                    out.extend(b.revoked(queue).await?);
+                }
+                Ok(out)
+            }
+            Broker::Postgres(b) => b.revoked_all().await,
+        }
+    }
+
     /// What is parked in the dead letters, newest last.
     ///
     /// The store existed from the first broker commit and nothing could read
@@ -279,9 +312,23 @@ pub struct MemoryBroker {
     next_id: AtomicU64,
     results: Mutex<HashMap<String, (Vec<u8>, std::time::Instant)>>,
     ticks: Mutex<std::collections::HashSet<(String, i64)>>,
+    revoked: Mutex<HashMap<String, std::time::Instant>>,
 }
 
 impl MemoryBroker {
+    fn revoke(&self, id: &str, ttl_ms: u64) -> Res<()> {
+        let until = std::time::Instant::now() + Duration::from_millis(ttl_ms);
+        self.revoked.lock().unwrap().insert(id.to_string(), until);
+        Ok(())
+    }
+
+    fn revoked(&self) -> Vec<String> {
+        let now = std::time::Instant::now();
+        let mut held = self.revoked.lock().unwrap();
+        held.retain(|_, until| *until > now);
+        held.keys().cloned().collect()
+    }
+
     fn push(&self, job: NewJob, delay: Duration) -> Res<()> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         self.jobs.lock().unwrap().insert(id, (job, 0));
@@ -435,6 +482,10 @@ fn entry_fields(entry: &redis::streams::StreamId) -> (String, Vec<u8>, u64) {
 
 fn entry_id(entry: &redis::streams::StreamId) -> String {
     entry.get("i").unwrap_or_default()
+}
+
+fn revoked_key(queue: &str) -> String {
+    format!("{}:revoked", stream_key(queue))
 }
 
 fn result_key(id: &str) -> String {
@@ -736,6 +787,36 @@ impl RedisBroker {
         Ok(())
     }
 
+    async fn revoke(&self, queue: &str, id: &str, ttl_ms: u64) -> Res<()> {
+        let mut conn = self.conn.clone();
+        let _: i64 = redis::cmd("ZADD")
+            .arg(revoked_key(queue))
+            .arg(now_ms() + ttl_ms)
+            .arg(id)
+            .query_async(&mut conn)
+            .await?;
+        Ok(())
+    }
+
+    async fn revoked(&self, queue: &str) -> Res<Vec<String>> {
+        let key = revoked_key(queue);
+        let mut conn = self.conn.clone();
+        // Prune and read in one round trip. A sorted set scored by expiry gives
+        // per-member TTL, which a plain SET cannot.
+        let (_, live): (i64, Vec<String>) = redis::pipe()
+            .cmd("ZREMRANGEBYSCORE")
+            .arg(&key)
+            .arg(0)
+            .arg(now_ms())
+            .cmd("ZRANGE")
+            .arg(&key)
+            .arg(0)
+            .arg(-1)
+            .query_async(&mut conn)
+            .await?;
+        Ok(live)
+    }
+
     async fn dead_list(&self, queue: &str, limit: usize) -> Res<Vec<Dead>> {
         let grave = format!("{}:dead", stream_key(queue));
         let mut conn = self.conn.clone();
@@ -1010,6 +1091,12 @@ create table if not exists tarsk_dead (
 -- back. Nothing noticed, because nothing read them: a store you can only write
 -- to cannot tell you it is missing a column. Added separately from the CREATE
 -- so a table made by an earlier version gains them too.
+create table if not exists tarsk_revoked (
+    id         text        primary key,
+    queue      text        not null,
+    expires_at timestamptz not null
+);
+create index if not exists tarsk_revoked_expiry on tarsk_revoked (expires_at);
 alter table tarsk_dead add column if not exists job_id     text;
 alter table tarsk_dead add column if not exists timeout_ms integer not null default 0;
 ";
@@ -1194,6 +1281,32 @@ impl PgBroker {
     }
 
     /// One statement, so the row cannot be in both tables or neither.
+    async fn revoke(&self, queue: &str, id: &str, ttl_ms: u64) -> Res<()> {
+        self.client
+            .execute(
+                "insert into tarsk_revoked (id, queue, expires_at)
+                 values ($1, $2, now() + make_interval(secs => $3))
+                 on conflict (id) do update set expires_at = excluded.expires_at",
+                &[&id, &queue, &(ttl_ms as f64 / 1000.0)],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn revoked_all(&self) -> Res<Vec<String>> {
+        self.client
+            .execute("delete from tarsk_revoked where expires_at <= now()", &[])
+            .await?;
+        let rows = self
+            .client
+            .query(
+                "select id from tarsk_revoked where queue = any($1)",
+                &[&self.queues],
+            )
+            .await?;
+        Ok(rows.iter().map(|r| r.get(0)).collect())
+    }
+
     async fn dead_list(&self, queue: &str, limit: usize) -> Res<Vec<Dead>> {
         let rows = self
             .client

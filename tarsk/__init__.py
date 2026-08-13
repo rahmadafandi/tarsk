@@ -358,6 +358,20 @@ class App:
             self._producer = Producer(self.broker)
         return self._producer
 
+    def cancel(self, task_id: str, *, queue: str = "default", ttl: float = 86400.0) -> None:
+        """Stop a job from running. Takes effect within a second.
+
+        A job that has already started is *not* interrupted. The supervisor
+        could tell the child to drop it, but a handler that has begun has
+        usually begun doing the thing you wanted stopped — written the row,
+        called the API — and a queue that reports "cancelled" for work that
+        half-happened is worse than one that admits it finished.
+
+        `ttl` is how long the cancellation is remembered, and it has to outlive
+        the job: cancelling something scheduled for next week needs a week.
+        """
+        self.producer().cancel(task_id, queue=queue, ttl=ttl)
+
     def result(self, task_id: str) -> "AsyncResult":
         """Handle for reading back a task that set `result_ttl`."""
         return AsyncResult(self, task_id)
@@ -439,6 +453,10 @@ class AsyncResult:
 
     def ready(self) -> bool:
         return self._fetch() is not None
+
+    def cancel(self, *, queue: str = "default", ttl: float = 86400.0) -> None:
+        """Stop this job from running, if it has not started. See `App.cancel`."""
+        self.app.cancel(self.task_id, queue=queue, ttl=ttl)
 
     def progress(self):
         """The last value the task published, or None."""

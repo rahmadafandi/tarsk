@@ -29,6 +29,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="tarsk")
     sub = parser.add_subparsers(dest="command", required=True)
 
+    cancel = sub.add_parser("cancel", help="stop queued jobs from running")
+    cancel.add_argument("ids", nargs="+", metavar="ID")
+    cancel.add_argument("--broker", default=os.environ.get("TARSK_BROKER"),
+                        help="redis://…, postgres://… (or TARSK_BROKER)")
+    cancel.add_argument("--queue", default="default")
+    cancel.add_argument("--ttl", type=float, default=86400.0,
+                        help="how long to remember the cancellation. Must outlive the job: "
+                             "something scheduled for next week needs a week")
+
     dead = sub.add_parser("dead", help="inspect and replay the dead letters")
     dead.add_argument("action", choices=["list", "show", "replay", "purge"])
     dead.add_argument("ids", nargs="*", metavar="ID",
@@ -133,6 +142,14 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if not args.broker:
         sys.exit("no broker: pass --broker or set TARSK_BROKER")
+    if args.command == "cancel":
+        from ._core import Producer
+
+        producer = Producer(broker_url=args.broker)
+        for job_id in args.ids:
+            producer.cancel(job_id, queue=args.queue, ttl=args.ttl)
+        print(f"cancelled {len(args.ids)}; a job already running is not interrupted")
+        return 0
     if args.command == "dead":
         return run_dead(args)
 

@@ -6,7 +6,19 @@ python bench/run.py memory oom gap     # a subset
 ```
 
 Linux only: RSS comes from `/proc`, the hard-limit scenario uses `systemd-run --user --scope`.
-Needs `redis-server` on `PATH`; the harness starts its own instance on port 6399 and tears it down.
+
+By default the harness starts its own `redis-server` on a free port and tears it down, so it
+never touches anything you are running. To use your own instead:
+
+```bash
+BENCH_REDIS=redis://127.0.0.1:6379/10 python bench/run.py
+```
+
+Nothing here calls `FLUSHALL` — which empties every database in an instance no matter which
+one is selected, measured: a key in db 0 does not survive a `FLUSHALL` issued from db 10. The
+harness uses `FLUSHDB`, so a database number in the URL is respected and the rest of your
+instance is left alone. A throwaway server is still the better measurement, since it runs
+without persistence and without other traffic.
 
 ## What is being claimed
 

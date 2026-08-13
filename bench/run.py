@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import socket
 import statistics
 import subprocess
 import sys
@@ -38,8 +39,12 @@ sys.path.insert(0, str(ROOT))
 os.chdir(ROOT)
 
 PY = sys.executable
-REDIS_PORT = 6399
-REDIS_URL = f"redis://127.0.0.1:{REDIS_PORT}/0"
+# Point BENCH_REDIS at your own instance to use it instead of a throwaway one.
+# Nothing here calls FLUSHALL, so a database number is respected: pass
+# redis://host:6379/10 and db 0 is left alone.
+EXTERNAL_REDIS = os.environ.get("BENCH_REDIS")
+REDIS_PORT = 0  # assigned when the harness starts its own
+REDIS_URL = EXTERNAL_REDIS or ""
 PAGE = os.sysconf("SC_PAGE_SIZE")
 MB = 1024 * 1024
 
@@ -143,8 +148,22 @@ class Sampler(threading.Thread):
 
 
 class Redis:
+    """A throwaway server, unless BENCH_REDIS points somewhere already running."""
+
     def __enter__(self):
+        global REDIS_PORT, REDIS_URL
+        self.external = bool(EXTERNAL_REDIS)
+        if self.external:
+            REDIS_URL = EXTERNAL_REDIS
+            REDIS_PORT = int(EXTERNAL_REDIS.rsplit(":", 1)[1].split("/")[0])
+            self.dir = None
+            self.proc = None
+            return self
         self.dir = tempfile.mkdtemp(prefix="bench-redis-")
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            REDIS_PORT = probe.getsockname()[1]
+        REDIS_URL = f"redis://127.0.0.1:{REDIS_PORT}/0"
         self.proc = subprocess.Popen(
             ["redis-server", "--port", str(REDIS_PORT), "--save", "", "--appendonly", "no",
              "--dir", self.dir],
@@ -158,12 +177,23 @@ class Redis:
         raise RuntimeError("redis did not come up")
 
     def flush(self) -> None:
-        subprocess.run(["redis-cli", "-p", str(REDIS_PORT), "flushall"], capture_output=True)
+        """FLUSHDB, never FLUSHALL.
+
+        FLUSHALL empties every database in the instance regardless of which one
+        is selected, so a harness that used it could not be pointed at a Redis
+        anybody cared about — measured: a key in db 0 does not survive a
+        FLUSHALL issued from db 10.
+        """
+        db = REDIS_URL.rsplit("/", 1)[-1] or "0"
+        subprocess.run(["redis-cli", "-p", str(REDIS_PORT), "-n", db, "flushdb"],
+                       capture_output=True)
 
     def __exit__(self, *exc):
-        self.proc.terminate()
-        self.proc.wait()
-        shutil.rmtree(self.dir, ignore_errors=True)
+        if self.proc is not None:
+            self.proc.terminate()
+            self.proc.wait()
+        if self.dir:
+            shutil.rmtree(self.dir, ignore_errors=True)
 
 
 # ----------------------------------------------------------------- results

@@ -75,6 +75,16 @@ pub struct Delivery {
     pub receipt: Receipt,
 }
 
+/// One parked failure, as a human needs to see it.
+pub struct Dead {
+    pub id: String,
+    pub name: String,
+    pub error: String,
+    pub traceback: String,
+    /// Milliseconds since the epoch, or 0 where the store does not say.
+    pub died_at_ms: u64,
+}
+
 pub enum Broker {
     Memory(MemoryBroker),
     Redis(RedisBroker),
@@ -138,6 +148,41 @@ impl Broker {
             (Broker::Redis(b), r) => b.requeue(r, delay).await,
             (Broker::Postgres(b), r) => b.requeue(r, delay).await,
             _ => Err("receipt does not belong to this broker".into()),
+        }
+    }
+
+    /// What is parked in the dead letters, newest last.
+    ///
+    /// The store existed from the first broker commit and nothing could read
+    /// it, which made it a place work went to be forgotten rather than found.
+    pub async fn dead_list(&self, queue: &str, limit: usize) -> Res<Vec<Dead>> {
+        match self {
+            Broker::Redis(b) => b.dead_list(queue, limit).await,
+            Broker::Postgres(b) => b.dead_list(queue, limit).await,
+            Broker::Memory(_) => Ok(Vec::new()),
+        }
+    }
+
+    /// Put dead letters back on the live queue. Empty `ids` means all of them.
+    ///
+    /// Returns how many moved. A replayed job starts its retries over: the
+    /// reason it died has usually been deployed away by the time anyone runs
+    /// this, and carrying the old attempt count would spend the fix's first
+    /// attempt on the last failure's budget.
+    pub async fn dead_replay(&self, queue: &str, ids: &[String]) -> Res<usize> {
+        match self {
+            Broker::Redis(b) => b.dead_replay(queue, ids).await,
+            Broker::Postgres(b) => b.dead_replay(queue, ids).await,
+            Broker::Memory(_) => Ok(0),
+        }
+    }
+
+    /// Drop dead letters. Empty `ids` means all of them.
+    pub async fn dead_purge(&self, queue: &str, ids: &[String]) -> Res<usize> {
+        match self {
+            Broker::Redis(b) => b.dead_purge(queue, ids).await,
+            Broker::Postgres(b) => b.dead_purge(queue, ids).await,
+            Broker::Memory(_) => Ok(0),
         }
     }
 
@@ -691,6 +736,101 @@ impl RedisBroker {
         Ok(())
     }
 
+    async fn dead_list(&self, queue: &str, limit: usize) -> Res<Vec<Dead>> {
+        let grave = format!("{}:dead", stream_key(queue));
+        let mut conn = self.conn.clone();
+        let entries: redis::streams::StreamRangeReply = redis::cmd("XREVRANGE")
+            .arg(&grave)
+            .arg("+")
+            .arg("-")
+            .arg("COUNT")
+            .arg(limit)
+            .query_async(&mut conn)
+            .await?;
+        let mut out: Vec<Dead> = entries
+            .ids
+            .iter()
+            .map(|e| Dead {
+                // A stream id is `<millis>-<seq>`, so when it died is already
+                // in the key and does not need storing twice.
+                died_at_ms: e
+                    .id
+                    .split('-')
+                    .next()
+                    .and_then(|m| m.parse().ok())
+                    .unwrap_or(0),
+                id: e.id.clone(),
+                name: e.get("n").unwrap_or_default(),
+                error: e.get("e").unwrap_or_default(),
+                traceback: e.get("tb").unwrap_or_default(),
+            })
+            .collect();
+        out.reverse(); // XREVRANGE reads newest first; print oldest first
+        Ok(out)
+    }
+
+    async fn dead_replay(&self, queue: &str, ids: &[String]) -> Res<usize> {
+        let key = stream_key(queue);
+        let grave = format!("{key}:dead");
+        let mut conn = self.conn.clone();
+        let entries: redis::streams::StreamRangeReply = redis::cmd("XRANGE")
+            .arg(&grave)
+            .arg("-")
+            .arg("+")
+            .query_async(&mut conn)
+            .await?;
+        let mut moved = 0;
+        for entry in &entries.ids {
+            if !ids.is_empty() && !ids.contains(&entry.id) {
+                continue;
+            }
+            let (name, payload, timeout_ms) = entry_fields(entry);
+            let job_id: String = entry.get("i").unwrap_or_else(|| entry.id.clone());
+            // XADD then XDEL in one MULTI: a crash between them would either
+            // lose the job or leave it in both places, and both are worse than
+            // this being one round trip slower.
+            let _: redis::Value = redis::pipe()
+                .atomic()
+                .cmd("XADD")
+                .arg(&key)
+                .arg("*")
+                .arg("n")
+                .arg(&name)
+                .arg("p")
+                .arg(&payload)
+                .arg("t")
+                .arg(timeout_ms)
+                .arg("i")
+                .arg(&job_id)
+                .cmd("XDEL")
+                .arg(&grave)
+                .arg(&entry.id)
+                .query_async(&mut conn)
+                .await?;
+            moved += 1;
+        }
+        Ok(moved)
+    }
+
+    async fn dead_purge(&self, queue: &str, ids: &[String]) -> Res<usize> {
+        let grave = format!("{}:dead", stream_key(queue));
+        let mut conn = self.conn.clone();
+        if ids.is_empty() {
+            let n: i64 = redis::cmd("XLEN")
+                .arg(&grave)
+                .query_async(&mut conn)
+                .await?;
+            let _: i64 = redis::cmd("DEL").arg(&grave).query_async(&mut conn).await?;
+            return Ok(n as usize);
+        }
+        let n: i64 = redis::cmd("XDEL")
+            .arg(&grave)
+            .arg(ids)
+            .query_async(&mut conn)
+            .await?;
+        Ok(n as usize)
+    }
+
     /// Move the entry to `tarsk:{queue}:dead` and drop it from the live stream.
     ///
     /// MULTI is enough: every field is already in hand from the delivery, so
@@ -866,6 +1006,12 @@ create table if not exists tarsk_dead (
     traceback   text        not null,
     died_at     timestamptz not null default now()
 );
+-- job_id and timeout_ms were not kept until the dead letters could be read
+-- back. Nothing noticed, because nothing read them: a store you can only write
+-- to cannot tell you it is missing a column. Added separately from the CREATE
+-- so a table made by an earlier version gains them too.
+alter table tarsk_dead add column if not exists job_id     text;
+alter table tarsk_dead add column if not exists timeout_ms integer not null default 0;
 ";
 
 /// Claiming and reclaiming are the same statement: a lease that has run out is
@@ -1048,6 +1194,63 @@ impl PgBroker {
     }
 
     /// One statement, so the row cannot be in both tables or neither.
+    async fn dead_list(&self, queue: &str, limit: usize) -> Res<Vec<Dead>> {
+        let rows = self
+            .client
+            .query(
+                "select id, name, error, traceback,
+                        (extract(epoch from died_at) * 1000)::bigint as died_ms
+                   from tarsk_dead where queue = $1
+                  order by died_at desc limit $2",
+                &[&queue, &(limit as i64)],
+            )
+            .await?;
+        let mut out: Vec<Dead> = rows
+            .iter()
+            .map(|r| Dead {
+                id: r.get::<_, i64>(0).to_string(),
+                name: r.get(1),
+                error: r.get(2),
+                traceback: r.get(3),
+                died_at_ms: r.get::<_, i64>(4).max(0) as u64,
+            })
+            .collect();
+        out.reverse();
+        Ok(out)
+    }
+
+    async fn dead_replay(&self, queue: &str, ids: &[String]) -> Res<usize> {
+        // Back onto the live table with the lease cleared, inside one statement
+        // so nothing can observe a job in both places.
+        let picked: Vec<i64> = ids.iter().filter_map(|i| i.parse().ok()).collect();
+        // A fresh row rather than the old id: bigserial hands out the next one,
+        // and reusing a primary key that a result or a log still refers to
+        // would quietly merge two runs of the same job into one identity.
+        let sql = "with gone as (
+                       delete from tarsk_dead
+                        where queue = $1 and ($2::bigint[] = '{}' or id = any($2))
+                    returning job_id, queue, name, payload, timeout_ms)
+                   insert into tarsk_jobs
+                       (job_id, queue, name, payload, timeout_ms, attempt, lease_until)
+                   select coalesce(job_id, ''), queue, name, payload, timeout_ms, 0, null
+                     from gone";
+        let n = self.client.execute(sql, &[&queue, &picked]).await?;
+        Ok(n as usize)
+    }
+
+    async fn dead_purge(&self, queue: &str, ids: &[String]) -> Res<usize> {
+        let picked: Vec<i64> = ids.iter().filter_map(|i| i.parse().ok()).collect();
+        let n = self
+            .client
+            .execute(
+                "delete from tarsk_dead
+                  where queue = $1 and ($2::bigint[] = '{}' or id = any($2))",
+                &[&queue, &picked],
+            )
+            .await?;
+        Ok(n as usize)
+    }
+
     async fn dead_letter(&self, receipt: &Receipt, error: &str, traceback: &str) -> Res<()> {
         let Receipt::Postgres { row, run_lease } = receipt else {
             return Err("not a postgres receipt".into());
@@ -1056,10 +1259,11 @@ impl PgBroker {
             .execute(
                 "with gone as (
                      delete from tarsk_jobs where id = $1 and run_lease = $2
-                     returning id, queue, name, payload, attempt
+                     returning id, job_id, queue, name, payload, timeout_ms, attempt
                  )
-                 insert into tarsk_dead (id, queue, name, payload, attempt, error, traceback)
-                 select id, queue, name, payload, attempt, $3, $4 from gone
+                 insert into tarsk_dead
+                     (id, job_id, queue, name, payload, timeout_ms, attempt, error, traceback)
+                 select id, job_id, queue, name, payload, timeout_ms, attempt, $3, $4 from gone
                  on conflict (id) do nothing",
                 &[row, run_lease, &error, &traceback],
             )

@@ -29,6 +29,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="tarsk")
     sub = parser.add_subparsers(dest="command", required=True)
 
+    dead = sub.add_parser("dead", help="inspect and replay the dead letters")
+    dead.add_argument("action", choices=["list", "show", "replay", "purge"])
+    dead.add_argument("ids", nargs="*", metavar="ID",
+                      help="which entries. Empty means all, except for `show`")
+    dead.add_argument("--broker", default=os.environ.get("TARSK_BROKER"),
+                      help="redis://…, postgres://… (or TARSK_BROKER)")
+    dead.add_argument("--queue", default="default")
+    dead.add_argument("--limit", type=int, default=50, help="how many to list")
+
     worker = sub.add_parser("worker", help="run a supervisor and its children")
     worker.add_argument("--app", required=True, metavar="module:app",
                         help="where children find your tasks")
@@ -61,10 +70,71 @@ def build_parser() -> argparse.ArgumentParser:
 DEFAULT_SLOTS = 100
 
 
+def run_dead(args) -> int:
+    """Read, replay or drop what the retries gave up on.
+
+    No app module: a dead letter is a name, a payload and a traceback, none of
+    which needs the user's code to be importable. That matters when the reason
+    the tasks died is that the code does not import.
+    """
+    from ._core import Producer
+
+    producer = Producer(broker_url=args.broker)
+
+    if args.action == "purge":
+        gone = producer.dead_purge(queue=args.queue, ids=args.ids)
+        print(f"purged {gone}")
+        return 0
+
+    if args.action == "replay":
+        moved = producer.dead_replay(queue=args.queue, ids=args.ids)
+        print(f"replayed {moved}")
+        return 0
+
+    entries = producer.dead_list(queue=args.queue, limit=args.limit)
+    if not entries:
+        print(f"no dead letters in {args.queue!r}")
+        return 0
+
+    if args.action == "show":
+        if not args.ids:
+            sys.exit("show needs at least one id — `tarsk dead list` prints them")
+        wanted = [e for e in entries if e[0] in args.ids]
+        missing = set(args.ids) - {e[0] for e in wanted}
+        for entry_id, name, error, traceback, died in wanted:
+            print(f"{entry_id}  {name}  {_when(died)}")
+            print(f"  {error}")
+            for line in traceback.rstrip().splitlines():
+                print(f"  {line}")
+            print()
+        if missing:
+            # Not an error: it may simply be older than --limit.
+            print(f"not in the last {args.limit}: {', '.join(sorted(missing))}", file=sys.stderr)
+        return 0
+
+    width = max(len(e[1]) for e in entries)
+    for entry_id, name, error, _tb, died in entries:
+        print(f"{entry_id}  {_when(died)}  {name:<{width}}  {error.splitlines()[0][:60]}")
+    print(f"\n{len(entries)} shown. `tarsk dead show <id>` for a traceback, "
+          f"`replay` to requeue, `purge` to drop.", file=sys.stderr)
+    return 0
+
+
+def _when(millis: int) -> str:
+    if not millis:
+        return "unknown" + " " * 9
+    import datetime
+
+    stamp = datetime.datetime.fromtimestamp(millis / 1000, datetime.timezone.utc)
+    return stamp.strftime("%Y-%m-%d %H:%M:%S")
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if not args.broker:
         sys.exit("no broker: pass --broker or set TARSK_BROKER")
+    if args.command == "dead":
+        return run_dead(args)
 
     from ._supervisor import Supervisor
 

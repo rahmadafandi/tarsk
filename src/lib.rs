@@ -1686,6 +1686,37 @@ impl Producer {
             None => Ok(None),
         }
     }
+
+    /// Parked failures, oldest first: (id, name, error, traceback, died_at_ms).
+    #[pyo3(signature = (queue="default", limit=50))]
+    fn dead_list(
+        &self,
+        py: Python<'_>,
+        queue: &str,
+        limit: usize,
+    ) -> PyResult<Vec<(String, String, String, String, u64)>> {
+        let found = py
+            .detach(|| self.runtime.block_on(self.broker.dead_list(queue, limit)))
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(found
+            .into_iter()
+            .map(|d| (d.id, d.name, d.error, d.traceback, d.died_at_ms))
+            .collect())
+    }
+
+    /// Put dead letters back on the queue. Empty `ids` means all of them.
+    #[pyo3(signature = (queue="default", ids=Vec::new()))]
+    fn dead_replay(&self, py: Python<'_>, queue: &str, ids: Vec<String>) -> PyResult<usize> {
+        py.detach(|| self.runtime.block_on(self.broker.dead_replay(queue, &ids)))
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+
+    /// Drop dead letters. Empty `ids` means all of them.
+    #[pyo3(signature = (queue="default", ids=Vec::new()))]
+    fn dead_purge(&self, py: Python<'_>, queue: &str, ids: Vec<String>) -> PyResult<usize> {
+        py.detach(|| self.runtime.block_on(self.broker.dead_purge(queue, &ids)))
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
 }
 
 #[pymodule]

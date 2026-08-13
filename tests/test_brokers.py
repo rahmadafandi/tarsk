@@ -320,6 +320,39 @@ def check_broker(url: str, label: str) -> None:
                      "tarsk_task_duration_seconds_count 2",
                      "tarsk_supervisor_rss_bytes"):
             assert line in scrape, f"{label}: /metrics missing {line!r}\n{scrape}"
+
+        # --- the dead letters can be read, replayed and dropped -----------
+        from tarsk._core import Producer
+
+        producer = Producer(broker_url=url)
+        parked = producer.dead_list(queue="default", limit=50)
+        assert len(parked) == dead_before + 1, f"{label}: dead_list saw {len(parked)}"
+        entry_id, name, error, traceback, died_ms = parked[-1]
+        assert name == "always_fails", f"{label}: wrong name in dead_list: {name!r}"
+        assert "doomed never works" in traceback, \
+            f"{label}: traceback did not survive: {traceback!r}"
+        assert died_ms > 0, f"{label}: no timestamp on the dead letter"
+
+        # Replaying puts the work back where a worker will find it. Without the
+        # payload and timeout stored alongside, this is where it would fail:
+        # the job would reappear unrunnable rather than not reappear at all.
+        log.write_text("")
+        moved = producer.dead_replay(queue="default", ids=[entry_id])
+        assert moved == 1, f"{label}: replayed {moved}"
+        assert not any(e[0] == entry_id for e in producer.dead_list(queue="default", limit=50)), \
+            f"{label}: replayed entry is still in the dead letters"
+
+        worker = start_worker(env, TARSK_LEASE_GRACE=1)
+        deadline = time.time() + 60
+        while time.time() < deadline and not tags_in(log):
+            time.sleep(0.2)
+        stop_worker(worker)
+        assert tags_in(log), f"{label}: a replayed job never ran"
+
+        producer.dead_replay(queue="default")  # everything else, so purge has work
+        gone = producer.dead_purge(queue="default")
+        assert producer.dead_list(queue="default", limit=50) == [], \
+            f"{label}: purge left {gone} behind"
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 

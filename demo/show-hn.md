@@ -90,31 +90,35 @@ workload changes between columns.
 
 | runtime | p50 | p99 | max |
 |---|---|---|---|
-| celery `--max-tasks-per-child=20` | 6.2 ms | 171 ms | 173 ms |
-| tarsk `--max-tasks=20` | 6.0 ms | 10 ms | **11 ms** |
-| taskiq, never recycles | 6.7 ms | 7 ms | 7 ms |
+| celery `--max-tasks-per-child=20` | 5.7 ms | 152 ms | 159 ms |
+| tarsk `--max-tasks=20` | 5.9 ms | 11 ms | **11 ms** |
+| taskiq, never recycles | 6.3 ms | 7 ms | 7 ms |
 
 **30 leaky tasks under a hard 400 MB cgroup limit** — what Kubernetes does to a worker that grows.
 
 | runtime | completed | lost | restarts | longest stall |
 |---|---|---|---|---|
-| celery, defaults | 16/30 | **14** | 0 | 14 ms |
-| taskiq | 15/30 | **15** | 0 | 17 ms |
-| celery `task_acks_late` | 16/30 | **14** | 0 | 19 ms |
-| celery `task_acks_late` + restarted | 29/30 | **1** | 1 | 2,757 ms |
-| celery `--max-tasks-per-child=6`, tuned | **30/30** | 0 | 0 | 203 ms |
-| tarsk `--max-rss=200MB` | **30/30** | 0 | 0 | 21 ms |
+| celery, defaults | 16/30 | **14** | 0 | 9 ms |
+| taskiq (list, no ack) | 15/30 | **15** | 0 | 7 ms |
+| taskiq (streams, acked) | 15/30 | **15** | 0 | 8 ms |
+| celery `task_acks_late` | 16/30 | **14** | 0 | 9 ms |
+| celery `task_acks_late` + restarted | 29/30 | **1** | 1 | 2,410 ms |
+| celery `--max-tasks-per-child=6`, tuned | **30/30** | 0 | 0 | 179 ms |
+| tarsk `--max-rss=200MB` | **30/30** | 0 | 0 | 13 ms |
 
 **Throughput**, single worker, concurrency 1. Reported to be honest about it, not as a claim.
 
 | runtime | no-op handler | 50 ms handler | startup |
 |---|---|---|---|
-| celery | 1,773/s | 20/s | 0.30s |
-| taskiq | 2,571/s | 19/s | 0.45s |
-| tarsk | 6,138/s *(no broker yet)* | 20/s | 0.16s |
+| celery | 1,853/s | 20/s | 0.26s |
+| taskiq | 2,793/s | 19/s | 0.47s |
+| tarsk | 2,748/s | 19/s | 0.18s |
 
-The no-op row for tarsk is not a comparison: it has no broker to talk to yet, so it skips a hop
-the others pay. The 50 ms row is the one that matters, and all three are the same number.
+Draining a 10,000-task queue across four processes, same guarantee for both: taskiq 1.44s,
+tarsk 1.15s. At a thousand tasks taskiq wins instead, 0.17s to 0.44s.
+
+All three read the same Redis. The 50 ms row is the one that matters, and all three are the
+same number.
 
 ---
 
@@ -128,13 +132,15 @@ unchanged, against a workload that moved.
 **Celery doesn't lose tasks, you configured it wrong.**
 Tuned correctly it ties: 30/30, and at a lower peak. `task_acks_late` alone does not — the OOM
 killer takes the whole cgroup, master included, so nothing survives to receive the redelivery.
-With an orchestrator restarting the pod it recovers all but the in-flight one, and pays 2.8
-seconds of dead air.
+With an orchestrator restarting the pod it recovers all but the in-flight one, and pays 2.4
+seconds of dead air. taskiq's acked streams broker loses the same 15 as its unacked one, for
+the same reason: an acknowledgement only helps if something survives to redeliver to.
 
 **Your throughput numbers are missing the broker.**
-They are, and the post says so. Redis Streams and Postgres drivers exist; the benchmark harness
-still feeds tarsk from memory, so treat 6,138/s as an upper bound rather than a result. It
-changes nothing above 50 ms, which is where handlers live.
+They were, and they are not any more — the harness fed tarsk from memory until that was fixed,
+which flattered every figure. Against the same Redis with the same at-least-once guarantee,
+taskiq is faster at a thousand tasks and tarsk at ten thousand. None of it changes above 50 ms,
+which is where handlers live.
 
 **A ceiling that can be exceeded isn't a ceiling.**
 It is read while a child is idle, so overshoot is bounded by one task's peak allocation rather
@@ -145,7 +151,7 @@ for people who would rather lose the task, and it is off by default.
 **Why not contribute this to Celery?**
 The supervision model is the whole design — pull-based children, a registry that crosses IPC so
 the supervisor never imports user code, per-task leases. Bolting an RSS ceiling onto prefork
-gets the byte budget without the handover, which is the 173 ms column.
+gets the byte budget without the handover, which is the 159 ms column.
 
 ---
 

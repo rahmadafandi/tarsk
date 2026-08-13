@@ -69,9 +69,9 @@ trigger fires, so the slot never goes empty:
 
 | | p50 gap | p99 gap | max gap |
 |---|---|---|---|
-| celery `--max-tasks-per-child=20` | 6.2 ms | 171 ms | 173 ms |
-| tarsk `--max-tasks=20` | 6.0 ms | 10 ms | **11 ms** |
-| taskiq (no recycling at all) | 6.7 ms | 7 ms | 7 ms |
+| celery `--max-tasks-per-child=20` | 5.7 ms | 152 ms | 159 ms |
+| tarsk `--max-tasks=20` | 5.9 ms | 11 ms | **11 ms** |
+| taskiq (no recycling at all) | 6.3 ms | 7 ms | 7 ms |
 
 And the worker that runs your code is smaller, because it imports your tasks and nothing else —
 no broker driver, no scheduler: 27 MB against Celery's 49 MB and taskiq's 58 MB.
@@ -92,15 +92,17 @@ their RSS, retires them, holds their leases and runs the schedule. A memory ceil
 held by something that does not have the problem — which is also why Celery could not enforce
 one from a master carrying 77 MB of your dependencies.
 
-Draining 10,000 no-op tasks across four worker processes, startup excluded: Celery 5.3s, taskiq
-1.4s, tarsk 0.6s — but tarsk has no broker yet and reads its queue from memory, so that last
-number is an upper bound rather than a result. Full table and caveats in
+Draining 10,000 no-op tasks across four worker processes, all three against the same Redis and
+the same at-least-once guarantee, startup excluded: Celery 5.2s, taskiq 1.4s, tarsk 1.2s. At a
+thousand tasks taskiq is the faster one. Full tables, including where that flips and why, in
 [`bench/`](bench/README.md).
 
 ## What it does not claim
 
 **Not faster.** Dispatch costs microseconds; real handlers run for 50ms to minutes. With a 50ms
-handler tarsk, Celery and taskiq all reach 19–20 tasks/s — identical, as they should be. Anyone
+handler tarsk, Celery and taskiq all reach 19–20 tasks/s — identical, as they should be. On
+no-op throughput taskiq edges it, and every task here crosses a Unix socket to a child, which
+is the price of the ceiling above. Anyone
 selling a task queue on throughput benchmarks is selling the wrong thing.
 
 **Not a hard ceiling regardless of task size.** The ceiling is read while a child is idle, so a

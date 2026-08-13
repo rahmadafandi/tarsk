@@ -124,7 +124,7 @@ long enough.
 
 | runtime | worker RSS | tree RSS |
 |---|---|---|
-| tarsk | **27 MB** | 47 MB |
+| tarsk | **27 MB** | 44 MB |
 | celery | 49 MB | 104 MB |
 | taskiq | 58 MB | 144 MB |
 
@@ -168,15 +168,18 @@ floor for any design that refuses to kill running work.
 
 | runtime | completed | lost | executions | restarts | max gap | peak RSS |
 |---|---|---|---|---|---|---|
-| celery (defaults) | 16/30 | **14** | 16 | 0 | 14 ms | 369 MB |
-| taskiq | 15/30 | **15** | 15 | 0 | 17 ms | 358 MB |
-| celery `task_acks_late=True` | 16/30 | **14** | 16 | 0 | 19 ms | 369 MB |
-| celery `task_acks_late=True` + restarted | 29/30 | **1** | 29 | 1 | 2757 ms | 377 MB |
-| celery `--max-tasks-per-child=6` (tuned) | 30/30 | 0 | 30 | 0 | 203 ms | 170 MB |
-| tarsk `--max-rss=200MB` | 30/30 | 0 | 30 | 0 | 21 ms | 204 MB |
+| celery (defaults) | 16/30 | **14** | 16 | 0 | 9 ms | 368 MB |
+| taskiq (list, no ack) | 15/30 | **15** | 15 | 0 | 7 ms | 358 MB |
+| taskiq (streams, acked) | 15/30 | **15** | 15 | 0 | 8 ms | 366 MB |
+| celery `task_acks_late=True` | 16/30 | **14** | 16 | 0 | 9 ms | 369 MB |
+| celery `task_acks_late=True` + restarted | 29/30 | **1** | 29 | 1 | 2410 ms | 369 MB |
+| celery `--max-tasks-per-child=6` (tuned) | 30/30 | 0 | 30 | 0 | 179 ms | 170 MB |
+| tarsk `--max-rss=200MB` | 30/30 | 0 | 30 | 0 | 13 ms | 205 MB |
 
-`task_acks_late` alone changes nothing: the OOM killer takes the whole cgroup, master included,
-so nothing survives to receive a redelivery. With an orchestrator restarting the worker it very
+**An acknowledgement only helps if something survives to notice.** taskiq's streams broker acks
+and still loses 15 of 30 here, exactly as its unacked list broker does, for the same reason
+Celery's `task_acks_late` changes nothing: the OOM killer takes the whole cgroup, coordinator
+included, so there is nobody left to redeliver to. With an orchestrator restarting the worker it very
 nearly recovers — the one task still missing was in flight when the kill landed, and the Redis
 transport's default visibility timeout (1 hour) puts its redelivery outside the run. The price
 is 2.8 seconds of dead air.
@@ -204,61 +207,68 @@ rather than assertable.
 Shaped after [s3rius's taskiq benchmark](https://gist.github.com/s3rius/91c39494fe1b96ad467cee671dfdf5ec),
 with startup pulled out of the figure rather than folded into it.
 
-| runtime | tasks | min | median | p90 | max | startup (median) |
-|---|---|---|---|---|---|---|
-| celery | 10 | 0.005 | 0.005 | 0.005 | 0.005 | 0.42 s |
-| celery | 100 | 0.047 | 0.052 | 0.053 | 0.053 | 0.37 s |
-| celery | 1,000 | 0.492 | 0.519 | 0.555 | 0.555 | 0.37 s |
-| celery | 10,000 | 5.059 | 5.306 | 5.538 | 5.538 | 0.37 s |
-| taskiq | 10 | 0.002 | 0.003 | 0.004 | 0.004 | 0.48 s |
-| taskiq | 100 | 0.012 | 0.012 | 0.017 | 0.017 | 0.47 s |
-| taskiq | 1,000 | 0.087 | 0.093 | 0.096 | 0.096 | 0.44 s |
-| taskiq | 10,000 | 1.337 | 1.415 | 1.486 | 1.486 | 0.55 s |
-| tarsk | 10 | 0.001 | 0.002 | 0.002 | 0.002 | 0.19 s |
-| tarsk | 100 | 0.008 | 0.009 | 0.012 | 0.012 | 0.18 s |
-| tarsk | 1,000 | 0.068 | 0.073 | 0.074 | 0.074 | 0.18 s |
-| tarsk | 10,000 | 0.606 | 0.617 | 0.654 | 0.654 | 0.20 s |
+| runtime | 10 | 100 | 1,000 | 10,000 | startup |
+|---|---|---|---|---|---|
+| celery | 0.005 | 0.056 | 0.534 | 5.233 | 0.37 s |
+| taskiq (list, no ack) | 0.002 | 0.012 | 0.095 | 1.017 | 0.48 s |
+| taskiq (streams, acked) | 0.009 | 0.047 | **0.167** | 1.439 | 0.55 s |
+| tarsk (streams, acked) | 0.003 | 0.016 | 0.443 | **1.154** | 0.18 s |
 
-**tarsk's rows are the least interesting here and are not comparable.** It has no broker yet,
-so it reads its queue from memory while the others make a Redis round trip per task — at these
-sizes, most of what is being timed. Read celery against taskiq; read tarsk as an upper bound on
-what a broker will have to fit under.
+Median seconds from first completion to last. The two `streams, acked` rows are the
+like-for-like pair: same guarantee, same process count, same handler. tarsk leads at ten
+thousand and trails at one thousand — batching a claim per child pays once there is a steady
+queue to batch from, and costs a little when there is not.
 
-Between the two that *are* comparable, taskiq drains 10,000 no-ops in 1.4s to Celery's 5.3s,
-and boots slower doing it: 0.48s against 0.37s. The original benchmark folds boot into the
-figure, which is most of why its N=10 row reads 0.46s against 1.78s — at ten tasks there is
-almost nothing but startup to measure.
+**Acking is not what separates them.** It costs taskiq about 40% by itself (1.02s on its
+default list broker against 1.44s on streams), and tarsk pays that too. What tarsk pays on top
+is a Unix socket round trip per task, because the handler runs in a child the supervisor can
+meter and replace. That is the design, not an overhead waiting to be removed.
 
-What is held equal here is **processes, not concurrency**. taskiq can await thousands of tasks
+taskiq's default `ListQueueBroker` is `BRPOP` with no acknowledgement — at-most-once, and a
+killed worker loses what it held. Comparing it to an acked broker compares different promises,
+which is why both of its rows are here.
+
+What is held equal is **processes, not concurrency**. taskiq can await thousands of tasks
 inside one process and would pull away on anything I/O-bound; tarsk runs one task per child and
 cannot. That is a real limit rather than a benchmark choice — see the one-slot note in
 `tarsk/_child.py` — and a no-op handler is precisely the case that hides it.
 
+#### How big a batch
+
+The Redis driver used to claim one message per `XREADGROUP`. Batching helps, but only up to the
+number of children — measured on 5,000 no-ops across four, seven runs each:
+
+| messages per read | median |
+|---|---|
+| 1 | 0.96 s |
+| 4 (one per child) | **0.65 s** |
+| 64 | 1.18 s |
+
+Sixty-four is slower than not batching at all: the extra entries are parsed in one burst on a
+single-threaded runtime while the children the batch exists to feed wait through it. The cap is
+now the child count. Three runs could not tell these apart — the spread within a configuration
+is nearly 2× — which is why the table says seven.
+
 ### Throughput, single worker
 
-| runtime | tasks/sec | wall | startup | 
+| runtime | no-op | 50 ms handler | startup |
 |---|---|---|---|
-| celery | 1,773/s | 0.28s | 0.30s |
-| taskiq | 2,571/s | 0.19s | 0.45s |
-| tarsk | 6,138/s *(no broker yet)* | 0.08s | 0.16s |
+| celery | 1,853/s | 20/s | 0.26 s |
+| taskiq | 2,793/s | 19/s | 0.47 s |
+| tarsk | 2,748/s | 19/s | 0.18 s |
 
-With a 50 ms handler all three land on 19–20/s, which is the row that matters.
+All three read the same Redis. Rate and wall cover first completion to last; **startup is
+separate on purpose**. Folding it in turns a 500-task row into a boot-time contest — it was 51%
+of Celery's figure, 59% of tarsk's and 77% of taskiq's when this table still did that.
 
-Rate and wall cover first completion to last; **startup is separate on purpose**. Folding it in
-turns a 500-task row into a boot-time contest — it was 51% of Celery's old figure, 59% of
-tarsk's and 77% of taskiq's, which is why the previous version of this table read 359 / 445 /
-850. Worth reporting, not worth hiding inside a number labelled throughput.
-
-The noop row for tarsk is not a comparison: it has no broker to talk to yet. The 50ms row is
-the one that matters, and all three are identical — which is exactly what spec §2 predicts.
-Dispatch overhead disappears behind any handler doing real work.
+With a 50 ms handler all three land on 19–20/s, which is the row that matters and the whole of
+spec §2's argument: dispatch overhead disappears behind any handler doing real work.
 
 ## Known limits of these numbers
 
-- **tarsk has no broker yet (step 3).** Its jobs come from an in-memory list, so throughput
-  rows skip a Redis round-trip that Celery and taskiq pay. Those rows are an upper bound on
-  tarsk, not a comparison. Memory, OOM and gap results are unaffected — none of them depend on
-  where the job came from.
+- **Every runtime here reads the same Redis.** That was not true until recently: tarsk was fed
+  from an in-memory list while the others paid a round trip, which flattered every throughput
+  figure on this page. The tables above are from after that was fixed.
 - **Single machine, single worker.** Nothing here says anything about scaling out.
 - **Peak RSS is a lower bound, not the true peak.** Both measurement methods under-report in
   different ways (see Results), and taking the larger of the two narrows the gap without

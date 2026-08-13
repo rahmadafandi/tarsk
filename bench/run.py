@@ -11,9 +11,9 @@ What this measures and why (spec §2 sets the terms):
   scale       time to drain 10 / 100 / 1k / 10k tasks, repeated, with spread
 
 Only `memory`, `oom` and `gap` test claims tarsk actually makes. `throughput`
-is here to be honest about the cost, not to win: tarsk has no broker yet
-(step 3), so its throughput number omits a hop the others pay and is an upper
-bound rather than a comparison.
+and `scale` are here to be honest about the cost, not to win. All three
+runtimes read the same Redis, so those numbers are comparable — which they were
+not while tarsk was still being fed from memory.
 
 Linux only — it reads /proc for RSS and uses systemd-run for the OOM case.
 
@@ -736,33 +736,31 @@ def scenario_scale(redis: Redis, tmp: Path) -> None:
                   f"{quantile(good, 0.9):.3f} | {good[-1]:.3f} | "
                   f"{statistics.median(boots):.2f} |")
     print("\nRead the two `streams, acked` rows against each other: same guarantee, same "
-          "number of\nprocesses, same handler. **tarsk is the slower one** — 1.8s against "
-          "1.0s at ten thousand\ntasks. Acking costs taskiq about 12% (0.92s on its default "
-          "list broker, 1.03s on\nstreams); the rest of tarsk's gap is its own.\n")
-    print("Two reasons, one of them structural. tarsk claims one message per XREADGROUP "
-          "rather\nthan a batch, so it pays a round trip per task where taskiq amortises "
-          "one over many.\nAnd every task crosses a Unix socket to a child process, which "
-          "is the price of running\nuser code somewhere the supervisor can meter and "
-          "replace — the thing the whole project\nis for. The first is fixable, the second "
-          "is the design.\n")
+          "number of\nprocesses, same handler. tarsk is ahead at ten thousand tasks and "
+          "behind at one\nthousand — batching a claim per child pays off once there is a "
+          "steady queue to batch\nfrom, and costs a little when the queue is short.\n")
+    print("Acking is not the difference: it costs taskiq about 40% here (1.0s on its "
+          "default\nlist broker against 1.4s on streams), and tarsk pays that too. What "
+          "tarsk pays on top\nis a Unix socket round trip per task, because the handler "
+          "runs in a child the\nsupervisor can meter and replace. That is the design, not "
+          "an overhead to remove.\n")
     print("What is held equal is processes, not concurrency. taskiq can await thousands of "
-          "tasks\ninside one process and would pull further away on anything I/O-bound; "
-          "tarsk runs one\ntask per child and cannot. That is a real limit, not a benchmark "
-          "choice.")
+          "tasks\ninside one process and would pull away on anything I/O-bound; tarsk runs "
+          "one task per\nchild and cannot. That is a real limit, not a benchmark choice, "
+          "and a no-op handler is\nthe case that hides it.")
 
 
 def scenario_throughput(redis: Redis, tmp: Path) -> None:
     rows = [
         case("celery", "noop", "noop", 500, [], 300, redis, tmp),
         case("taskiq", "noop", "noop", 500, [], 300, redis, tmp),
-        case("tarsk", "noop (no broker yet)", "noop", 500, [], 300, redis, tmp),
+        case("tarsk", "noop", "noop", 500, [], 300, redis, tmp),
         case("celery", "50ms handler", "work50", 200, [], 300, redis, tmp),
         case("taskiq", "50ms handler", "work50", 200, [], 300, redis, tmp),
-        case("tarsk", "50ms handler (no broker yet)", "work50", 200, [], 300, redis, tmp),
+        case("tarsk", "50ms handler", "work50", 200, [], 300, redis, tmp),
     ]
     table("Throughput — single worker, concurrency 1",
-          "Not a claim (spec §2, §5). tarsk has no broker yet, so its rows skip a hop "
-          "the others pay: treat them as an upper bound, not a win. The 50ms rows are "
+          "Not a claim (spec §2, §5). All three read the same Redis. The 50ms rows are "
           "the point — with a realistic handler the runtimes converge.\n\n"
           "Rate and wall cover first completion to last. Startup is its own column "
           "because folding it in would make the short rows a boot-time contest: it was "

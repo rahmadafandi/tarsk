@@ -54,6 +54,23 @@ def rss_of(pid: int) -> float:
         return 0
 
 
+def smaps(pid: int, key: str) -> float:
+    """A field from /proc/<pid>/smaps_rollup, in bytes.
+
+    Pss is the one that can be summed across a process tree: it divides each
+    shared page among the processes mapping it, where Rss counts it in full for
+    every one of them. A runtime that forks therefore looks much heavier under
+    summed Rss than it is.
+    """
+    try:
+        for line in open(f"/proc/{pid}/smaps_rollup"):
+            if line.startswith(key):
+                return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0.0
+
+
 def parent_map() -> dict[int, int]:
     tree = {}
     for entry in os.listdir("/proc"):
@@ -390,16 +407,22 @@ def measure_imports(cmd: list[str], env: dict, tmp: Path, tag: str) -> tuple[flo
                             stderr=subprocess.DEVNULL, start_new_session=True)
     coordinator = importer = 0.0
     importers: set[int] = set()
+    ever_alive = False
     deadline = time.time() + 8
     while time.time() < deadline:
         importers |= {int(line) for line in log.read_text().split() if line.isdigit()}
         coordinator = max(coordinator, rss_of(proc.pid))
-        importer = max(importer, max((rss_of(pid) for pid in importers), default=0.0))
+        live = [rss_of(pid) for pid in importers if rss_of(pid) > 0]
+        ever_alive |= bool(live)
+        importer = max(importer, max(live, default=0.0))
         time.sleep(0.2)
     root_imports = proc.pid in importers
+    family = [proc.pid, *descendants(proc.pid)]
+    tree_rss = sum(smaps(pid, "Rss:") for pid in family)
+    tree_pss = sum(smaps(pid, "Pss:") for pid in family)
     kill_tree(proc.pid)
     proc.wait()
-    return coordinator, importer, root_imports
+    return coordinator, importer if ever_alive else None, root_imports, tree_rss, tree_pss
 
 
 def scenario_imports(redis: Redis, tmp: Path) -> None:
@@ -418,21 +441,23 @@ def scenario_imports(redis: Redis, tmp: Path) -> None:
           "for a real dependency tree. `heavy − light`\nis what your code costs that "
           "process.\n")
     print("| runtime | coordinator (light → heavy) | runs your code (light → heavy) | "
-          "coordinator imports it |")
-    print("|---|---|---|---|")
+          "coordinator imports it | whole tree, heavy (Rss / Pss) |")
+    print("|---|---|---|---|---|")
     for name, cmd in runtimes.items():
         redis.flush()
         base = {**os.environ, "BENCH_REDIS": REDIS_URL, "PYTHONPATH": str(ROOT)}
         light = measure_imports(cmd, base, tmp, f"{name}-light")
         heavy = measure_imports(cmd, {**base, "BENCH_HEAVY": "1"}, tmp, f"{name}-heavy")
-        arrow = lambda a, b: f"{a / MB:.0f} → {b / MB:.0f} MB ({(b - a) / MB:+.0f})"
-        note = ""
-        if light[1] and abs(heavy[1] - light[1]) < 2 * MB:
-            # Its own log proves the module was imported there, so a flat number
-            # is a measurement we do not understand rather than a finding.
-            note = " ⚠️ unexplained"
-        print(f"| {name} | {arrow(light[0], heavy[0])} | {arrow(light[1], heavy[1])}{note} | "
-              f"{'**yes**' if light[2] else 'no'} |")
+        def arrow(a, b):
+            if a is None or b is None:
+                # Better an admitted gap than a zero that reads as a result.
+                return "n/a — the process did not stay up to be measured"
+            return f"{a / MB:.0f} → {b / MB:.0f} MB ({(b - a) / MB:+.0f})"
+        # Rss summed over a tree counts every shared page once per process;
+        # Pss splits it. The gap is how much the summed figure overstates.
+        tree = f"{heavy[3] / MB:.0f} / **{heavy[4] / MB:.0f}** MB"
+        print(f"| {name} | {arrow(light[0], heavy[0])} | {arrow(light[1], heavy[1])} | "
+              f"{'**yes**' if light[2] else 'no'} | {tree} |")
 
 
 def scenario_footprint(redis: Redis, tmp: Path) -> None:

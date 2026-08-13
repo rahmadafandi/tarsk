@@ -49,36 +49,53 @@ spike shorter than the interval, which a fast handover makes likely.
 `python bench/run.py imports`
 
 The same two app modules under each runtime — one trivial, one importing celery + taskiq +
-redis, which costs 47MB in a bare interpreter and stands in for a real dependency tree. The
-importing process names itself in a log rather than being guessed at as "the biggest child".
+redis, which costs 47MB in a bare interpreter. The importing process names itself in a log
+rather than being guessed at as "the biggest child", which picks wrong the moment a runtime
+keeps several around.
 
-| runtime | coordinator (light → heavy) | runs your code (light → heavy) | coordinator imports it |
-|---|---|---|---|
-| celery | 55 → 77 MB (+22) | 55 → 77 MB (+22) | **yes** |
-| taskiq | 51 → 51 MB (−0) | 59 → 58 MB (−1) ⚠️ | no |
-| tarsk | 27 → 27 MB (+0) | 24 → 58 MB (+33) | no |
+| runtime | coordinator (light → heavy) | runs your code (light → heavy) | coordinator imports it | whole tree, heavy (Rss / Pss) |
+|---|---|---|---|---|
+| celery | 55 → 77 MB (+22) | 55 → 77 MB (+22) | **yes** | 141 / **99** MB |
+| taskiq | 51 → 51 MB (+0) | 58 → 58 MB (+0) ⚠️ | no | 144 / **91** MB |
+| tarsk | 27 → 27 MB (+0) | 24 → 58 MB (+33) | no | 85 / **59** MB |
 
-Celery's master imports your app and grows with it; it then forks, so its children start from
-that memory — which is why both its columns are the same number. taskiq's coordinator does not
-import your code, and neither does tarsk's supervisor: **this property is not unique to tarsk,
-and an earlier draft of these notes implied it was.**
+Celery's master imports your app and grows with it, then forks, so its children start from that
+memory — which is why both its columns are the same number. taskiq's coordinator does not
+import your code, and neither does tarsk's supervisor: **this is not unique to tarsk, and an
+earlier draft of these notes implied it was.**
 
-What differs is what the property is spent on. taskiq's coordinator is a process manager: it
-starts workers and restarts them when they die. It reads nobody's RSS and enforces nothing.
-tarsk's supervisor is the enforcer — it reads each child's RSS from outside, decides when one
-retires, holds the broker leases so a dead child's work is redelivered, and runs the retry
-machine and the schedule. That work has to live somewhere that outlives every child *and does
-not itself grow*: you cannot hold a memory ceiling from inside a process with the same problem.
-Celery's master could not do it if it wanted to, at 77MB of your imports and forking children
-from them.
+What differs is what the property is spent on. taskiq's coordinator starts workers and restarts
+them when they die; it reads nobody's RSS and enforces nothing. tarsk's supervisor is the
+enforcer — it reads each child's RSS from outside, decides when one retires, holds the leases
+so a dead child's work comes back, and runs the retries and the schedule. That has to live
+somewhere that outlives every child *and does not itself grow*: a memory ceiling cannot be held
+from inside a process with the same problem. Celery's master could not do it at 77MB of your
+imports, forking children from them.
 
-⚠️ **The taskiq worker cell is a measurement we cannot account for.** Its own import log shows
-the module is loaded in that process (`'celery' in sys.modules` is true there), so the number
-should have moved by roughly what it moved everywhere else. It did not, across two different
-sampling methods. Something about how taskiq replaces worker processes is likely hiding it.
-Reported as unexplained rather than rounded into a story.
+**Two things this scenario taught us that correct the numbers elsewhere on this page.**
 
-### Footprint, after one trivial task
+*Summed Rss over a process tree double-counts.* Every page shared between processes is counted
+in full for each of them, and forking shares almost everything. Pss divides each shared page
+among its mappers, which is why the tree columns above show both. Celery's tree is 141MB by Rss
+and 99MB by Pss — 42MB of double counting — against tarsk's 85 and 59. The gap between the two
+runtimes is real but roughly 40% smaller than summed Rss suggests, and the *tree RSS* column in
+the footprint table below overstates in exactly this way.
+
+*The cost of an import depends on what is already loaded.* Instrumenting the taskiq worker
+directly showed the heavy module costing it +7MB, not +47: it already had 514 modules, so most
+of celery's dependency tree was a re-import. The same code costs a fresh tarsk child +33MB
+because a fresh tarsk child has almost nothing in it. Neither number is wrong; they answer
+different questions, and "how much does my dependency tree cost" only has an answer relative to
+a starting point.
+
+⚠️ The taskiq worker cell does not move, and the run-to-run figures for it are unstable —
+sometimes 58MB, sometimes no live process at all. Its worker does not survive an idle Redis
+read here (`redis.exceptions.TimeoutError`) and is respawned, so what gets sampled depends on
+where in that cycle the sample lands. The direct instrumentation above is the trustworthy
+reading for taskiq: +7MB, from 514 modules to 581. Earlier benchmarks on this page avoided the
+whole problem by preloading the queue, so the worker was never idle.
+
+### Footprint, after one trivial task### Footprint, after one trivial task
 
 | runtime | worker RSS | tree RSS |
 |---|---|---|
@@ -87,7 +104,8 @@ Reported as unexplained rather than rounded into a story.
 | taskiq | 58 MB | 144 MB |
 
 The tarsk child is CPython plus the user's task module and nothing else — no broker driver,
-no scheduler (spec §4.1). The tree column includes the supervisor / master.
+no scheduler (spec §4.1). The tree column includes the supervisor / master, and is summed Rss,
+so it double-counts pages shared by forking — see the Pss figures above for how much.
 
 ### Bounded memory, 40 tasks each retaining 20MB
 

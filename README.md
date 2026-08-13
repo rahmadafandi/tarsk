@@ -84,6 +84,8 @@ Your imports land in one process here, and the supervisor is not it:
 | taskiq | 51 → 51 MB | no |
 | tarsk | 27 → 27 MB | no |
 
+(`python bench/run.py imports`. The heavy app imports celery + taskiq + redis.)
+
 taskiq keeps its coordinator clean too, so that part is not a tarsk invention. The difference
 is what the clean process then does: taskiq's starts and restarts workers, while tarsk's reads
 their RSS, retires them, holds their leases and runs the schedule. A memory ceiling has to be

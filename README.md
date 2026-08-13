@@ -163,7 +163,9 @@ one task at a time and is the first thing to revisit if that changes.
 global would have been, except `app.override(provider, fake)` can replace it in a test. Pass
 `scope="task"` to resolve per call.
 
-Both run in the worker, and `before_send` in the producer. Neither can run in the supervisor:
+`execute` runs in the worker; `before_send(ctx)` runs in the producer before the job is
+serialised and may add to `ctx.kwargs`, which is how a trace id gets attached to work that has
+not left the process yet. Neither can run in the supervisor:
 that process never imports your code, which is what keeps its footprint constant. For the same
 reason there is no "result stored" hook — the supervisor is what stores it.
 

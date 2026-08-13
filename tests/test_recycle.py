@@ -140,6 +140,32 @@ def test_hooks_bracket_every_worker():
         os.environ.pop("TARSK_HOOK_LOG", None)
 
 
+def test_before_send_can_attach_to_the_payload():
+    """The producer-side hook, which the README claimed before it existed."""
+    from unittest.mock import Mock
+
+    import msgpack
+
+    from tarsk import App
+
+    app = App(broker="memory://")
+
+    class Tracer:
+        def before_send(self, ctx):
+            ctx.kwargs["trace_id"] = f"trace-of-{ctx.name}"
+
+    app.middleware(Tracer())
+
+    @app.task(name="carried")
+    def carried(x, trace_id=None):
+        return trace_id
+
+    app._producer = Mock()
+    app.registry["carried"].send(1)
+    payload = app._producer.send.call_args[0][3]
+    assert msgpack.unpackb(payload) == [[1], {"trace_id": "trace-of-carried"}], payload
+
+
 def test_middleware_wraps_and_dependencies_inject():
     """Layers nest outside-in and unwind inside-out, failures included.
 
@@ -183,6 +209,7 @@ if __name__ == "__main__":
                   test_hard_ceiling_kills_and_dead_letters,
                   test_hard_ceiling_must_exceed_the_soft_one,
                   test_hooks_bracket_every_worker,
-                  test_middleware_wraps_and_dependencies_inject):
+                  test_middleware_wraps_and_dependencies_inject,
+                  test_before_send_can_attach_to_the_payload):
         check()
         print("ok", check.__name__)

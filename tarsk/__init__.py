@@ -185,6 +185,22 @@ class Enqueue:
     def send(self, *args, **kwargs) -> str:
         from . import _proto  # lazy — see App.producer
 
+        app = self.task.app
+        if app.middlewares:
+            # Producer side, so sync only: send() is not a coroutine, and
+            # making it one to accommodate a hook would be the tail wagging.
+            ctx = Context(
+                name=self.task.spec.name,
+                task_id=self.task_id,
+                attempt=0,  # not run yet
+                args=args,
+                kwargs=kwargs,
+            )
+            for middleware in app.middlewares:
+                hook = getattr(middleware, "before_send", None)
+                if hook is not None:
+                    hook(ctx)
+            kwargs = ctx.kwargs  # mutable, so a trace id can be attached here
         payload = _proto.pack_args(args, kwargs)
         self.task.app.producer().send(
             self.task_id, self.queue, self.task.spec.name, payload,
@@ -301,8 +317,12 @@ class App:
         the way it looks like it should. It costs a thread for the length of
         the task, which is the same trade sync handlers already make.
 
-        Middleware runs in the worker, and on the producer side for
-        `before_send`. It cannot run in the supervisor: that process never
+        `before_send(ctx)` additionally runs in the producer, before the job is
+        serialised, and may add to `ctx.kwargs` — which is how a trace id gets
+        attached to work that has not left the process yet. It is sync: `send()`
+        is not a coroutine.
+
+        Neither can run in the supervisor: that process never
         imports your code, which is what keeps its footprint a constant
         (spec §4.1). There is no hook for "result stored" for the same reason.
         """

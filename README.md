@@ -238,6 +238,11 @@ Redis Streams and Postgres. Both at-least-once, both leasing per task rather tha
 neither needing lease renewal — a task's timeout is capped, so a lease cannot outlive a known
 ceiling.
 
+`rediss://` connects over TLS, which every managed Redis requires — verified against the
+system trust store, so an untrusted certificate is refused rather than accepted. Append
+`#insecure` to skip that check for a self-signed certificate you control; nothing else turns
+it off.
+
 Failures follow the task's own `retries` and `backoff`, and neither backend needed a delay
 queue for it: Postgres already has a visibility timer, and Redis has the idle clock its pending
 sweep reads. What runs out of retries lands in `tarsk:{queue}:dead` or the `tarsk_dead` table,

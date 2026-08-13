@@ -340,7 +340,28 @@ def test_postgres():
         check_broker(pg.url, "postgres")
 
 
+def test_tls_is_compiled_in():
+    """rediss:// must fail like a connection, not like a missing feature.
+
+    Two things break silently here and only when someone actually uses TLS:
+    dropping the redis TLS feature from Cargo.toml, and leaving rustls without
+    a crypto provider — the second aborts the process rather than raising.
+    Neither shows up in any test that talks plaintext.
+    """
+    from tarsk._core import Producer
+
+    # Port 1 is reserved and nothing listens there, so a TLS handshake cannot
+    # get far enough to succeed for the wrong reason.
+    try:
+        Producer(broker_url="rediss://127.0.0.1:1/0")
+    except ValueError as exc:
+        assert "feature is not enabled" not in str(exc), "redis built without TLS"
+        assert "CryptoProvider" not in str(exc), "rustls has no crypto provider selected"
+    else:
+        raise AssertionError("connecting to a dead port should not succeed")
+
+
 if __name__ == "__main__":
-    for check in (test_redis, test_postgres):
+    for check in (test_redis, test_postgres, test_tls_is_compiled_in):
         check()
         print("ok", check.__name__)

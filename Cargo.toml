@@ -16,7 +16,19 @@ libc = "0.2.189"
 # per Python minor (spec §8). On a free-threaded interpreter pyo3 falls back
 # to a version-specific build on its own, which is the cp314t wheel we want.
 pyo3 = { version = "0.29.2", features = ["extension-module", "abi3-py311"] }
-redis = { version = "1.5.0", features = ["tokio-comp", "streams"] }
+# tls-rustls rather than native-tls: a manylinux wheel cannot depend on
+# whatever OpenSSL the build host happened to have. `insecure` only does
+# anything when a URL asks for it with #insecure — see docs on rediss://.
+redis = { version = "1.5.0", features = [
+    "tokio-comp",
+    "streams",
+    "tokio-rustls-comp",
+    "tls-rustls-insecure",
+] }
+# Not used directly — present to pick rustls's crypto provider, which redis
+# leaves unselected. ring over aws-lc-rs: the latter wants cmake and a C
+# compiler, which a manylinux wheel build should not need.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 rmpv = "1.3.1"
 sysinfo = "0.38.4"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "process", "io-util", "time", "sync", "signal"] }

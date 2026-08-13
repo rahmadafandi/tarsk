@@ -12,7 +12,10 @@ if os.environ.get("BENCH_HEAVY"):
 
 from celery import Celery
 
-app = Celery("footprint", broker=os.environ.get("BENCH_REDIS", "redis://localhost:6399/0"))
+# BENCH_REDIS is always set by the harness; the fallback is for importing this
+# module by hand, so it points at the conventional port rather than one nothing
+# is listening on.
+app = Celery("footprint", broker=os.environ.get("BENCH_REDIS", "redis://localhost:6379/0"))
 app.conf.update(task_ignore_result=True, broker_connection_retry_on_startup=True)
 
 

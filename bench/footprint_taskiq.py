@@ -18,8 +18,10 @@ from taskiq_redis import ListQueueBroker
 # respawned every few seconds. Disabling the read timeout is the configuration
 # that makes a blocking pop work as intended — the same courtesy this harness
 # extends to Celery's tuned settings.
+# BENCH_REDIS is always set by the harness; the fallback is for importing this
+# module by hand, so it points at the conventional port.
 broker = ListQueueBroker(
-    url=os.environ.get("BENCH_REDIS", "redis://localhost:6399/0"),
+    url=os.environ.get("BENCH_REDIS", "redis://localhost:6379/0"),
     socket_timeout=None,
 )
 

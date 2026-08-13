@@ -111,10 +111,40 @@ def test_hard_ceiling_must_exceed_the_soft_one():
         raise AssertionError("a hard ceiling below the soft one must be refused")
 
 
+def test_child_hooks_bracket_every_child():
+    """Each child runs the hooks exactly once, including the ones it replaced.
+
+    A pool opened at import instead of in a hook lands in the baseline RSS the
+    ceiling is measured against, so getting this right is not housekeeping.
+    """
+    import tempfile
+
+    hook_log = Path(tempfile.mktemp(suffix=".hooks"))
+    os.environ["TARSK_HOOK_LOG"] = str(hook_log)
+    try:
+        sup = Supervisor("tests.demo_app:app", children=1, max_tasks=10)
+        results = sup.run([("add", (i, 1), {}) for i in range(30)])
+        assert all(kind == "ack" for kind, _ in results.values()), results
+
+        lines = [line.split() for line in hook_log.read_text().splitlines() if line]
+        started = [pid for kind, pid in lines if kind == "start"]
+        stopped = [pid for kind, pid in lines if kind == "stop"]
+        assert len(started) == len(set(started)), f"a child ran start twice: {started}"
+        # Every child that drained also stopped; the last one may still be
+        # draining as run() returns, so stops trail starts by at most one.
+        assert 0 <= len(started) - len(stopped) <= 1, f"{started} vs {stopped}"
+        assert set(stopped) <= set(started), "a child stopped without starting"
+        assert len(started) >= 3, f"expected several children at 30 tasks / 10: {started}"
+    finally:
+        hook_log.unlink(missing_ok=True)
+        os.environ.pop("TARSK_HOOK_LOG", None)
+
+
 if __name__ == "__main__":
     for check in (test_leaky_handler_is_bounded, test_recycling_is_overlapped,
                   test_baseline_above_ceiling_is_refused,
                   test_hard_ceiling_kills_and_dead_letters,
-                  test_hard_ceiling_must_exceed_the_soft_one):
+                  test_hard_ceiling_must_exceed_the_soft_one,
+                  test_child_hooks_bracket_every_child):
         check()
         print("ok", check.__name__)

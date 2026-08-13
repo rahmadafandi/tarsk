@@ -7,6 +7,7 @@ and belong to the parent process only.
 
 from __future__ import annotations
 
+import datetime
 import functools
 import hashlib
 import importlib
@@ -15,7 +16,7 @@ import secrets
 import time
 from dataclasses import dataclass
 
-__all__ = ["App", "AsyncResult", "Task", "TaskSpec", "load_app"]
+__all__ = ["App", "AsyncResult", "Task", "TaskFailed", "TaskSpec", "load_app"]
 
 DEFAULT_TIMEOUT = 300.0  # seconds — spec §9, doubles as the hard cap
 
@@ -62,7 +63,7 @@ class Task:
         An id, not a future (spec §4.3). Nothing is written anywhere unless the
         task set `result_ttl`; the id is just how you would ask later.
         """
-        return self._enqueue(0.0, args, kwargs)
+        return Enqueue(self).send(*args, **kwargs)
 
     def send_in(self, delay: float, /, *args, **kwargs) -> str:
         """Enqueue, to run no earlier than `delay` seconds from now.
@@ -71,24 +72,71 @@ class Task:
         `send_at(doc_id="abc", delay=60)`, which quietly breaks the day someone
         writes a task that takes an argument called `delay`.
         """
-        if delay < 0:
-            raise ValueError("delay must not be negative")
-        return self._enqueue(delay, args, kwargs)
+        return Enqueue(self, delay=delay).send(*args, **kwargs)
 
-    def _enqueue(self, delay: float, args: tuple, kwargs: dict) -> str:
-        from . import _proto  # lazy — see App.producer
+    def send_at(self, when: "datetime.datetime", /, *args, **kwargs) -> str:
+        """Enqueue for an absolute time. Must be timezone-aware.
 
-        # Minted here so send() can answer without a round trip, and so the id
-        # is known before the job exists anywhere.
-        task_id = secrets.token_hex(8)
-        payload = _proto.pack_args(args, kwargs)
-        self.app.producer().send(
-            task_id, self.spec.queue, self.spec.name, payload, self.spec.timeout_ms, delay
-        )
-        return task_id
+        A naive datetime is the same bug as a local-time cron: it means
+        something different depending on where it is read.
+        """
+        return Enqueue(self, when=when).send(*args, **kwargs)
+
+    def options(
+        self,
+        *,
+        queue: str | None = None,
+        timeout: float | None = None,
+        delay: float = 0.0,
+        when: "datetime.datetime | None" = None,
+        task_id: str | None = None,
+    ) -> "Enqueue":
+        """Override what this one send does, without touching the registration.
+
+        Keyword-only and on a separate object so that nothing here can collide
+        with an argument the task itself takes.
+        """
+        return Enqueue(self, queue=queue, timeout=timeout, delay=delay, when=when,
+                       task_id=task_id)
 
     def __repr__(self) -> str:
         return f"<Task {self.spec.name}>"
+
+
+class Enqueue:
+    """One send, with the registration's defaults optionally overridden."""
+
+    def __init__(self, task: Task, *, queue=None, timeout=None, delay=0.0, when=None,
+                 task_id=None):
+        if delay and when is not None:
+            raise ValueError("give a delay or a time, not both")
+        if when is not None:
+            if when.tzinfo is None:
+                raise ValueError("send_at needs a timezone-aware datetime")
+            delay = max(0.0, when.timestamp() - datetime.datetime.now(datetime.UTC).timestamp())
+        if delay < 0:
+            raise ValueError("delay must not be negative")
+        if timeout is not None and timeout > task.app.max_timeout:
+            raise ValueError(
+                f"timeout={timeout}s exceeds max_timeout={task.app.max_timeout}s"
+            )
+        self.task = task
+        self.queue = queue or task.spec.queue
+        self.timeout_ms = task.spec.timeout_ms if timeout is None else int(timeout * 1000)
+        self.delay = delay
+        # A caller-supplied id is an idempotency key: send the same one twice
+        # and the second result overwrites the first rather than adding a row.
+        self.task_id = task_id or secrets.token_hex(8)
+
+    def send(self, *args, **kwargs) -> str:
+        from . import _proto  # lazy — see App.producer
+
+        payload = _proto.pack_args(args, kwargs)
+        self.task.app.producer().send(
+            self.task_id, self.queue, self.task.spec.name, payload,
+            self.timeout_ms, self.delay,
+        )
+        return self.task_id
 
 
 class App:
@@ -108,6 +156,8 @@ class App:
         self.default_timeout = default_timeout
         self.max_timeout = max_timeout
         self.registry: dict[str, Task] = {}
+        self.child_start_hooks: list = []
+        self.child_stop_hooks: list = []
         self._producer = None
 
     def task(
@@ -155,6 +205,26 @@ class App:
             return task
 
         return decorate
+
+    def on_child_start(self, fn):
+        """Run once in each child, before it takes any work.
+
+        This is where a connection pool belongs. Opening one at import time
+        instead puts it in every child's baseline RSS, which is the number
+        `--max-rss` is measured against — so the alternative is not just untidy,
+        it spends the budget the ceiling is there to protect.
+        """
+        self.child_start_hooks.append(fn)
+        return fn
+
+    def on_child_stop(self, fn):
+        """Run once in each child as it drains, before the process ends.
+
+        Without it the only thing closing a connection is the process exiting,
+        which a server on the other end experiences as a reset.
+        """
+        self.child_stop_hooks.append(fn)
+        return fn
 
     def producer(self):
         """Connection to the broker for enqueueing.

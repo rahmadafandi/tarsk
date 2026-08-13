@@ -20,6 +20,13 @@ def embed_document(doc_id: str) -> dict:
 task_id = embed_document.send("abc")
 ```
 
+```python
+@app.on_child_start
+def connect():
+    global pool
+    pool = psycopg.ConnectionPool(...)   # not at import: see below
+```
+
 `send()` hands back an id, not a future. Nothing is written anywhere unless the task asks for
 it — `@app.task(result_ttl=3600)`, then `app.result(task_id).get(timeout=30)`. Writing every
 result to a broker nobody reads from is most of why Celery feels heavy, so it is off by
@@ -107,9 +114,25 @@ fit it is dead-lettered instead of retried forever. It cannot make an oversized 
 it decides who loses when one task threatens the box. It must sit above `--max-rss`, or the
 graceful ceiling could never fire.
 
+## Where setup belongs
+
+`@app.on_child_start` runs once in each child before it takes work, and
+`@app.on_child_stop` as it drains. Opening a connection pool at import time instead puts it in
+every child's baseline RSS — the number `--max-rss` is measured against — so it spends the
+budget the ceiling exists to protect, in every child, forever.
+
+Hooks run before the child registers, so whatever they open is inside the baseline the
+supervisor checks against the ceiling. A pool that does not fit is refused at startup rather
+than discovered as a child that recycles instantly.
+
 ## Scheduling
 
-`send_in(60, …)` runs a task once, later. `@app.task(cron="*/5 * * * *")` runs it on a
+`send_in(60, …)` runs a task once, later; `send_at(when)` takes a timezone-aware datetime.
+`task.options(queue=…, timeout=…, task_id=…)` overrides any of it for one send — keyword-only
+and on its own object, so nothing can collide with an argument the task itself takes. A
+caller-supplied id doubles as an idempotency key.
+
+ `@app.task(cron="*/5 * * * *")` runs it on a
 schedule — five fields, evaluated in UTC.
 
 UTC is the whole timezone story, deliberately. A local schedule has to answer what "02:30

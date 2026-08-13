@@ -11,12 +11,17 @@ import os
 import sys
 import traceback
 
+import inspect
+
 from . import Task, load_app
 from . import _proto
 
 # Distinct exit code so the supervisor can tell "recycled after a sync timeout"
 # from a crash. Both are unclean; only one is the runtime's own doing.
 EXIT_SYNC_TIMEOUT = 75
+# A start hook raised. Distinct so the supervisor can say so rather than
+# reporting a child that simply never showed up.
+EXIT_STARTUP_FAILED = 78
 
 
 async def _call(task: Task, args: list, kwargs: dict):
@@ -37,8 +42,31 @@ async def _die(writer: asyncio.StreamWriter, code: int) -> None:
     os._exit(code)
 
 
+async def _run_hooks(hooks) -> None:
+    for hook in hooks:
+        result = hook()
+        if inspect.isawaitable(result):
+            await result
+
+
+async def _shutdown(app, writer) -> None:
+    """Let the child put its own things down before the process ends."""
+    try:
+        await _run_hooks(app.child_stop_hooks)
+    except Exception:
+        traceback.print_exc()
+
+
 async def main(socket_path: str, app_spec: str, child_id: int) -> None:
     app = load_app(app_spec)
+    # Before Register, so whatever a hook opens is inside the baseline the
+    # supervisor measures against the ceiling. A pool that does not fit should
+    # be refused at startup, not discovered as a child that recycles instantly.
+    try:
+        await _run_hooks(app.child_start_hooks)
+    except Exception:
+        traceback.print_exc()
+        sys.exit(EXIT_STARTUP_FAILED)
     reader, writer = await asyncio.open_unix_connection(socket_path)
     # child_id is assigned by the supervisor before spawn, so it can match this
     # connection to the process it started — and to that process's RSS.
@@ -52,9 +80,11 @@ async def main(socket_path: str, app_spec: str, child_id: int) -> None:
         await _proto.write(writer, "Ready")
         frame = await _proto.read(reader)
         if frame is None:
+            await _shutdown(app, writer)
             return  # supervisor went away
         tag, args = frame
         if tag == "Drain":
+            await _shutdown(app, writer)
             return
         if tag != "Dispatch":
             raise RuntimeError(f"unexpected frame from supervisor: {tag!r}")

@@ -255,6 +255,22 @@ def check_broker(url: str, label: str) -> None:
         assert app.result(forgotten_id).ready() is False, f"{label}: stored an unasked result"
         stop_worker(worker)
 
+        # --- per-call overrides: a different queue, an absolute time ----
+        import datetime
+
+        log.write_text("")
+        note = app.registry["note"]
+        fixed = note.options(task_id="chosen-by-the-caller").send("by-id")
+        assert fixed == "chosen-by-the-caller", fixed
+        soon = datetime.datetime.now(datetime.UTC) + datetime.timedelta(seconds=5)
+        note.send_at(soon, "absolute")
+        worker = start_worker(env, TARSK_LEASE_GRACE=1)
+        early = wait_for(log, {"by-id"}, timeout=30)
+        assert "absolute" not in early, f"{label}: send_at jumped the queue ({early})"
+        seen = wait_for(log, {"by-id", "absolute"}, timeout=60)
+        stop_worker(worker)
+        assert "absolute" in seen, f"{label}: send_at never arrived ({seen})"
+
         # --- cron fires once a minute, once across the fleet ------------
         log.write_text("")
         # Two workers, so a schedule fired twice would show up as two ticks.

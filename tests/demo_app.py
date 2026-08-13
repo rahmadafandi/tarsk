@@ -54,3 +54,19 @@ def glutton(megabytes):
     hoard = bytearray(megabytes * 1024 * 1024)
     time.sleep(5)
     return len(hoard)
+
+
+# Lifecycle hooks: a file per child, so a test can count how often they ran.
+HOOK_LOG = Path(os.environ.get("TARSK_HOOK_LOG", "/dev/null"))
+
+
+@app.on_child_start
+def opened():
+    with open(HOOK_LOG, "a", buffering=1) as fh:
+        fh.write(f"start {os.getpid()}\n")
+
+
+@app.on_child_stop
+def closed():
+    with open(HOOK_LOG, "a", buffering=1) as fh:
+        fh.write(f"stop {os.getpid()}\n")

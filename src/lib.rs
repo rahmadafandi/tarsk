@@ -32,6 +32,8 @@ use tokio::net::UnixListener;
 use tokio::sync::{mpsc, oneshot, Notify};
 
 const MAX_FRAME: usize = 32 * 1024 * 1024;
+/// Mirrors tarsk._child.EXIT_STARTUP_FAILED.
+const EXIT_STARTUP_FAILED: i32 = 78;
 
 // ---------------------------------------------------------------- framing
 
@@ -289,7 +291,7 @@ impl Shared {
         let spec = self.specs.lock().unwrap().get(&job.name).cloned();
         let retries = spec.as_ref().map(|s| s.retries).unwrap_or(0);
         if job.attempt <= retries {
-            let delay = backoff_for(spec.as_ref(), job.attempt);
+            let delay = backoff_for(spec.as_ref(), job.attempt, &job.id);
             self.counters.retried.fetch_add(1, Ordering::Relaxed);
             if self.broker.retry(&job.receipt, delay).await.is_err() {
                 self.counters.broker_errors.fetch_add(1, Ordering::Relaxed);
@@ -391,13 +393,26 @@ struct Spec {
 
 /// Wait before the next attempt. Exponential from one second, capped so a
 /// backoff cannot outrun what a broker can express (see the Redis driver).
-fn backoff_for(spec: Option<&Spec>, attempt: u32) -> Duration {
+///
+/// Jittered into the top half of the window, keyed off the job's own id. A
+/// dependency that came back after a blip would otherwise be hit by every
+/// retry it caused, at the same instant, in step — the outage's own echo.
+fn backoff_for(spec: Option<&Spec>, attempt: u32, seed: &str) -> Duration {
     let base = Duration::from_secs(1);
-    match spec.map(|s| s.backoff.as_str()) {
-        Some("none") => Duration::ZERO,
+    let full = match spec.map(|s| s.backoff.as_str()) {
+        Some("none") => return Duration::ZERO,
         Some("fixed") => base,
         _ => base * 2u32.pow(attempt.saturating_sub(1).min(6)),
+    };
+    // FNV-1a over the id: no rand crate, and deterministic per job, which is
+    // all that spreading requires.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in seed.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
+    let fraction = (hash >> 11) as f64 / (1u64 << 53) as f64; // [0, 1)
+    full.mul_f64(0.5 + fraction * 0.5)
 }
 
 /// A scheduled task takes no arguments: msgpack for `([], {})`, the same shape
@@ -537,13 +552,30 @@ async fn spawn_child(shared: &Arc<Shared>, cfg: &Cfg) -> Option<ChildHandle> {
         .ok()?;
     let pid = proc.id().unwrap_or(0);
 
-    let halves = match tokio::time::timeout(cfg.connect_timeout, rx).await {
-        Ok(Ok(Some(halves))) => halves,
-        _ => {
-            shared.conns.lock().unwrap().remove(&child_id);
-            let _ = proc.kill().await;
-            return None;
+    // Watch the process as well as the socket. A child that dies on the way up
+    // — a bad app module, a start hook that raised — would otherwise cost the
+    // full connect timeout before anyone noticed, per attempt.
+    let halves = tokio::select! {
+        connected = tokio::time::timeout(cfg.connect_timeout, rx) => match connected {
+            Ok(Ok(Some(halves))) => Some(halves),
+            _ => None,
+        },
+        status = proc.wait() => {
+            let code = status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
+            shared.exits.lock().unwrap().push(code);
+            if code == EXIT_STARTUP_FAILED {
+                shared.fail(format!(
+                    "a child's on_child_start hook raised; its traceback is on the \
+                     worker's stderr (exit {code})"
+                ));
+            }
+            None
         }
+    };
+    let Some(halves) = halves else {
+        shared.conns.lock().unwrap().remove(&child_id);
+        let _ = proc.kill().await;
+        return None;
     };
     let (mut reader, writer) = halves;
 

@@ -76,6 +76,20 @@ trigger fires, so the slot never goes empty:
 And the worker that runs your code is smaller, because it imports your tasks and nothing else —
 no broker driver, no scheduler: 16 MB against Celery's 49 MB and taskiq's 58 MB.
 
+Your imports land in one process here, and the supervisor is not it:
+
+| runtime | coordinator (trivial app → heavy app) | coordinator imports your code |
+|---|---|---|
+| celery | 55 → 77 MB | **yes**, and it forks children from that |
+| taskiq | 51 → 51 MB | no |
+| tarsk | 27 → 27 MB | no |
+
+taskiq keeps its coordinator clean too, so that part is not a tarsk invention. The difference
+is what the clean process then does: taskiq's starts and restarts workers, while tarsk's reads
+their RSS, retires them, holds their leases and runs the schedule. A memory ceiling has to be
+held by something that does not have the problem — which is also why Celery could not enforce
+one from a master carrying 77 MB of your dependencies.
+
 ## What it does not claim
 
 **Not faster.** Dispatch costs microseconds; real handlers run for 50ms to minutes. With a 50ms

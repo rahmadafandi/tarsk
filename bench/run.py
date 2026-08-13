@@ -3,6 +3,7 @@
 What this measures and why (spec §2 sets the terms):
 
   footprint   idle RSS of the worker that runs user code
+  imports     which process carries your imports, and what that costs
   memory      worker RSS under a leaky handler, fixed and variable leak sizes
   oom         tasks lost when the box enforces a hard memory limit
   gap         inter-task gaps caused by worker recycling
@@ -45,7 +46,7 @@ MB = 1024 * 1024
 # --------------------------------------------------------------- proc utils
 
 
-def rss_of(pid: int) -> int:
+def rss_of(pid: int) -> float:
     try:
         with open(f"/proc/{pid}/statm") as fh:
             return int(fh.read().split()[1]) * PAGE
@@ -374,6 +375,66 @@ def quantile(values: list[float], q: float) -> float:
     return ordered[min(len(ordered) - 1, int(q * len(ordered)))]
 
 
+def measure_imports(cmd: list[str], env: dict, tmp: Path, tag: str) -> tuple[float, float, bool]:
+    """Coordinator RSS, importer RSS, and whether the coordinator is the importer.
+
+    The importing process names itself in a log, because picking "the biggest
+    child" guesses wrong the moment a runtime keeps more than one process
+    around. RSS is sampled repeatedly and kept at its maximum: a worker that
+    dies and is respawned would otherwise be caught mid-import and read low.
+    """
+    log = tmp / f"imports-{tag}.log"
+    log.write_text("")
+    env = {**env, "BENCH_IMPORT_LOG": str(log)}
+    proc = subprocess.Popen(cmd, env=env, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, start_new_session=True)
+    coordinator = importer = 0.0
+    importers: set[int] = set()
+    deadline = time.time() + 8
+    while time.time() < deadline:
+        importers |= {int(line) for line in log.read_text().split() if line.isdigit()}
+        coordinator = max(coordinator, rss_of(proc.pid))
+        importer = max(importer, max((rss_of(pid) for pid in importers), default=0.0))
+        time.sleep(0.2)
+    root_imports = proc.pid in importers
+    kill_tree(proc.pid)
+    proc.wait()
+    return coordinator, importer, root_imports
+
+
+def scenario_imports(redis: Redis, tmp: Path) -> None:
+    runtimes = {
+        "celery": [PY, "-m", "celery", "-A", "bench.footprint_celery", "worker", "-c", "1",
+                   "--loglevel", "error", "--without-gossip", "--without-mingle",
+                   "--without-heartbeat"],
+        "taskiq": [PY, "-m", "taskiq", "worker", "bench.footprint_taskiq:broker",
+                   "--workers", "1", "--log-level", "ERROR"],
+        "tarsk": [PY, "-m", "tarsk._cli", "worker", "--app", "bench.footprint_app:app",
+                  "--broker", REDIS_URL, "--children", "1"],
+    }
+    print("\n### Where your imports land\n")
+    print("The same two app modules under each runtime: one trivial, one importing "
+          "celery + taskiq + redis,\nwhich costs 47MB in a bare interpreter and stands in "
+          "for a real dependency tree. `heavy − light`\nis what your code costs that "
+          "process.\n")
+    print("| runtime | coordinator (light → heavy) | runs your code (light → heavy) | "
+          "coordinator imports it |")
+    print("|---|---|---|---|")
+    for name, cmd in runtimes.items():
+        redis.flush()
+        base = {**os.environ, "BENCH_REDIS": REDIS_URL, "PYTHONPATH": str(ROOT)}
+        light = measure_imports(cmd, base, tmp, f"{name}-light")
+        heavy = measure_imports(cmd, {**base, "BENCH_HEAVY": "1"}, tmp, f"{name}-heavy")
+        arrow = lambda a, b: f"{a / MB:.0f} → {b / MB:.0f} MB ({(b - a) / MB:+.0f})"
+        note = ""
+        if light[1] and abs(heavy[1] - light[1]) < 2 * MB:
+            # Its own log proves the module was imported there, so a flat number
+            # is a measurement we do not understand rather than a finding.
+            note = " ⚠️ unexplained"
+        print(f"| {name} | {arrow(light[0], heavy[0])} | {arrow(light[1], heavy[1])}{note} | "
+              f"{'**yes**' if light[2] else 'no'} |")
+
+
 def scenario_footprint(redis: Redis, tmp: Path) -> None:
     rows = [
         case("tarsk", "", "noop", 1, [], 60, redis, tmp),
@@ -496,6 +557,7 @@ def scenario_throughput(redis: Redis, tmp: Path) -> None:
 
 SCENARIOS = {
     "footprint": scenario_footprint,
+    "imports": scenario_imports,
     "memory": scenario_memory,
     "shift": scenario_memory_workload_shift,
     "variable": scenario_memory_variable,

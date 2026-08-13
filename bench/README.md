@@ -44,6 +44,40 @@ mark, and `/proc` sampled every 50ms. Neither alone is trustworthy — `ru_maxrs
 last completed task, so it under-reports a process killed mid-task, and sampling misses any
 spike shorter than the interval, which a fast handover makes likely.
 
+### Where your imports land
+
+`python bench/run.py imports`
+
+The same two app modules under each runtime — one trivial, one importing celery + taskiq +
+redis, which costs 47MB in a bare interpreter and stands in for a real dependency tree. The
+importing process names itself in a log rather than being guessed at as "the biggest child".
+
+| runtime | coordinator (light → heavy) | runs your code (light → heavy) | coordinator imports it |
+|---|---|---|---|
+| celery | 55 → 77 MB (+22) | 55 → 77 MB (+22) | **yes** |
+| taskiq | 51 → 51 MB (−0) | 59 → 58 MB (−1) ⚠️ | no |
+| tarsk | 27 → 27 MB (+0) | 24 → 58 MB (+33) | no |
+
+Celery's master imports your app and grows with it; it then forks, so its children start from
+that memory — which is why both its columns are the same number. taskiq's coordinator does not
+import your code, and neither does tarsk's supervisor: **this property is not unique to tarsk,
+and an earlier draft of these notes implied it was.**
+
+What differs is what the property is spent on. taskiq's coordinator is a process manager: it
+starts workers and restarts them when they die. It reads nobody's RSS and enforces nothing.
+tarsk's supervisor is the enforcer — it reads each child's RSS from outside, decides when one
+retires, holds the broker leases so a dead child's work is redelivered, and runs the retry
+machine and the schedule. That work has to live somewhere that outlives every child *and does
+not itself grow*: you cannot hold a memory ceiling from inside a process with the same problem.
+Celery's master could not do it if it wanted to, at 77MB of your imports and forking children
+from them.
+
+⚠️ **The taskiq worker cell is a measurement we cannot account for.** Its own import log shows
+the module is loaded in that process (`'celery' in sys.modules` is true there), so the number
+should have moved by roughly what it moved everywhere else. It did not, across two different
+sampling methods. Something about how taskiq replaces worker processes is likely hiding it.
+Reported as unexplained rather than rounded into a story.
+
 ### Footprint, after one trivial task
 
 | runtime | worker RSS | tree RSS |

@@ -129,6 +129,13 @@ class Sampler(threading.Thread):
         self.peak_root = 0
         self.peak_worker = 0  # largest single descendant
         self.peak_total = 0
+        # Summed Rss counts a page once per process it is mapped into, and a
+        # supervisor and its child share libpython, libc and the extension
+        # module. Half of tarsk's tree figure is the same pages twice; Celery
+        # forks, so its children share more still and its figure is inflated
+        # further. Pss divides each page by its sharers and is the one that can
+        # honestly be summed.
+        self.peak_total_pss = 0.0
         self.trace: list[tuple[float, int]] = []
 
     def run(self) -> None:
@@ -141,6 +148,10 @@ class Sampler(threading.Thread):
             self.peak_root = max(self.peak_root, root_rss)
             self.peak_worker = max(self.peak_worker, max(per_kid, default=0))
             self.peak_total = max(self.peak_total, total)
+            self.peak_total_pss = max(
+                self.peak_total_pss,
+                sum(smaps(pid, "Pss:") for pid in [self.root, *kids]),
+            )
             self.trace.append((time.time() - origin, max(per_kid, default=root_rss)))
             time.sleep(self.interval)
 
@@ -223,6 +234,7 @@ class Result:
     peak_worker: int = 0    # max(self-reported high-water, /proc sampling)
     peak_sampled: int = 0
     peak_total: int = 0
+    peak_total_pss: float = 0.0
     peak_root: int = 0
     gaps: list[float] = field(default_factory=list)
     note: str = ""
@@ -485,7 +497,8 @@ def run_worker(cmd: list[str], env: dict, expected: int, log: Path, timeout: flo
                     pids=len({row[1] for row in rows}), launches=launches, wall=wall,
                     stalled=stalled,
                     peak_worker=max(self_peak, peaks[0]), peak_sampled=peaks[0],
-                    peak_total=peaks[1], peak_root=peaks[2])
+                    peak_total=peaks[1], peak_root=peaks[2],
+                    peak_total_pss=sampler.peak_total_pss)
     ends = sorted(row[4] for row in rows)
     result.work = (ends[-1] - ends[0]) if len(ends) > 1 else result.wall
     warm = ends[len(ends) // 10 :]  # drop the first 10%: worker startup, not a gap
@@ -532,7 +545,8 @@ def table(title: str, note: str, rows: list[Result], columns: list[str]) -> None
     print(f"\n### {title}\n")
     if note:
         print(note + "\n")
-    header = {"peak": "peak worker RSS", "total": "peak tree RSS", "done": "completed",
+    header = {"peak": "peak worker RSS", "total": "tree Rss", "totalpss": "tree Pss",
+              "done": "completed",
               "lost": "lost", "rate": "tasks/sec", "wall": "wall", "p50gap": "p50 gap",
               "p99gap": "p99 gap", "maxgap": "max gap", "runs": "executions",
               "pids": "worker pids", "launches": "worker restarts", "boot": "startup"}
@@ -545,6 +559,8 @@ def table(title: str, note: str, rows: list[Result], columns: list[str]) -> None
                 cells.append(f"{r.peak_worker / MB:.0f} MB")
             elif column == "total":
                 cells.append(f"{r.peak_total / MB:.0f} MB")
+            elif column == "totalpss":
+                cells.append(f"{r.peak_total_pss / MB:.0f} MB")
             elif column == "done":
                 cells.append(f"{r.completed}/{r.expected}")
             elif column == "lost":
@@ -655,8 +671,13 @@ def scenario_footprint(redis: Redis, tmp: Path) -> None:
     ]
     table("Footprint — RSS after one trivial task",
           "The process that runs user code, from its own ru_maxrss. tarsk children never "
-          "import the broker driver (spec §4.1); Celery and taskiq workers carry theirs.",
-          rows, ["peak", "total"])
+          "import the broker driver (spec §4.1); Celery and taskiq workers carry theirs."
+          "\n\nThe tree column is given as summed Rss and as Pss. Rss counts a shared page "
+          "once per process holding it, so it double-counts libpython and libc across a "
+          "supervisor and its children — and counts far more than twice for a runtime that "
+          "forks. Pss divides each page by its sharers. The Rss figure is the one that "
+          "wandered between runs of this table; Pss did not.",
+          rows, ["peak", "total", "totalpss"])
 
 
 CEILING = 200 * MB

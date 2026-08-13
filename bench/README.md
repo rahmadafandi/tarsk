@@ -120,17 +120,29 @@ this harness now passes it. Anything else would be benchmarking a version mismat
 scenarios on this page never saw it because they preload the queue, so the worker is never idle
 long enough.
 
-### Footprint, after one trivial task### Footprint, after one trivial task
+### Footprint, after one trivial task
 
-| runtime | worker RSS | tree RSS |
-|---|---|---|
-| tarsk | **27 MB** | 52 MB |
-| celery | 49 MB | 104 MB |
-| taskiq | 57 MB | 138 MB |
+| runtime | worker RSS | tree Rss | tree Pss |
+|---|---|---|---|
+| tarsk | **27 MB** | 52 MB | **27 MB** |
+| celery | 49 MB | 104 MB | 69 MB |
+| taskiq | 58 MB | 144 MB | 87 MB |
 
-The tarsk child is CPython plus the user's task module and nothing else — no broker driver,
-no scheduler (spec §4.1). The tree column includes the supervisor / master, and is summed Rss,
-so it double-counts pages shared by forking — see the Pss figures above for how much.
+The tarsk child is CPython plus the user's task module and nothing else — no broker driver, no
+scheduler (spec §4.1). The tree columns include the supervisor / master.
+
+**Read the Pss column.** Summed Rss counts a shared page once per process mapping it, so a
+supervisor and its child double-count libpython, libc and the extension module. Pss divides
+each page by its sharers. The correction favours tarsk — worth saying, because nothing else on
+this page has needed correcting in that direction. Its processes are small, so shared libraries
+are the largest fraction of them: summed Rss inflates tarsk 1.93×, against Celery's 1.51× and
+taskiq's 1.66×.
+
+Rss is also the column that will not hold still — 50, 52, 52 MB across three runs where Pss
+gave 26, 27, 27. An earlier version of this table said 44 MB and I could not account for it.
+Checking out the commit that produced it, rebuilding and measuring again gave the same 51 MB as
+today, so nothing in tarsk had changed between them; how much of libpython happened to be
+resident had. A number that moves with the page cache should not have been the headline.
 
 **This table said 16 MB for tarsk until it was measured properly.** A child that runs one
 trivial task lives about a second, and the sampler took the largest of a handful of 50ms reads

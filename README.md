@@ -92,9 +92,9 @@ their RSS, retires them, holds their leases and runs the schedule. A memory ceil
 held by something that does not have the problem — which is also why Celery could not enforce
 one from a master carrying 77 MB of your dependencies.
 
-Draining 10,000 no-op tasks across four worker processes, all three against the same Redis and
-the same at-least-once guarantee, startup excluded: Celery 5.2s, taskiq 1.4s, tarsk 1.2s. At a
-thousand tasks taskiq is the faster one. Full tables, including where that flips and why, in
+Draining 10,000 no-op tasks across four worker processes, same Redis and same at-least-once
+guarantee, startup excluded: Celery 5.3s, taskiq 1.56s, tarsk 1.55s. tarsk and taskiq are a
+tie — the spread within either is wider than the gap between them. Full tables in
 [`bench/`](bench/README.md).
 
 ## What it does not claim

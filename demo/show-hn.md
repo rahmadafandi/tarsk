@@ -114,8 +114,8 @@ workload changes between columns.
 | taskiq | 2,793/s | 19/s | 0.47s |
 | tarsk | 2,748/s | 19/s | 0.18s |
 
-Draining a 10,000-task queue across four processes, same guarantee for both: taskiq 1.44s,
-tarsk 1.15s. At a thousand tasks taskiq wins instead, 0.17s to 0.44s.
+Draining a 10,000-task queue across four processes, same guarantee for both: taskiq 1.56s,
+tarsk 1.55s — a tie, with the spread inside either wider than the gap. Celery takes 5.3s.
 
 All three read the same Redis. The 50 ms row is the one that matters, and all three are the
 same number.

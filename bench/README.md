@@ -209,29 +209,41 @@ with startup pulled out of the figure rather than folded into it.
 
 | runtime | 10 | 100 | 1,000 | 10,000 | startup |
 |---|---|---|---|---|---|
-| celery | 0.005 | 0.056 | 0.534 | 5.233 | 0.37 s |
-| taskiq (list, no ack) | 0.002 | 0.012 | 0.095 | 1.017 | 0.48 s |
-| taskiq (streams, acked) | 0.009 | 0.047 | **0.167** | 1.439 | 0.55 s |
-| tarsk (streams, acked) | 0.003 | 0.016 | 0.443 | **1.154** | 0.18 s |
+| celery | 0.005 | 0.053 | 0.559 | 5.317 | 0.36 s |
+| taskiq (list, no ack) | 0.003 | 0.012 | 0.094 | 1.455 | 0.47 s |
+| taskiq (streams, acked) | 0.007 | 0.072 | 0.176 | 1.564 | 0.55 s |
+| tarsk (streams, acked) | 0.004 | 0.016 | 0.184 | 1.551 | 0.15 s |
 
-Median seconds from first completion to last. The two `streams, acked` rows are the
-like-for-like pair: same guarantee, same process count, same handler. tarsk leads at ten
-thousand and trails at one thousand — batching a claim per child pays once there is a steady
-queue to batch from, and costs a little when there is not.
+Median seconds from first completion to last, five runs a cell.
 
-**Acking is not what separates them.** It costs taskiq about 40% by itself (1.02s on its
-default list broker against 1.44s on streams), and tarsk pays that too. What tarsk pays on top
-is a Unix socket round trip per task, because the handler runs in a child the supervisor can
-meter and replace. That is the design, not an overhead waiting to be removed.
+The two `streams, acked` rows are the like-for-like pair — same guarantee, same process count,
+same handler — and **they are a tie**. The spread inside a single cell is wider than the gap
+between them: tarsk's five runs at ten thousand span 1.20–1.75s, taskiq's list broker spans
+1.22–1.51s. An earlier version of this page read an ordering out of one set of five runs and
+said tarsk led at ten thousand and trailed at one thousand. Seven independent runs put the
+winner on either side depending on the run. Celery is the only clear result here, at roughly
+three times the other two.
+
+**Acking is not what separates them.** It costs taskiq about 50% on its own — 1.46s on its
+default list broker against 1.56s on streams at ten thousand, and 0.09s against 0.18s at one
+thousand — and tarsk pays that too. What tarsk pays on top is a Unix socket round trip per
+task, because the handler runs in a child the supervisor can meter and replace. That is the
+design, not an overhead waiting to be removed.
 
 taskiq's default `ListQueueBroker` is `BRPOP` with no acknowledgement — at-most-once, and a
-killed worker loses what it held. Comparing it to an acked broker compares different promises,
-which is why both of its rows are here.
+killed worker loses what it held. Comparing it against an acked broker compares different
+promises, which is why both of its rows are here.
 
 What is held equal is **processes, not concurrency**. taskiq can await thousands of tasks
 inside one process and would pull away on anything I/O-bound; tarsk runs one task per child and
 cannot. That is a real limit rather than a benchmark choice — see the one-slot note in
 `tarsk/_child.py` — and a no-op handler is precisely the case that hides it.
+
+**The harness was on the scale.** These figures come from runs with RSS sampling switched off.
+Walking `/proc` for a whole process tree twenty times a second is affordable when RSS is the
+measurement and a thumb on the scale when speed is — and it costs more for a runtime with more
+processes, which taskiq has. With sampling on, tarsk's thousand-task cell read 0.44s instead of
+0.18s.
 
 #### How big a batch
 

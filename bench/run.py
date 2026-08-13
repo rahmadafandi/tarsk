@@ -336,7 +336,8 @@ def submit_taskiq(task: str, count: int, args: list,
 
 def run_worker(cmd: list[str], env: dict, expected: int, log: Path, timeout: float,
                memory_max: str | None = None, restarts: int = 0,
-               stall_after: float = 15.0, startup_grace: float = 90.0) -> Result:
+               stall_after: float = 15.0, startup_grace: float = 90.0,
+               sample: bool = True) -> Result:
     """Run the worker until it finishes or stops making progress.
 
     `restarts` stands in for the orchestrator: Kubernetes restarts a pod its OOM
@@ -355,6 +356,11 @@ def run_worker(cmd: list[str], env: dict, expected: int, log: Path, timeout: flo
     `startup_grace` applies instead. Conflating the two makes every slow-booting
     runtime look like it lost all its work — Celery needs seconds to come up,
     and the first version of this check reported 0/30 for it.
+
+    `sample=False` turns off the RSS sampler, which walks /proc for the whole
+    process tree twenty times a second. That is affordable when RSS is the
+    measurement and a thumb on the scale when speed is: it costs more for a
+    runtime with more processes, and taskiq runs seven where tarsk runs five.
     """
     if memory_max:
         cmd = ["systemd-run", "--user", "--scope", "-q", "-p", f"MemoryMax={memory_max}",
@@ -391,7 +397,8 @@ def run_worker(cmd: list[str], env: dict, expected: int, log: Path, timeout: flo
         proc = subprocess.Popen(cmd, env=env, stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL)
         sampler = Sampler(proc.pid)
-        sampler.start()
+        if sample:
+            sampler.start()
         while time.time() < deadline:
             done = progress()
             if done > settled:
@@ -406,7 +413,8 @@ def run_worker(cmd: list[str], env: dict, expected: int, log: Path, timeout: flo
                 break
             time.sleep(0.05)
         sampler.stop.set()
-        sampler.join()
+        if sample:
+            sampler.join()
         peaks = [max(peaks[0], sampler.peak_worker), max(peaks[1], sampler.peak_total),
                  max(peaks[2], sampler.peak_root)]
         kill_tree(proc.pid)
@@ -438,7 +446,7 @@ def run_worker(cmd: list[str], env: dict, expected: int, log: Path, timeout: flo
 def case(framework: str, label: str, task: str, count: int, args: list, timeout: float,
          redis: Redis, tmp: Path, *, celery_mtpc=None, tarsk_kw=None, memory_max=None,
          extra_env=None, restarts=0, celery_workers=1, taskiq_workers=1,
-         taskiq_module="bench.taskiq_app") -> Result:
+         taskiq_module="bench.taskiq_app", sample=True) -> Result:
     log = tmp / f"{framework}-{label}-{task}.log".replace(" ", "_")
     log.unlink(missing_ok=True)
     log.touch()
@@ -459,7 +467,7 @@ def case(framework: str, label: str, task: str, count: int, args: list, timeout:
             submit_taskiq(task, count, args, taskiq_module)
             cmd = taskiq_cmd(taskiq_workers, taskiq_module)
 
-    result = run_worker(cmd, env, count, log, timeout, memory_max, restarts)
+    result = run_worker(cmd, env, count, log, timeout, memory_max, restarts, sample=sample)
     result.framework, result.label = framework, label
     return result
 
@@ -722,7 +730,7 @@ def scenario_scale(redis: Redis, tmp: Path) -> None:
             for _ in range(repeats):
                 framework = name.split()[0]
                 result = case(framework, f"scale-{count}", "noop", count, [], 300,
-                              redis, tmp, **kwargs)
+                              redis, tmp, sample=False, **kwargs)
                 if result.completed < count:
                     works.append(float("nan"))
                     continue
@@ -735,15 +743,16 @@ def scenario_scale(redis: Redis, tmp: Path) -> None:
             print(f"| {name} | {count:,} | {good[0]:.3f} | {statistics.median(good):.3f} | "
                   f"{quantile(good, 0.9):.3f} | {good[-1]:.3f} | "
                   f"{statistics.median(boots):.2f} |")
-    print("\nRead the two `streams, acked` rows against each other: same guarantee, same "
-          "number of\nprocesses, same handler. tarsk is ahead at ten thousand tasks and "
-          "behind at one\nthousand — batching a claim per child pays off once there is a "
-          "steady queue to batch\nfrom, and costs a little when the queue is short.\n")
-    print("Acking is not the difference: it costs taskiq about 40% here (1.0s on its "
-          "default\nlist broker against 1.4s on streams), and tarsk pays that too. What "
-          "tarsk pays on top\nis a Unix socket round trip per task, because the handler "
-          "runs in a child the\nsupervisor can meter and replace. That is the design, not "
-          "an overhead to remove.\n")
+    print("\nThe two `streams, acked` rows are the like-for-like pair: same guarantee, same "
+          "process\ncount, same handler. **They are a tie, and the spread inside each cell "
+          "is wider than\nthe distance between them.** An earlier version of this table "
+          "read an ordering out of\nfive runs; seven independent ones put the winner on "
+          "either side depending on the run.\nCelery is the only clear result here, at "
+          "roughly three times the other two.\n")
+    print("Acking costs taskiq about 50% by itself (its list broker against its stream "
+          "broker),\nand tarsk pays that too. What tarsk pays on top is a Unix socket "
+          "round trip per task,\nbecause the handler runs in a child the supervisor can "
+          "meter and replace — the design,\nnot an overhead waiting to be removed.\n")
     print("What is held equal is processes, not concurrency. taskiq can await thousands of "
           "tasks\ninside one process and would pull away on anything I/O-bound; tarsk runs "
           "one task per\nchild and cannot. That is a real limit, not a benchmark choice, "

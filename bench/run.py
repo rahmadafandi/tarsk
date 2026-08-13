@@ -48,6 +48,9 @@ REDIS_PORT = 0  # assigned when the harness starts its own
 REDIS_URL = EXTERNAL_REDIS or ""
 PAGE = os.sysconf("SC_PAGE_SIZE")
 MB = 1024 * 1024
+# Read the shipped default rather than restating it: this file has already
+# printed "the default eight" twice after the default stopped being eight.
+from tarsk._cli import DEFAULT_SLOTS  # noqa: E402
 
 # --------------------------------------------------------------- proc utils
 
@@ -724,17 +727,17 @@ def scenario_memory(redis: Redis, tmp: Path) -> None:
              celery_mtpc=MTPC),
         case("tarsk", "--max-rss=200MB --slots 1", "leak", count, [leak], 300, redis, tmp,
              tarsk_kw={"max_rss": CEILING, "slots": 1}),
-        case("tarsk", "--max-rss=200MB (default 100 slots)", "leak", count, [leak], 300,
-             redis, tmp, tarsk_kw={"max_rss": CEILING, "slots": 100}),
+        case("tarsk", f"--max-rss=200MB (default {DEFAULT_SLOTS} slots)", "leak", count,
+             [leak], 300, redis, tmp, tarsk_kw={"max_rss": CEILING, "slots": DEFAULT_SLOTS}),
     ]
     table(f"Bounded memory — {count} tasks, each retaining {leak}MB",
           f"Both limits aim at the same ~200MB budget: `--max-tasks-per-child={MTPC}` was "
           "chosen by dividing that budget by this workload's known leak rate. Celery bounds "
           "it tighter here, and that is the fair result to report — when you know the leak "
           "per task, counting tasks works.\n\nThe two tarsk rows are the same ceiling at "
-          "one slot and at the default eight. A slot is a task that can be allocating when "
-          "the ceiling is read, so the gap between those rows is what the default costs on "
-          "a workload that allocates.", rows, ["peak", "done", "lost"])
+          f"one slot and at the default {DEFAULT_SLOTS}. A slot is a task that can be "
+          "allocating when the ceiling is read, so the gap between those rows is what the "
+          "default costs on a workload that allocates.", rows, ["peak", "done", "lost"])
 
 
 def scenario_memory_workload_shift(redis: Redis, tmp: Path) -> None:
@@ -927,10 +930,11 @@ def scenario_defaults(redis: Redis, tmp: Path) -> None:
     count = 2_000
     repeats = int(os.environ.get("BENCH_REPEAT", "3"))
     runtimes = {
-        "celery (-c = cores, 16 here)": dict(celery_workers=None),
-        "taskiq (2 workers × 100)": dict(taskiq_workers=None,
+        f"celery (-c = cores, {os.cpu_count()} here)": dict(celery_workers=None),
+        "taskiq (2 workers x 100)": dict(taskiq_workers=None,
                                          taskiq_module="bench.taskiq_stream_app"),
-        "tarsk (2 children × 100 slots)": dict(tarsk_kw={"children": None, "slots": None}),
+        f"tarsk (2 children x {DEFAULT_SLOTS} slots)":
+            dict(tarsk_kw={"children": None, "slots": None}),
     }
     print(f"\n### Out of the box — {count} tasks that each await 100ms\n")
     print("No `-c`, no `--workers`, no `--children`, no `--slots`: whatever each runtime "

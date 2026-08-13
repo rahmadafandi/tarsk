@@ -1628,6 +1628,10 @@ fn work(
     Ok(stats)
 }
 
+/// One parked failure crossing into Python: id, name, error, traceback, and
+/// when it died in milliseconds since the epoch.
+type DeadRow = (String, String, String, String, u64);
+
 /// Producer handle. Holds its own runtime and connection so enqueueing from a
 /// web request is one round trip, not a reconnect.
 #[pyclass]
@@ -1687,14 +1691,9 @@ impl Producer {
         }
     }
 
-    /// Parked failures, oldest first: (id, name, error, traceback, died_at_ms).
+    /// Parked failures, oldest first.
     #[pyo3(signature = (queue="default", limit=50))]
-    fn dead_list(
-        &self,
-        py: Python<'_>,
-        queue: &str,
-        limit: usize,
-    ) -> PyResult<Vec<(String, String, String, String, u64)>> {
+    fn dead_list(&self, py: Python<'_>, queue: &str, limit: usize) -> PyResult<Vec<DeadRow>> {
         let found = py
             .detach(|| self.runtime.block_on(self.broker.dead_list(queue, limit)))
             .map_err(|e| PyValueError::new_err(e.to_string()))?;

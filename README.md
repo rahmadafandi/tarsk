@@ -95,7 +95,7 @@ one from a master carrying 77 MB of your dependencies.
 ## What it does not claim
 
 **Not faster.** Dispatch costs microseconds; real handlers run for 50ms to minutes. With a 50ms
-handler tarsk, Celery and taskiq all reach 18–19 tasks/s — identical, as they should be. Anyone
+handler tarsk, Celery and taskiq all reach 19–20 tasks/s — identical, as they should be. Anyone
 selling a task queue on throughput benchmarks is selling the wrong thing.
 
 **Not a hard ceiling regardless of task size.** The ceiling is read while a child is idle, so a

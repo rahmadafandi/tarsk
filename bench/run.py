@@ -216,6 +216,7 @@ class Result:
     runs: int = 0           # executions, including re-runs after a kill
     pids: int = 0           # distinct worker processes that ran a task
     stalled: bool = False   # stopped because nothing new completed, not on a deadline
+    work: float = 0.0       # first completion to last: the part that is not startup
     launches: int = 1       # times the worker had to be (re)started from outside
     wall: float = 0.0
     peak_worker: int = 0    # max(self-reported high-water, /proc sampling)
@@ -231,7 +232,18 @@ class Result:
 
     @property
     def rate(self) -> float:
-        return self.completed / self.wall if self.wall else 0.0
+        """Tasks per second over the work itself, startup excluded.
+
+        Measuring from process launch instead makes this mostly a boot-time
+        comparison: on 500 no-ops, startup was 51% of Celery's figure, 59% of
+        tarsk's and 77% of taskiq's. Worth knowing — and worth reporting in its
+        own column rather than folded into one labelled throughput.
+        """
+        return self.completed / self.work if self.work else 0.0
+
+    @property
+    def boot(self) -> float:
+        return max(0.0, self.wall - self.work)
 
 
 def read_log(path: Path) -> list[tuple[int, int, int, float, float]]:
@@ -375,6 +387,7 @@ def run_worker(cmd: list[str], env: dict, expected: int, log: Path, timeout: flo
                     peak_worker=max(self_peak, peaks[0]), peak_sampled=peaks[0],
                     peak_total=peaks[1], peak_root=peaks[2])
     ends = sorted(row[4] for row in rows)
+    result.work = (ends[-1] - ends[0]) if len(ends) > 1 else result.wall
     warm = ends[len(ends) // 10 :]  # drop the first 10%: worker startup, not a gap
     result.gaps = [b - a for a, b in zip(warm, warm[1:])]
     return result
@@ -417,7 +430,7 @@ def table(title: str, note: str, rows: list[Result], columns: list[str]) -> None
     header = {"peak": "peak worker RSS", "total": "peak tree RSS", "done": "completed",
               "lost": "lost", "rate": "tasks/sec", "wall": "wall", "p50gap": "p50 gap",
               "p99gap": "p99 gap", "maxgap": "max gap", "runs": "executions",
-              "pids": "worker pids", "launches": "worker restarts"}
+              "pids": "worker pids", "launches": "worker restarts", "boot": "startup"}
     print("| runtime | " + " | ".join(header[c] for c in columns) + " |")
     print("|---" * (len(columns) + 1) + "|")
     for r in rows:
@@ -440,7 +453,9 @@ def table(title: str, note: str, rows: list[Result], columns: list[str]) -> None
             elif column == "rate":
                 cells.append(f"{r.rate:.0f}")
             elif column == "wall":
-                cells.append(f"{r.wall:.1f}s")
+                cells.append(f"{r.work:.2f}s")
+            elif column == "boot":
+                cells.append(f"{r.boot:.2f}s")
             elif column == "p50gap":
                 cells.append(f"{statistics.median(r.gaps) * 1000:.1f} ms" if r.gaps else "—")
             elif column == "p99gap":
@@ -643,8 +658,11 @@ def scenario_throughput(redis: Redis, tmp: Path) -> None:
     table("Throughput — single worker, concurrency 1",
           "Not a claim (spec §2, §5). tarsk has no broker yet, so its rows skip a hop "
           "the others pay: treat them as an upper bound, not a win. The 50ms rows are "
-          "the point — with a realistic handler the runtimes converge.",
-          rows, ["rate", "wall", "done"])
+          "the point — with a realistic handler the runtimes converge.\n\n"
+          "Rate and wall cover first completion to last. Startup is its own column "
+          "because folding it in would make the short rows a boot-time contest: it was "
+          "half to three quarters of the old figures.",
+          rows, ["rate", "wall", "boot", "done"])
 
 
 SCENARIOS = {

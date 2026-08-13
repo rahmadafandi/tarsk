@@ -32,7 +32,7 @@ against a 400 MB ceiling, zero tasks lost, nothing killed. The trough held at 27
 over the first half hour and 28.1 MB over the second, so nothing survives a recycle.
 
 What it does not claim: it is not faster. With a 50 ms handler, Tarsk, Celery and
-taskiq all reach 18-19 tasks/s -- identical, as they should be. Dispatch costs
+taskiq all reach 19-20 tasks/s -- identical, as they should be. Dispatch costs
 microseconds and real handlers do not. Nor is the ceiling absolute: it is read while
 a child is idle, so a child never starts a task it cannot afford, but a handler that
 allocates 300 MB will allocate it. Overshoot is one task's peak, not zero. A ceiling
@@ -107,11 +107,11 @@ workload changes between columns.
 
 **Throughput**, single worker, concurrency 1. Reported to be honest about it, not as a claim.
 
-| runtime | no-op handler | 50 ms handler |
-|---|---|---|
-| celery | 359/s | 18/s |
-| taskiq | 445/s | 18/s |
-| tarsk | 850/s *(no broker yet)* | 19/s |
+| runtime | no-op handler | 50 ms handler | startup |
+|---|---|---|---|
+| celery | 1,773/s | 20/s | 0.30s |
+| taskiq | 2,571/s | 19/s | 0.45s |
+| tarsk | 6,138/s *(no broker yet)* | 20/s | 0.16s |
 
 The no-op row for tarsk is not a comparison: it has no broker to talk to yet, so it skips a hop
 the others pay. The 50 ms row is the one that matters, and all three are the same number.
@@ -133,7 +133,7 @@ seconds of dead air.
 
 **Your throughput numbers are missing the broker.**
 They are, and the post says so. Redis Streams and Postgres drivers exist; the benchmark harness
-still feeds tarsk from memory, so treat 850/s as an upper bound rather than a result. It
+still feeds tarsk from memory, so treat 6,138/s as an upper bound rather than a result. It
 changes nothing above 50 ms, which is where handlers live.
 
 **A ceiling that can be exceeded isn't a ceiling.**

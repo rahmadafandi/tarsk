@@ -200,11 +200,18 @@ rather than assertable.
 
 ### Throughput, single worker
 
-| runtime | noop | 50ms handler |
-|---|---|---|
-| celery | 359/s | 18/s |
-| taskiq | 445/s | 18/s |
-| tarsk | 850/s (no broker yet) | 19/s |
+| runtime | tasks/sec | wall | startup | 
+|---|---|---|---|
+| celery | 1,773/s | 0.28s | 0.30s |
+| taskiq | 2,571/s | 0.19s | 0.45s |
+| tarsk | 6,138/s *(no broker yet)* | 0.08s | 0.16s |
+
+With a 50 ms handler all three land on 19–20/s, which is the row that matters.
+
+Rate and wall cover first completion to last; **startup is separate on purpose**. Folding it in
+turns a 500-task row into a boot-time contest — it was 51% of Celery's old figure, 59% of
+tarsk's and 77% of taskiq's, which is why the previous version of this table read 359 / 445 /
+850. Worth reporting, not worth hiding inside a number labelled throughput.
 
 The noop row for tarsk is not a comparison: it has no broker to talk to yet. The 50ms row is
 the one that matters, and all three are identical — which is exactly what spec §2 predicts.

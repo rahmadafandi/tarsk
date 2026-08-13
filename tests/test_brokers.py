@@ -253,6 +253,33 @@ def check_broker(url: str, label: str) -> None:
             raise AssertionError(f"{label}: a failed task must raise, not return")
         # note has no result_ttl, so nothing was written for it
         assert app.result(forgotten_id).ready() is False, f"{label}: stored an unasked result"
+
+        # The async pair has to leave the event loop free, which is the whole
+        # reason it exists — so count how often a neighbouring coroutine got to
+        # run while the enqueue and the wait were in flight. If either blocked,
+        # the counter barely moves.
+        import asyncio
+
+        async def check_async_path():
+            ticks = 0
+            stop = asyncio.Event()
+
+            async def ticker():
+                nonlocal ticks
+                while not stop.is_set():
+                    ticks += 1
+                    await asyncio.sleep(0.001)
+
+            spin = asyncio.create_task(ticker())
+            job = await app.registry["answers"].send_async(4, 5)
+            answer = await app.result(job).get_async(timeout=60)
+            stop.set()
+            await spin
+            return answer, ticks
+
+        answer, ticks = asyncio.run(check_async_path())
+        assert answer == {"sum": 9, "pid": ANY_PID}, f"{label}: {answer}"
+        assert ticks > 20, f"{label}: the loop only ran {ticks} times — something blocked it"
         stop_worker(worker)
 
         # --- per-call overrides: a different queue, an absolute time ----

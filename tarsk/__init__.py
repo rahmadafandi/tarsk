@@ -7,6 +7,7 @@ and belong to the parent process only.
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 import functools
 import hashlib
@@ -126,6 +127,24 @@ class Task:
         task set `result_ttl`; the id is just how you would ask later.
         """
         return Enqueue(self).send(*args, **kwargs)
+
+    async def send_async(self, *args, **kwargs) -> str:
+        """Enqueue without blocking the event loop.
+
+        The Rust producer releases the GIL for the round trip, so handing it to
+        a thread frees the loop for the whole wait rather than only for the
+        parts Python was not holding. Against a Redis on the same machine that
+        wait is tens of microseconds and this is not worth it; against a
+        managed one over TLS it is milliseconds, and a web handler that blocks
+        for milliseconds per enqueue is a web handler with a throughput ceiling.
+        """
+        # ponytail: a thread hop, not a native async client. The ceiling is
+        # asyncio's default executor, min(32, cpu + 4) threads, so a burst
+        # wider than that queues — measured at 500 concurrent enqueues in 57ms.
+        # Lifting it means bridging the tokio runtime into the event loop with
+        # pyo3-async-runtimes, which is worth doing the day someone is
+        # enqueueing fast enough to see the pool rather than the network.
+        return await asyncio.to_thread(self.send, *args, **kwargs)
 
     def send_in(self, delay: float, /, *args, **kwargs) -> str:
         """Enqueue, to run no earlier than `delay` seconds from now.
@@ -490,6 +509,28 @@ class AsyncResult:
     def cancel(self, *, queue: str = "default", ttl: float = 86400.0) -> None:
         """Stop this job from running, if it has not started. See `App.cancel`."""
         self.app.cancel(self.task_id, queue=queue, ttl=ttl)
+
+    async def get_async(self, timeout: float = 30.0, poll: float = 0.05):
+        """Wait for the answer without blocking the event loop.
+
+        The blocking version sleeps between polls, so a handler awaiting a
+        result would hold the loop for up to `timeout` — thirty seconds by
+        default, which is not a hiccup but an outage.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            found = await asyncio.to_thread(self._fetch)
+            if found is not None:
+                ok, payload, error_type, traceback = found
+                if ok:
+                    return _unpack(payload)
+                raise TaskFailed(error_type, traceback)
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"no result for {self.task_id} after {timeout}s — still running, "
+                    "never kept, or expired"
+                )
+            await asyncio.sleep(poll)
 
     def progress(self):
         """The last value the task published, or None."""

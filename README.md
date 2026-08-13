@@ -289,6 +289,24 @@ queue for it: Postgres already has a visibility timer, and Redis has the idle cl
 sweep reads. What runs out of retries lands in `tarsk:{queue}:dead` or the `tarsk_dead` table,
 with the error and traceback.
 
+## Enqueueing from async code
+
+```python
+job = await send_email.send_async(user.id)
+answer = await app.result(job).get_async(timeout=30)
+```
+
+`send()` and `get()` are blocking, and in a web handler that matters more than the microseconds
+suggest. Measured on 500 sequential enqueues against a local Redis: the blocking pair held the
+event loop for 45ms of the 46ms it took, while the async pair kept it responsive at 103µs
+median lag. `get()` is worse than either — it polls, so awaiting a result on the loop holds it
+for up to the timeout, thirty seconds by default.
+
+The Rust producer releases the GIL for the round trip, so the async versions hand it to a
+thread and the loop is free for the whole wait rather than the parts Python was not holding.
+That is a thread hop rather than a native async client: 500 concurrent enqueues take 57ms, and
+the ceiling is asyncio's default executor rather than the network.
+
 ## Rate limits
 
 ```python

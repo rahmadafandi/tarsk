@@ -151,6 +151,20 @@ impl Broker {
         }
     }
 
+    /// Take one token for `task`, or say how long to wait in milliseconds.
+    ///
+    /// The counter lives in the broker because a per-worker limit is not a
+    /// limit: three workers each allowing ten a second is thirty a second at
+    /// the API you were protecting. This is the reason to pay a round trip
+    /// here, and only tasks that asked for a limit pay it.
+    pub async fn take_token(&self, task: &str, per_sec: f64, burst: u32) -> Res<u64> {
+        match self {
+            Broker::Memory(b) => Ok(b.take_token(task, per_sec, burst)),
+            Broker::Redis(b) => b.take_token(task, per_sec, burst).await,
+            Broker::Postgres(b) => b.take_token(task, per_sec, burst).await,
+        }
+    }
+
     /// Mark a job id as cancelled for `ttl_ms`, so it is never dispatched.
     ///
     /// The TTL has to outlive the job it is cancelling: a delayed task due next
@@ -313,9 +327,26 @@ pub struct MemoryBroker {
     results: Mutex<HashMap<String, (Vec<u8>, std::time::Instant)>>,
     ticks: Mutex<std::collections::HashSet<(String, i64)>>,
     revoked: Mutex<HashMap<String, std::time::Instant>>,
+    buckets: Mutex<HashMap<String, (f64, std::time::Instant)>>,
 }
 
 impl MemoryBroker {
+    fn take_token(&self, task: &str, per_sec: f64, burst: u32) -> u64 {
+        let now = std::time::Instant::now();
+        let mut buckets = self.buckets.lock().unwrap();
+        let (tokens, seen) = buckets
+            .entry(task.to_string())
+            .or_insert((burst as f64, now));
+        *tokens = (*tokens + seen.elapsed().as_secs_f64() * per_sec).min(burst as f64);
+        *seen = now;
+        if *tokens >= 1.0 {
+            *tokens -= 1.0;
+            0
+        } else {
+            (((1.0 - *tokens) / per_sec) * 1000.0).ceil() as u64
+        }
+    }
+
     fn revoke(&self, id: &str, ttl_ms: u64) -> Res<()> {
         let until = std::time::Instant::now() + Duration::from_millis(ttl_ms);
         self.revoked.lock().unwrap().insert(id.to_string(), until);
@@ -407,6 +438,14 @@ pub struct RedisBroker {
     /// from every child queue behind one lock on a single-threaded runtime,
     /// which is a bottleneck this driver invented for itself.
     conn: redis::aio::MultiplexedConnection,
+    /// Only for `XREADGROUP … BLOCK`, and never shared with anything else.
+    ///
+    /// A blocking command on a multiplexed connection holds up every command
+    /// multiplexed onto it, because there is one socket and the server answers
+    /// in order. With children waiting for work, that put the reclaim sweep,
+    /// the acks and the rate-limit script behind a 250ms wait each time — the
+    /// sweep was timing out and requeued jobs were never coming back.
+    blocking: redis::aio::MultiplexedConnection,
     consumer: String,
     queues: Vec<String>,
     /// Shortest timeout registered anywhere, the floor for the pending sweep.
@@ -496,6 +535,7 @@ impl RedisBroker {
     async fn connect(url: &str, queues: Vec<String>) -> Res<RedisBroker> {
         let client = redis::Client::open(url)?;
         let mut conn = client.get_multiplexed_async_connection().await?;
+        let blocking = client.get_multiplexed_async_connection().await?;
         for queue in &queues {
             // MKSTREAM so producers and consumers can start in either order;
             // from 0 so messages published before the group existed are seen.
@@ -515,6 +555,7 @@ impl RedisBroker {
         }
         Ok(RedisBroker {
             conn,
+            blocking,
             consumer: format!("tarsk-{}", std::process::id()),
             queues,
             min_timeout_ms: AtomicU64::new(u64::MAX),
@@ -652,7 +693,7 @@ impl RedisBroker {
             }
         }
         let batch = self.prefetch.load(Ordering::Relaxed).max(1);
-        let mut conn = self.conn.clone();
+        let mut conn = self.blocking.clone();
         let mut cmd = redis::cmd("XREADGROUP");
         cmd.arg("GROUP")
             .arg(REDIS_GROUP)
@@ -785,6 +826,39 @@ impl RedisBroker {
             .query_async(&mut conn)
             .await?;
         Ok(())
+    }
+
+    async fn take_token(&self, task: &str, per_sec: f64, burst: u32) -> Res<u64> {
+        // Read-refill-write has to be one step or two workers both see the last
+        // token. Lua is the only thing Redis offers that is; MULTI would not
+        // help, since the decision depends on what the read returned.
+        let script = redis::Script::new(
+            r"local tokens = tonumber(redis.call('HGET', KEYS[1], 't'))
+              local seen   = tonumber(redis.call('HGET', KEYS[1], 's'))
+              local rate, burst, now = tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3])
+              if tokens == nil then tokens = burst; seen = now end
+              tokens = math.min(burst, tokens + math.max(0, now - seen) * rate / 1000)
+              local wait = 0
+              if tokens >= 1 then
+                tokens = tokens - 1
+              else
+                wait = math.ceil((1 - tokens) * 1000 / rate)
+              end
+              redis.call('HSET', KEYS[1], 't', tokens, 's', now)
+              -- Long enough to refill from empty; a bucket nobody touches for
+              -- that long is indistinguishable from a fresh one.
+              redis.call('PEXPIRE', KEYS[1], math.ceil(burst * 1000 / rate) + 1000)
+              return wait",
+        );
+        let mut conn = self.conn.clone();
+        let wait: i64 = script
+            .key(format!("tarsk:rate:{task}"))
+            .arg(per_sec)
+            .arg(burst)
+            .arg(now_ms())
+            .invoke_async(&mut conn)
+            .await?;
+        Ok(wait.max(0) as u64)
     }
 
     async fn revoke(&self, queue: &str, id: &str, ttl_ms: u64) -> Res<()> {
@@ -1091,6 +1165,11 @@ create table if not exists tarsk_dead (
 -- back. Nothing noticed, because nothing read them: a store you can only write
 -- to cannot tell you it is missing a column. Added separately from the CREATE
 -- so a table made by an earlier version gains them too.
+create table if not exists tarsk_buckets (
+    task   text             primary key,
+    tokens double precision not null,
+    seen   timestamptz      not null
+);
 create table if not exists tarsk_revoked (
     id         text        primary key,
     queue      text        not null,
@@ -1281,6 +1360,41 @@ impl PgBroker {
     }
 
     /// One statement, so the row cannot be in both tables or neither.
+    async fn take_token(&self, task: &str, per_sec: f64, burst: u32) -> Res<u64> {
+        // One statement, so a refill and a take cannot be split by another
+        // worker. `refill` reads the row inside the same statement that
+        // rewrites it, and reports the level *before* the take, which is the
+        // only number that says whether there was a token to take.
+        let row = self
+            .client
+            .query_one(
+                "with refill as (
+                     select least($2::float8,
+                                  coalesce(b.tokens, $2::float8)
+                                  + extract(epoch from now() - coalesce(b.seen, now())) * $3
+                            ) as level
+                       from (select 1) one
+                       left join tarsk_buckets b on b.task = $1
+                 ), taken as (
+                     insert into tarsk_buckets (task, tokens, seen)
+                     select $1, case when level >= 1 then level - 1 else level end, now()
+                       from refill
+                     on conflict (task) do update
+                        set tokens = excluded.tokens, seen = excluded.seen
+                     returning 1
+                 )
+                 select level from refill, taken",
+                &[&task, &(burst as f64), &per_sec],
+            )
+            .await?;
+        let level: f64 = row.get(0);
+        if level >= 1.0 {
+            Ok(0)
+        } else {
+            Ok(((1.0 - level) / per_sec * 1000.0).ceil() as u64)
+        }
+    }
+
     async fn revoke(&self, queue: &str, id: &str, ttl_ms: u64) -> Res<()> {
         self.client
             .execute(

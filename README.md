@@ -74,7 +74,7 @@ trigger fires, so the slot never goes empty:
 | taskiq (no recycling at all) | 6.1 ms | 7 ms | 7 ms |
 
 And the worker that runs your code is smaller, because it imports your tasks and nothing else —
-no broker driver, no scheduler: 27 MB against Celery's 49 MB and taskiq's 57 MB.
+no broker driver, no scheduler: 27 MB against Celery's 49 MB and taskiq's 58 MB.
 
 Your imports land in one process here, and the supervisor is not it:
 
@@ -144,11 +144,16 @@ this project claims it. At one slot the ceiling is read while the child has noth
 overshoot is bounded by a single task's peak. At 64 it is bounded by whatever 64 tasks are
 holding, and a hard kill takes all 64 down together.
 
-**The default is 8 slots**, whatever else is set. One flag quietly changing another flag's
-default is worse than either number being wrong, and a default that needs a line of runtime
-output to explain itself is the wrong default. What the worker does print, when `--max-rss` and
-several slots are both in play, is what that combination means: the ceiling still fires, but
-several tasks are running when it does, so overshoot is their peak rather than one task's.
+**The default is 100 slots**, whatever else is set — taskiq's number, and tarsk is tuned out
+of the box for handlers that wait. 2,000 awaiting tasks with no flags at all drain in 0.98s on
+78MB, against taskiq's 1.36s on 210MB. The same default lets 40 tasks leaking 20MB each reach
+826MB under a `--max-rss=200MB` ceiling, where `--slots 1` holds them to 205MB: a hundred slots
+hands a child a hundred tasks before any of them has allocated anything, so the ceiling is
+first read long after the damage. **If your handlers allocate, set `--slots 1`.** One flag quietly changing another flag's default is worse
+than either number being wrong, so `--max-rss` does not move this one. What the worker does
+print, when a ceiling and several slots are both in play, is what that combination means: the
+ceiling still fires, but several tasks are running when it does, so overshoot is their peak
+rather than one task's.
 
 Raise it for handlers that *wait* and allocate little; set it to 1 for handlers that allocate,
 which is the case the ceiling exists for. For a mix, run one worker per queue rather than

@@ -181,6 +181,7 @@ struct Counters {
     kills: AtomicU64,
     hard_killed: AtomicU64,
     retried: AtomicU64,
+    rate_limited: AtomicU64,
     dead_lettered: AtomicU64,
     cron_fired: AtomicU64,
     broker_errors: AtomicU64,
@@ -478,6 +479,10 @@ struct Spec {
     queue: String,
     /// Five-field cron, empty when the task is only ever sent by hand.
     cron: String,
+    /// Tokens per second and bucket depth. Zero rate means no limit, and no
+    /// broker round trip: the cost is paid only by tasks that asked for one.
+    rate_per_sec: f64,
+    rate_burst: u32,
 }
 
 /// Wait before the next attempt. Exponential from one second, capped so a
@@ -527,6 +532,7 @@ fn counter_list(counters: &Counters) -> Vec<(&'static str, u64)> {
         ("children_killed", load(&counters.kills)),
         ("children_hard_killed", load(&counters.hard_killed)),
         ("task_retries", load(&counters.retried)),
+        ("tasks_rate_limited", load(&counters.rate_limited)),
         ("tasks_dead_lettered", load(&counters.dead_lettered)),
         ("cron_fired", load(&counters.cron_fired)),
         ("broker_errors", load(&counters.broker_errors)),
@@ -580,6 +586,8 @@ async fn accept_loop(listener: UnixListener, shared: Arc<Shared>) {
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("")
                                 .to_string(),
+                            rate_per_sec: fields.get(7).and_then(|v| v.as_f64()).unwrap_or(0.0),
+                            rate_burst: fields.get(8).and_then(|v| v.as_u64()).unwrap_or(0) as u32,
                         },
                     )),
                     _ => None,
@@ -865,6 +873,46 @@ async fn serve(shared: &Arc<Shared>, child: &mut ChildHandle, cfg: &Arc<Cfg>) ->
                         None => break,
                     }
                 };
+                // Over its rate: hand it back with the wait the bucket asked
+                // for, rather than hold this slot idle. The delay is what stops
+                // it being re-claimed immediately, and requeue is the same path
+                // a retry takes.
+                let limit = shared
+                    .specs
+                    .lock()
+                    .unwrap()
+                    .get(&job.name)
+                    .map(|s| (s.rate_per_sec, s.rate_burst))
+                    .filter(|(rate, _)| *rate > 0.0);
+                if let Some((rate, burst)) = limit {
+                    match shared.broker.take_token(&job.name, rate, burst).await {
+                        Ok(0) => {}
+                        Ok(wait_ms) => {
+                            shared.counters.rate_limited.fetch_add(1, Ordering::Relaxed);
+                            let _ = shared
+                                .broker
+                                .retry(&job.receipt, Duration::from_millis(wait_ms))
+                                .await;
+                            continue;
+                        }
+                        Err(_) => {
+                            // Fail closed. A limit exists because exceeding it
+                            // hurts something outside this process — a quota, a
+                            // database, someone else's API. Dispatching when the
+                            // bucket cannot be read trades a delay the caller
+                            // asked for against a breach they did not.
+                            shared
+                                .counters
+                                .broker_errors
+                                .fetch_add(1, Ordering::Relaxed);
+                            let _ = shared
+                                .broker
+                                .retry(&job.receipt, Duration::from_millis(1000))
+                                .await;
+                            continue;
+                        }
+                    }
+                }
                 if shared.revoked.lock().unwrap().contains(&job.id) {
                     // Settled, not run. The delivery still has to be acked or
                     // the lease would expire and hand it back for another go.

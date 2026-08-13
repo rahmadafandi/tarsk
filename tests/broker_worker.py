@@ -8,7 +8,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tarsk._supervisor import Supervisor  # noqa: E402
 
-Supervisor("tests.broker_app:app", children=int(os.environ.get("TARSK_CHILDREN", "1"))).work(
+Supervisor(
+    "tests.broker_app:app",
+    children=int(os.environ.get("TARSK_CHILDREN", "1")),
+    slots=int(os.environ.get("TARSK_SLOTS", "1")),
+).work(
     os.environ["TARSK_BROKER"],
     ["default"],
     lease_grace=float(os.environ.get("TARSK_LEASE_GRACE", "30")),

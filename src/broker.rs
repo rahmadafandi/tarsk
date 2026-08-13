@@ -1368,16 +1368,28 @@ impl PgBroker {
         let row = self
             .client
             .query_one(
+                // No `$2::float8`: a cast makes Postgres infer the parameter
+                // as unknown and coerce at runtime, so the driver expects text
+                // and serializing an f64 fails. Inference from context is what
+                // types these — b.tokens is float8, and extract() returns
+                // numeric, so that one needs the cast on the column instead.
                 "with refill as (
-                     select least($2::float8,
-                                  coalesce(b.tokens, $2::float8)
-                                  + extract(epoch from now() - coalesce(b.seen, now())) * $3
+                     select least($2,
+                                  coalesce(b.tokens, $2)
+                                  + extract(epoch from now() - coalesce(b.seen, now()))::float8
+                                    * $3
                             ) as level
                        from (select 1) one
                        left join tarsk_buckets b on b.task = $1
                  ), taken as (
                      insert into tarsk_buckets (task, tokens, seen)
-                     select $1, case when level >= 1 then level - 1 else level end, now()
+                     -- Cast every parameter: in a SELECT list Postgres has
+                     -- nothing to infer $1's type from and refuses the whole
+                     -- statement, which this failed silently on until the
+                     -- limiter was measured rather than assumed.
+                     select $1::text,
+                            case when level >= 1 then level - 1 else level end,
+                            now()
                        from refill
                      on conflict (task) do update
                         set tokens = excluded.tokens, seen = excluded.seen

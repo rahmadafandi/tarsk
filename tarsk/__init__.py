@@ -12,6 +12,7 @@ import functools
 import hashlib
 import importlib
 import inspect
+import re
 import secrets
 import time
 from dataclasses import dataclass
@@ -35,6 +36,11 @@ class TaskSpec:
     queue: str
     result_ttl_ms: int = 0
     cron: str = ""
+    # Tokens per second and bucket depth, both zero when unlimited. Kept as
+    # numbers rather than the "10/m" the user wrote, so the supervisor — which
+    # cannot import their code — never has to parse anything.
+    rate_per_sec: float = 0.0
+    rate_burst: int = 0
 
     def as_row(self) -> list:
         """Positional form that crosses the wire (spec §4.2)."""
@@ -46,6 +52,8 @@ class TaskSpec:
             self.queue,
             self.result_ttl_ms,
             self.cron,
+            self.rate_per_sec,
+            self.rate_burst,
         ]
 
 
@@ -243,6 +251,7 @@ class App:
         name: str | None = None,
         result_ttl: float = 0.0,
         cron: str = "",
+        rate_limit: str = "",
     ):
         def decorate(fn):
             t = self.default_timeout if timeout is None else timeout
@@ -269,9 +278,13 @@ class App:
                         f"{fn.__qualname__}: a cron task is called with no arguments, but "
                         f"{[p.name for p in required]} have no default"
                     )
+            # Parsed here, where a bad string is a startup error the author
+            # sees, rather than in the supervisor where it would be a task that
+            # silently never runs.
+            per_sec, burst = parse_rate(rate_limit) if rate_limit else (0.0, 0)
             spec = TaskSpec(
                 task_name, int(t * 1000), retries, backoff, queue,
-                int(result_ttl * 1000), cron,
+                int(result_ttl * 1000), cron, per_sec, burst,
             )
             task = Task(fn, spec, self)
             self.registry[task_name] = task
@@ -388,6 +401,26 @@ class App:
         """
         digest = hashlib.blake2b(repr(self.registry_rows()).encode(), digest_size=8)
         return int.from_bytes(digest.digest(), "big")
+
+
+_RATE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*/\s*(\d*)\s*([smh])\s*$")
+_PER = {"s": 1.0, "m": 60.0, "h": 3600.0}
+
+
+def parse_rate(text: str) -> tuple[float, int]:
+    """`"10/s"`, `"100/m"`, `"2/h"`, `"30/5m"` → (tokens per second, burst).
+
+    Burst is the numerator: `"10/s"` lets ten run at once and then refills at
+    ten a second, which is what someone protecting a quota of ten per second
+    means. A bucket that refills smoothly but never holds more than one token
+    would turn a burst limit into a spacing rule nobody asked for.
+    """
+    match = _RATE.match(text)
+    if not match:
+        raise ValueError(f"not a rate: {text!r} (try '10/s', '100/m', '30/5m')")
+    count, every, unit = match.groups()
+    seconds = _PER[unit] * (int(every) if every else 1)
+    return float(count) / seconds, max(1, int(float(count)))
 
 
 def load_app(spec: str) -> App:

@@ -289,6 +289,27 @@ queue for it: Postgres already has a visibility timer, and Redis has the idle cl
 sweep reads. What runs out of retries lands in `tarsk:{queue}:dead` or the `tarsk_dead` table,
 with the error and traceback.
 
+## Rate limits
+
+```python
+@app.task(rate_limit="10/s")     # also "100/m", "2/h", "30/5m"
+def call_their_api(order_id): ...
+```
+
+**The bucket lives in the broker, not the worker.** Celery's `rate_limit` is per worker, so three
+workers each allowing ten a second is thirty a second arriving at the API you were protecting.
+Here they share one bucket, and the limit means what it says however many workers you run —
+measured at five a second across four processes with eight slots each, which is thirty-two
+things that could otherwise have run at once.
+
+Burst is the numerator: `"10/s"` lets ten go at once and then refills at ten a second, because
+that is what someone protecting a quota of ten per second means. A task over its limit is handed
+back with the wait the bucket calculated, so the slot goes to other work rather than idling.
+
+Only tasks that ask for a limit pay for one — the check is a broker round trip, and a task
+without `rate_limit` never makes it. If the bucket cannot be read at all, the task is deferred
+rather than run: a limit exists because exceeding it hurts something outside this process.
+
 ## Cancelling, and what is in the dead letters
 
 ```

@@ -300,6 +300,34 @@ def check_broker(url: str, label: str) -> None:
             stop_worker(worker)
         assert ticks == ["tick"], f"{label}: expected exactly one tick, got {ticks}"
 
+        # --- a rate limit holds across workers, not per worker ------------
+        #
+        # Four children with eight slots each is thirty-two things that could
+        # run at once. Celery's rate_limit is per worker and would let each of
+        # them have the full allowance; the point of putting the bucket in the
+        # broker is that they share one.
+        #
+        # Timed rather than counted, and drained rather than cut off: fifteen
+        # tasks at five a second cannot finish sooner than two seconds however
+        # many slots are free, and leaving leftovers in the queue would show up
+        # as noise in whichever phase runs next.
+        log.write_text("")
+        for i in range(15):
+            app.registry["metered"].send(f"metered-{i}")
+        worker = start_worker(env, TARSK_LEASE_GRACE=1, TARSK_CHILDREN=4, TARSK_SLOTS=8)
+        started = time.time()
+        try:
+            deadline = time.time() + 60
+            while time.time() < deadline and len(tags_in(log)) < 15:
+                time.sleep(0.1)
+        finally:
+            stop_worker(worker)
+        took = time.time() - started
+        assert len(tags_in(log)) == 15, f"{label}: only {len(tags_in(log))}/15 ever ran"
+        # Burst of five, then five a second: ten more take two seconds. Without
+        # a limit, thirty-two slots would have this done in well under one.
+        assert took >= 1.5, f"{label}: 15 tasks at 5/s finished in {took:.2f}s"
+
         # --- a queued job can be cancelled while the worker is running ----
         #
         # Ordering matters: the cancellation is sent *after* the worker is up

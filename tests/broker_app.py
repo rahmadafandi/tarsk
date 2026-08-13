@@ -48,6 +48,13 @@ def medium(tag):
     return tag
 
 
+@app.task(name="metered", rate_limit="5/s")
+def metered(tag):
+    """Nothing slow: whatever paces this is the limiter, not the handler."""
+    _log(tag)
+    return tag
+
+
 @app.task(name="always_fails", retries=1, backoff="none")
 def always_fails(tag):
     _log(tag)

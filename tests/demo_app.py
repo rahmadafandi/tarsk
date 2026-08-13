@@ -60,13 +60,13 @@ def glutton(megabytes):
 HOOK_LOG = Path(os.environ.get("TARSK_HOOK_LOG", "/dev/null"))
 
 
-@app.on_child_start
+@app.on_start
 def opened():
     with open(HOOK_LOG, "a", buffering=1) as fh:
         fh.write(f"start {os.getpid()}\n")
 
 
-@app.on_child_stop
+@app.on_stop
 def closed():
     with open(HOOK_LOG, "a", buffering=1) as fh:
         fh.write(f"stop {os.getpid()}\n")

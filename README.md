@@ -21,7 +21,7 @@ task_id = embed_document.send("abc")
 ```
 
 ```python
-@app.on_child_start
+@app.on_start
 def connect():
     global pool
     pool = psycopg.ConnectionPool(...)   # not at import: see below
@@ -116,14 +116,18 @@ graceful ceiling could never fire.
 
 ## Where setup belongs
 
-`@app.on_child_start` runs once in each child before it takes work, and
-`@app.on_child_stop` as it drains. Opening a connection pool at import time instead puts it in
-every child's baseline RSS — the number `--max-rss` is measured against — so it spends the
-budget the ceiling exists to protect, in every child, forever.
+`@app.on_start` runs in each worker process before it takes work, and `@app.on_stop` as it
+drains. Opening a connection pool at import time instead puts it in every worker's baseline
+RSS — the number `--max-rss` is measured against — so it spends the budget the ceiling exists
+to protect, in every worker, forever.
 
-Hooks run before the child registers, so whatever they open is inside the baseline the
+**Once per process, not once per deployment.** Workers are replaced whenever they hit a
+recycle limit, so both hooks run again every time — in the hour-long run above that would have
+been 66 times. Pools and clients belong here; migrations and "we are up" notifications do not.
+
+Hooks run before the worker registers, so whatever they open is inside the baseline the
 supervisor checks against the ceiling. A pool that does not fit is refused at startup rather
-than discovered as a child that recycles instantly.
+than discovered as a worker that recycles instantly.
 
 ## Scheduling
 

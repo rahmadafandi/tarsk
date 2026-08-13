@@ -156,8 +156,8 @@ class App:
         self.default_timeout = default_timeout
         self.max_timeout = max_timeout
         self.registry: dict[str, Task] = {}
-        self.child_start_hooks: list = []
-        self.child_stop_hooks: list = []
+        self.start_hooks: list = []
+        self.stop_hooks: list = []
         self._producer = None
 
     def task(
@@ -206,24 +206,30 @@ class App:
 
         return decorate
 
-    def on_child_start(self, fn):
-        """Run once in each child, before it takes any work.
+    def on_start(self, fn):
+        """Run in each worker process before it takes any work.
 
-        This is where a connection pool belongs. Opening one at import time
-        instead puts it in every child's baseline RSS, which is the number
-        `--max-rss` is measured against — so the alternative is not just untidy,
-        it spends the budget the ceiling is there to protect.
+        **Once per process, not once per deployment.** Workers are replaced
+        whenever they hit a recycle limit, so this runs again every time —
+        dozens of times an hour under a tight `--max-rss`. It is the place for
+        a connection pool, not for a migration or a "we are up" notification.
+
+        A pool opened at import time instead lands in every worker's baseline
+        RSS, which is the number `--max-rss` is measured against, so the
+        alternative is not merely untidy: it spends the budget the ceiling
+        exists to protect.
         """
-        self.child_start_hooks.append(fn)
+        self.start_hooks.append(fn)
         return fn
 
-    def on_child_stop(self, fn):
-        """Run once in each child as it drains, before the process ends.
+    def on_stop(self, fn):
+        """Run in each worker process as it drains, before it exits.
 
-        Without it the only thing closing a connection is the process exiting,
-        which a server on the other end experiences as a reset.
+        Also once per process — its pair above runs just as often. Without it
+        the only thing closing a connection is the process ending, which the
+        server on the other end experiences as a reset.
         """
-        self.child_stop_hooks.append(fn)
+        self.stop_hooks.append(fn)
         return fn
 
     def producer(self):

@@ -111,8 +111,8 @@ def test_hard_ceiling_must_exceed_the_soft_one():
         raise AssertionError("a hard ceiling below the soft one must be refused")
 
 
-def test_child_hooks_bracket_every_child():
-    """Each child runs the hooks exactly once, including the ones it replaced.
+def test_hooks_bracket_every_worker():
+    """Each worker process runs the hooks once, including every replacement.
 
     A pool opened at import instead of in a hook lands in the baseline RSS the
     ceiling is measured against, so getting this right is not housekeeping.
@@ -145,6 +145,6 @@ if __name__ == "__main__":
                   test_baseline_above_ceiling_is_refused,
                   test_hard_ceiling_kills_and_dead_letters,
                   test_hard_ceiling_must_exceed_the_soft_one,
-                  test_child_hooks_bracket_every_child):
+                  test_hooks_bracket_every_worker):
         check()
         print("ok", check.__name__)

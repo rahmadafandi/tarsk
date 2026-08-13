@@ -565,7 +565,7 @@ async fn spawn_child(shared: &Arc<Shared>, cfg: &Cfg) -> Option<ChildHandle> {
             shared.exits.lock().unwrap().push(code);
             if code == EXIT_STARTUP_FAILED {
                 shared.fail(format!(
-                    "a child's on_child_start hook raised; its traceback is on the \
+                    "a worker's on_start hook raised; its traceback is on the \
                      worker's stderr (exit {code})"
                 ));
             }

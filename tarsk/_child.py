@@ -52,7 +52,7 @@ async def _run_hooks(hooks) -> None:
 async def _shutdown(app, writer) -> None:
     """Let the child put its own things down before the process ends."""
     try:
-        await _run_hooks(app.child_stop_hooks)
+        await _run_hooks(app.stop_hooks)
     except Exception:
         traceback.print_exc()
 
@@ -63,7 +63,7 @@ async def main(socket_path: str, app_spec: str, child_id: int) -> None:
     # supervisor measures against the ceiling. A pool that does not fit should
     # be refused at startup, not discovered as a child that recycles instantly.
     try:
-        await _run_hooks(app.child_start_hooks)
+        await _run_hooks(app.start_hooks)
     except Exception:
         traceback.print_exc()
         sys.exit(EXIT_STARTUP_FAILED)

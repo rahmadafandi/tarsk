@@ -36,9 +36,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="redis://…, postgres://… (or TARSK_BROKER)")
     worker.add_argument("--queues", default="default", help="comma separated")
     worker.add_argument("--children", type=int, default=2)
-    worker.add_argument("--slots", type=int, default=1,
-                        help="tasks in flight per child. 1 keeps the memory ceiling "
-                             "precise; raise it only for handlers that wait")
+    worker.add_argument("--slots", type=int, default=None,
+                        help="tasks in flight per child. Defaults to 1 when --max-rss is set, "
+                             f"{SLOTS_UNBOUNDED} when it is not")
     worker.add_argument("--max-rss", type=parse_size, default=0,
                         help="recycle a child above this, e.g. 400MB")
     worker.add_argument("--hard-max-rss", type=parse_size, default=0,
@@ -53,6 +53,13 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+# Concurrency when no memory ceiling was asked for. A judgement, not a
+# measurement: enough to keep an I/O-bound queue moving, well short of the 200
+# taskiq allows, because every in-flight task holds a lease that a crash
+# redelivers.
+SLOTS_UNBOUNDED = 8
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if not args.broker:
@@ -60,16 +67,32 @@ def main(argv: list[str] | None = None) -> int:
 
     from ._supervisor import Supervisor
 
+    # The default follows what was asked for. A ceiling is a request for
+    # precision, and precision is what a second slot spends: with one task in
+    # flight the ceiling is read while the child is not running anything, so
+    # overshoot is one task's peak. Without a ceiling there is no precision to
+    # protect and one slot is just a slow default — taskiq runs 200 tasks at
+    # once out of the box, Celery one per core.
+    slots = args.slots
+    if slots is None:
+        slots = 1 if args.max_rss else SLOTS_UNBOUNDED
+
     supervisor = Supervisor(
         args.app,
         children=args.children,
-        slots=args.slots,
+        slots=slots,
         max_rss=args.max_rss,
         max_tasks=args.max_tasks,
         max_lifetime=args.max_lifetime,
         hard_max_rss=args.hard_max_rss,
     )
     queues = [q.strip() for q in args.queues.split(",") if q.strip()]
+    # Say the effective shape out loud. Adding --max-rss otherwise drops
+    # concurrency by a factor of eight with nothing on screen to explain it.
+    reason = "explicit" if args.slots is not None else (
+        "default with --max-rss" if args.max_rss else "default, no --max-rss")
+    print(f"tarsk: {args.children} children x {slots} "
+          f"{'slot' if slots == 1 else 'slots'} ({reason})", file=sys.stderr)
     stats = supervisor.work(
         args.broker, queues, lease_grace=args.lease_grace, metrics_addr=args.metrics
     )

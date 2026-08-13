@@ -140,11 +140,28 @@ Recycle triggers: `--max-rss`, `--max-tasks`, `--max-lifetime`, whichever comes 
 is drained, never killed outright: it finishes what it is holding.
 
 `--slots N` lets one child hold N tasks at once, and it costs precision in exactly the place
-this project claims it. At one slot — the default — the ceiling is read while the child has
-nothing running, so overshoot is bounded by a single task's peak. At 64 slots it is bounded by
-whatever 64 tasks are holding, and a hard kill takes all 64 down together. Raise it for
-handlers that *wait* on other services and allocate little; leave it at 1 for handlers that
-allocate, which is the case the ceiling exists for.
+this project claims it. At one slot the ceiling is read while the child has nothing running, so
+overshoot is bounded by a single task's peak. At 64 it is bounded by whatever 64 tasks are
+holding, and a hard kill takes all 64 down together.
+
+**The default follows `--max-rss`**: one slot when a ceiling is set, eight when none is. A
+ceiling is a request for precision, and precision is exactly what the second slot spends —
+but without one there is nothing to protect and a single slot is just a slow default. For
+comparison, taskiq runs 200 tasks at once out of the box and Celery one per core. The worker
+prints which rule it used, because otherwise adding `--max-rss` would cut throughput eightfold
+with nothing on screen to explain it.
+
+Raise it for handlers that *wait* and allocate little; set it to 1 for handlers that allocate,
+which is the case the ceiling exists for. For a mix, run one worker per queue rather than
+splitting the difference:
+
+```
+tarsk worker --queues io    --slots 64 --max-rss 400MB
+tarsk worker --queues heavy --slots 1  --max-rss 400MB
+```
+
+The safe ceiling for slots is arithmetic: `(max_rss − child baseline) / peak allocation per
+task`. A 27MB child under a 400MB ceiling running tasks that peak at 5MB gives about 74.
 
 Sync handlers get slots too — they run in threads, and the pool is sized to the slot count
 rather than left at asyncio's default of `min(32, cpu + 4)`, which would otherwise cap

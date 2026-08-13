@@ -73,8 +73,23 @@ async def _call(app, task: Task, ctx: Context, args: list, kwargs: dict):
 
 
 async def _layer(middleware, ctx: Context, nxt):
-    result = middleware.execute(ctx, nxt)
-    return await result if inspect.isawaitable(result) else result
+    """Run one middleware around the rest of the chain, sync or async.
+
+    A sync `execute` runs in a thread and is handed a blocking `call()`, so it
+    can wrap the work with a plain `with` block. The thread waits on the inner
+    layers while the event loop runs them — the same trade already made for
+    sync handlers, and refusing it here while accepting it there would be an
+    inconsistency rather than a principle.
+    """
+    if inspect.iscoroutinefunction(middleware.execute):
+        return await middleware.execute(ctx, nxt)
+
+    loop = asyncio.get_running_loop()
+
+    def blocking_call():
+        return asyncio.run_coroutine_threadsafe(nxt(), loop).result()
+
+    return await asyncio.to_thread(middleware.execute, ctx, blocking_call)
 
 
 async def _die(writer: asyncio.StreamWriter, code: int) -> None:

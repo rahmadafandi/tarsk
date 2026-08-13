@@ -98,7 +98,22 @@ class Recorder:
             _note(f"{self.tag}<{ctx.name}")
 
 
+class SyncRecorder:
+    """A plain `with`-shaped layer: no async anywhere in it."""
+
+    def __init__(self, tag):
+        self.tag = tag
+
+    def execute(self, ctx, call):
+        _note(f"{self.tag}>{ctx.name}")
+        try:
+            return call()
+        finally:
+            _note(f"{self.tag}<{ctx.name}")
+
+
 app.middleware(Recorder("outer"))
+app.middleware(SyncRecorder("sync"))
 app.middleware(Recorder("inner"))
 
 _opened = []

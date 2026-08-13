@@ -140,22 +140,6 @@ def test_hooks_bracket_every_worker():
         os.environ.pop("TARSK_HOOK_LOG", None)
 
 
-def test_sync_middleware_is_refused():
-    """It would close whatever it wraps before the task ran. Measured, once."""
-    from tarsk import App
-
-    class Wrong:
-        def execute(self, ctx, call):  # not async
-            return call()
-
-    try:
-        App().middleware(Wrong())
-    except TypeError as exc:
-        assert "async def" in str(exc), exc
-    else:
-        raise AssertionError("a sync middleware must be refused, not silently reordered")
-
-
 def test_middleware_wraps_and_dependencies_inject():
     """Layers nest outside-in and unwind inside-out, failures included.
 
@@ -180,9 +164,12 @@ def test_middleware_wraps_and_dependencies_inject():
         assert results[2][1][0] == "KeyError", results[2]
 
         lines = trace.read_text().splitlines()
-        first = lines[: lines.index("inner<uses_pool") + 1]
+        first = lines[: lines.index("outer<uses_pool") + 1]
+        # A sync layer sandwiched between two async ones still nests: it runs
+        # in a thread holding a blocking call() while the loop runs the rest.
         assert first == [
-            "outer>uses_pool", "inner>uses_pool", "inner<uses_pool",
+            "outer>uses_pool", "sync>uses_pool", "inner>uses_pool",
+            "inner<uses_pool", "sync<uses_pool", "outer<uses_pool",
         ], f"layers did not nest: {first}"
         assert "inner!KeyError" in lines and "outer!KeyError" in lines, lines
     finally:
@@ -196,7 +183,6 @@ if __name__ == "__main__":
                   test_hard_ceiling_kills_and_dead_letters,
                   test_hard_ceiling_must_exceed_the_soft_one,
                   test_hooks_bracket_every_worker,
-                  test_middleware_wraps_and_dependencies_inject,
-                  test_sync_middleware_is_refused):
+                  test_middleware_wraps_and_dependencies_inject):
         check()
         print("ok", check.__name__)

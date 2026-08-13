@@ -158,12 +158,20 @@ class Redis:
             REDIS_PORT = int(EXTERNAL_REDIS.rsplit(":", 1)[1].split("/")[0])
             self.dir = None
             self.proc = None
+            os.environ["BENCH_REDIS"] = REDIS_URL
             return self
         self.dir = tempfile.mkdtemp(prefix="bench-redis-")
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", 0))
             REDIS_PORT = probe.getsockname()[1]
         REDIS_URL = f"redis://127.0.0.1:{REDIS_PORT}/0"
+        # Also in this process's own environment. The producer half of the
+        # harness imports bench.celery_app here, and that module reads
+        # BENCH_REDIS at import — without this it silently publishes somewhere
+        # else while the workers read from the server we started. It did: an
+        # earlier version left 466 benchmark tasks queued in a developer's own
+        # Redis, and reported 0/30 because nothing was where it was expected.
+        os.environ["BENCH_REDIS"] = REDIS_URL
         self.proc = subprocess.Popen(
             ["redis-server", "--port", str(REDIS_PORT), "--save", "", "--appendonly", "no",
              "--dir", self.dir],
@@ -207,6 +215,7 @@ class Result:
     completed: int = 0      # distinct task ids that finished at least once
     runs: int = 0           # executions, including re-runs after a kill
     pids: int = 0           # distinct worker processes that ran a task
+    stalled: bool = False   # stopped because nothing new completed, not on a deadline
     launches: int = 1       # times the worker had to be (re)started from outside
     wall: float = 0.0
     peak_worker: int = 0    # max(self-reported high-water, /proc sampling)
@@ -291,13 +300,26 @@ def submit_taskiq(task: str, count: int, args: list) -> None:
 
 
 def run_worker(cmd: list[str], env: dict, expected: int, log: Path, timeout: float,
-               memory_max: str | None = None, restarts: int = 0) -> Result:
-    """Run the worker to completion, optionally restarting it when it dies.
+               memory_max: str | None = None, restarts: int = 0,
+               stall_after: float = 15.0, startup_grace: float = 90.0) -> Result:
+    """Run the worker until it finishes or stops making progress.
 
     `restarts` stands in for the orchestrator: Kubernetes restarts a pod its OOM
     killer took, and a queue configured to ack late gets its in-flight work
     redelivered to the replacement. Without that, a benchmark measures the
     absence of a supervisor rather than the queue.
+
+    `stall_after` is why this returns in seconds rather than minutes. Several
+    cases here are *supposed* to lose work, so they can never reach `expected`
+    and used to sit out the whole timeout for a foregone conclusion — five of
+    the suite's eighteen minutes. A run is over when nothing new has completed
+    for this long: that is the thing being measured, where a fixed deadline is
+    an arbitrary number we chose.
+
+    Before the first completion there is nothing to be stalled *from*, so
+    `startup_grace` applies instead. Conflating the two makes every slow-booting
+    runtime look like it lost all its work — Celery needs seconds to come up,
+    and the first version of this check reported 0/30 for it.
     """
     if memory_max:
         cmd = ["systemd-run", "--user", "--scope", "-q", "-p", f"MemoryMax={memory_max}",
@@ -306,6 +328,9 @@ def run_worker(cmd: list[str], env: dict, expected: int, log: Path, timeout: flo
     deadline = started + timeout
     peaks = [0, 0, 0]
     launches = 0
+    settled = 0
+    last_progress = started
+    stalled = False
 
     while time.time() < deadline and launches <= restarts:
         launches += 1
@@ -314,10 +339,17 @@ def run_worker(cmd: list[str], env: dict, expected: int, log: Path, timeout: flo
         sampler = Sampler(proc.pid)
         sampler.start()
         while time.time() < deadline:
-            if len({row[0] for row in read_log(log)}) >= expected:
+            done = len({row[0] for row in read_log(log)})
+            if done > settled:
+                settled, last_progress = done, time.time()
+            if done >= expected:
                 break
             if proc.poll() is not None:
                 break  # died — the orchestrator's turn
+            waited = time.time() - (last_progress if settled else started)
+            if waited > (stall_after if settled else startup_grace):
+                stalled = settled > 0  # otherwise it never started, which is not a stall
+                break
             time.sleep(0.05)
         sampler.stop.set()
         sampler.join()
@@ -325,7 +357,7 @@ def run_worker(cmd: list[str], env: dict, expected: int, log: Path, timeout: flo
                  max(peaks[2], sampler.peak_root)]
         kill_tree(proc.pid)
         proc.wait()
-        if len({row[0] for row in read_log(log)}) >= expected:
+        if stalled or len({row[0] for row in read_log(log)}) >= expected:
             break
     wall = time.time() - started
 
@@ -339,6 +371,7 @@ def run_worker(cmd: list[str], env: dict, expected: int, log: Path, timeout: flo
     result = Result(framework="", label="", expected=expected,
                     completed=len({row[0] for row in rows}), runs=len(rows),
                     pids=len({row[1] for row in rows}), launches=launches, wall=wall,
+                    stalled=stalled,
                     peak_worker=max(self_peak, peaks[0]), peak_sampled=peaks[0],
                     peak_total=peaks[1], peak_root=peaks[2])
     ends = sorted(row[4] for row in rows)
@@ -491,14 +524,18 @@ def scenario_imports(redis: Redis, tmp: Path) -> None:
 
 
 def scenario_footprint(redis: Redis, tmp: Path) -> None:
+    # Reported from the worker's own ru_maxrss, which the handler records. The
+    # sampler cannot be trusted for a child that lives about a second: it takes
+    # the largest of a handful of 50ms reads and can miss the peak entirely,
+    # which is how this table once claimed a 16MB tarsk worker.
     rows = [
         case("tarsk", "", "noop", 1, [], 60, redis, tmp),
         case("celery", "", "noop", 1, [], 60, redis, tmp),
         case("taskiq", "", "noop", 1, [], 60, redis, tmp),
     ]
     table("Footprint — RSS after one trivial task",
-          "The process that runs user code. tarsk children never import the broker "
-          "driver (spec §4.1); Celery and taskiq workers carry theirs.",
+          "The process that runs user code, from its own ru_maxrss. tarsk children never "
+          "import the broker driver (spec §4.1); Celery and taskiq workers carry theirs.",
           rows, ["peak", "total"])
 
 

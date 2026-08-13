@@ -124,7 +124,7 @@ long enough.
 
 | runtime | worker RSS | tree RSS |
 |---|---|---|
-| tarsk | 16 MB | 42 MB |
+| tarsk | **27 MB** | 47 MB |
 | celery | 49 MB | 104 MB |
 | taskiq | 58 MB | 144 MB |
 
@@ -132,14 +132,21 @@ The tarsk child is CPython plus the user's task module and nothing else — no b
 no scheduler (spec §4.1). The tree column includes the supervisor / master, and is summed Rss,
 so it double-counts pages shared by forking — see the Pss figures above for how much.
 
+**This table said 16 MB for tarsk until it was measured properly.** A child that runs one
+trivial task lives about a second, and the sampler took the largest of a handful of 50ms reads
+— often missing the peak entirely. The figure now comes from the worker's own `ru_maxrss`,
+which cannot. A bare CPython 3.14 is 12.6 MB here and `tarsk` plus msgpack adds 11.8, so 27 was
+always the honest number; 16 was never reachable. The ratio against Celery is 1.8×, not the 3×
+this page used to claim.
+
 ### Bounded memory, 40 tasks each retaining 20MB
 
 | runtime | peak worker RSS |
 |---|---|
-| celery (no recycling) | 848 MB |
+| celery (no recycling) | 849 MB |
 | taskiq (no recycling available) | 858 MB |
 | celery `--max-tasks-per-child=6` | **170 MB** |
-| tarsk `--max-rss=200MB` | 204 MB |
+| tarsk `--max-rss=200MB` | 205 MB |
 
 Celery wins this one. When the leak per task is known and constant, dividing the budget by it
 is a perfectly good bound — and a tighter one, because it stops short of the budget rather
@@ -161,18 +168,18 @@ floor for any design that refuses to kill running work.
 
 | runtime | completed | lost | executions | restarts | max gap | peak RSS |
 |---|---|---|---|---|---|---|
-| celery (defaults) | 16/30 | **14** | 16 | 0 | 7 ms | 368 MB |
-| taskiq | 15/30 | **15** | 15 | 0 | 8 ms | 358 MB |
-| celery `task_acks_late=True` | 16/30 | **14** | 16 | 0 | 10 ms | 368 MB |
-| celery `task_acks_late=True` + restarted | 29/30 | **1** | 29 | 1 | 2440 ms | 368 MB |
-| celery `--max-tasks-per-child=6` (tuned) | 30/30 | 0 | 30 | 0 | 167 ms | 170 MB |
-| tarsk `--max-rss=200MB` | 30/30 | 0 | 30 | 0 | 14 ms | 204 MB |
+| celery (defaults) | 16/30 | **14** | 16 | 0 | 14 ms | 369 MB |
+| taskiq | 15/30 | **15** | 15 | 0 | 17 ms | 358 MB |
+| celery `task_acks_late=True` | 16/30 | **14** | 16 | 0 | 19 ms | 369 MB |
+| celery `task_acks_late=True` + restarted | 29/30 | **1** | 29 | 1 | 2757 ms | 377 MB |
+| celery `--max-tasks-per-child=6` (tuned) | 30/30 | 0 | 30 | 0 | 203 ms | 170 MB |
+| tarsk `--max-rss=200MB` | 30/30 | 0 | 30 | 0 | 21 ms | 204 MB |
 
 `task_acks_late` alone changes nothing: the OOM killer takes the whole cgroup, master included,
 so nothing survives to receive a redelivery. With an orchestrator restarting the worker it very
 nearly recovers — the one task still missing was in flight when the kill landed, and the Redis
 transport's default visibility timeout (1 hour) puts its redelivery outside the run. The price
-is 2.4 seconds of dead air.
+is 2.8 seconds of dead air.
 
 A correctly tuned Celery ties tarsk here. The difference is what you had to know in advance.
 
@@ -180,9 +187,9 @@ A correctly tuned Celery ties tarsk here. The difference is what you had to know
 
 | runtime | p50 gap | p99 gap | max gap |
 |---|---|---|---|
-| celery `--max-tasks-per-child=20` | 5.7 ms | 156 ms | 157 ms |
-| tarsk `--max-tasks=20` | 5.4 ms | 9 ms | 13 ms |
-| taskiq (no recycling available) | 6.2 ms | 7 ms | 7 ms |
+| celery `--max-tasks-per-child=20` | 6.2 ms | 171 ms | 173 ms |
+| tarsk `--max-tasks=20` | 6.0 ms | 10 ms | 11 ms |
+| taskiq (no recycling available) | 6.7 ms | 7 ms | 7 ms |
 
 Recycling costs tarsk essentially nothing: it sits with taskiq, which never recycles at all.
 Getting there took three fixes, not one — starting the replacement early enough (projected from
@@ -195,9 +202,9 @@ rather than assertable.
 
 | runtime | noop | 50ms handler |
 |---|---|---|
-| celery | 856/s | 19/s |
-| taskiq | 778/s | 19/s |
-| tarsk | 2553/s (no broker yet) | 19/s |
+| celery | 359/s | 18/s |
+| taskiq | 445/s | 18/s |
+| tarsk | 850/s (no broker yet) | 19/s |
 
 The noop row for tarsk is not a comparison: it has no broker to talk to yet. The 50ms row is
 the one that matters, and all three are identical — which is exactly what spec §2 predicts.

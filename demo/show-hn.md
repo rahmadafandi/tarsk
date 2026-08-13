@@ -25,14 +25,14 @@ answer is an OOMKill.
 Tarsk takes --max-rss in bytes. A Rust supervisor watches each child's RSS from the
 parent and retires it when it crosses, starting the replacement early enough that
 the slot never goes empty. Children import your task modules and nothing else -- no
-broker driver, no scheduler -- so a worker is 16 MB against Celery's 49 MB.
+broker driver, no scheduler -- so a worker is 27 MB against Celery's 49 MB.
 
 One hour, 72,001 tasks, a handler that frees nothing: 66 recycles, peak 400 MB
 against a 400 MB ceiling, zero tasks lost, nothing killed. The trough held at 27.9 MB
 over the first half hour and 28.1 MB over the second, so nothing survives a recycle.
 
 What it does not claim: it is not faster. With a 50 ms handler, Tarsk, Celery and
-taskiq all reach 19 tasks/s -- identical, as they should be. Dispatch costs
+taskiq all reach 18-19 tasks/s -- identical, as they should be. Dispatch costs
 microseconds and real handlers do not. Nor is the ceiling absolute: it is read while
 a child is idle, so a child never starts a task it cannot afford, but a handler that
 allocates 300 MB will allocate it. Overshoot is one task's peak, not zero. A ceiling
@@ -43,10 +43,11 @@ And a correctly tuned Celery ties it on task loss. The difference is what you ha
 know in advance.
 
 Redis Streams and Postgres brokers, per-task leases, retries with backoff, a
-dead-letter store, and a Prometheus endpoint that reports the supervisor's own RSS so
-the constant can be checked rather than believed.
+dead-letter store, opt-in results with a required TTL, UTC cron elected through the
+broker, and a Prometheus endpoint that reports the supervisor's own RSS so the
+constant can be checked rather than believed.
 
-Pre-release: no published wheel yet, no result backend, no cron. Linux and macOS.
+Pre-release: no published wheel yet. Linux and macOS.
 ```
 
 ---
@@ -89,28 +90,28 @@ workload changes between columns.
 
 | runtime | p50 | p99 | max |
 |---|---|---|---|
-| celery `--max-tasks-per-child=20` | 5.7 ms | 156 ms | 157 ms |
-| tarsk `--max-tasks=20` | 5.4 ms | 9 ms | **13 ms** |
-| taskiq, never recycles | 6.2 ms | 7 ms | 7 ms |
+| celery `--max-tasks-per-child=20` | 6.2 ms | 171 ms | 173 ms |
+| tarsk `--max-tasks=20` | 6.0 ms | 10 ms | **11 ms** |
+| taskiq, never recycles | 6.7 ms | 7 ms | 7 ms |
 
 **30 leaky tasks under a hard 400 MB cgroup limit** — what Kubernetes does to a worker that grows.
 
 | runtime | completed | lost | restarts | longest stall |
 |---|---|---|---|---|
-| celery, defaults | 16/30 | **14** | 0 | 7 ms |
-| taskiq | 15/30 | **15** | 0 | 8 ms |
-| celery `task_acks_late` | 16/30 | **14** | 0 | 10 ms |
-| celery `task_acks_late` + restarted | 29/30 | **1** | 1 | 2,440 ms |
-| celery `--max-tasks-per-child=6`, tuned | **30/30** | 0 | 0 | 167 ms |
-| tarsk `--max-rss=200MB` | **30/30** | 0 | 0 | 9 ms |
+| celery, defaults | 16/30 | **14** | 0 | 14 ms |
+| taskiq | 15/30 | **15** | 0 | 17 ms |
+| celery `task_acks_late` | 16/30 | **14** | 0 | 19 ms |
+| celery `task_acks_late` + restarted | 29/30 | **1** | 1 | 2,757 ms |
+| celery `--max-tasks-per-child=6`, tuned | **30/30** | 0 | 0 | 203 ms |
+| tarsk `--max-rss=200MB` | **30/30** | 0 | 0 | 21 ms |
 
 **Throughput**, single worker, concurrency 1. Reported to be honest about it, not as a claim.
 
 | runtime | no-op handler | 50 ms handler |
 |---|---|---|
-| celery | 856/s | 19/s |
-| taskiq | 778/s | 19/s |
-| tarsk | 2,553/s *(no broker yet)* | 19/s |
+| celery | 359/s | 18/s |
+| taskiq | 445/s | 18/s |
+| tarsk | 850/s *(no broker yet)* | 19/s |
 
 The no-op row for tarsk is not a comparison: it has no broker to talk to yet, so it skips a hop
 the others pay. The 50 ms row is the one that matters, and all three are the same number.
@@ -127,12 +128,12 @@ unchanged, against a workload that moved.
 **Celery doesn't lose tasks, you configured it wrong.**
 Tuned correctly it ties: 30/30, and at a lower peak. `task_acks_late` alone does not — the OOM
 killer takes the whole cgroup, master included, so nothing survives to receive the redelivery.
-With an orchestrator restarting the pod it recovers all but the in-flight one, and pays 2.4
+With an orchestrator restarting the pod it recovers all but the in-flight one, and pays 2.8
 seconds of dead air.
 
 **Your throughput numbers are missing the broker.**
 They are, and the post says so. Redis Streams and Postgres drivers exist; the benchmark harness
-still feeds tarsk from memory, so treat 2,553/s as an upper bound rather than a result. It
+still feeds tarsk from memory, so treat 850/s as an upper bound rather than a result. It
 changes nothing above 50 ms, which is where handlers live.
 
 **A ceiling that can be exceeded isn't a ceiling.**
@@ -144,16 +145,15 @@ for people who would rather lose the task, and it is off by default.
 **Why not contribute this to Celery?**
 The supervision model is the whole design — pull-based children, a registry that crosses IPC so
 the supervisor never imports user code, per-task leases. Bolting an RSS ceiling onto prefork
-gets the byte budget without the handover, which is the 157 ms column.
+gets the byte budget without the handover, which is the 173 ms column.
 
 ---
 
 ## Not done yet
 
-- No published wheel — build from source with `maturin develop --release`
-- No result backend; `send()` returns nothing
-- No cron or recurring schedule — `send_in(60, …)` covers one-off delays
-- Linux and macOS; Windows needs a decision about the IPC transport
+- Not on PyPI yet — the wheel builds and installs, it just has not been uploaded
+- No chains, groups or chords
+- Linux and macOS; the macOS wheel builds in CI but nothing runs the tests there
 - The hour-long trace records child RSS but not the supervisor's own gauge — the other constant
   this project claims, still unproven at that length
 

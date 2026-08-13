@@ -69,12 +69,12 @@ trigger fires, so the slot never goes empty:
 
 | | p50 gap | p99 gap | max gap |
 |---|---|---|---|
-| celery `--max-tasks-per-child=20` | 5.7 ms | 156 ms | 157 ms |
-| tarsk `--max-tasks=20` | 5.4 ms | 9 ms | **13 ms** |
-| taskiq (no recycling at all) | 6.2 ms | 7 ms | 7 ms |
+| celery `--max-tasks-per-child=20` | 6.2 ms | 171 ms | 173 ms |
+| tarsk `--max-tasks=20` | 6.0 ms | 10 ms | **11 ms** |
+| taskiq (no recycling at all) | 6.7 ms | 7 ms | 7 ms |
 
 And the worker that runs your code is smaller, because it imports your tasks and nothing else —
-no broker driver, no scheduler: 16 MB against Celery's 49 MB and taskiq's 58 MB.
+no broker driver, no scheduler: 27 MB against Celery's 49 MB and taskiq's 58 MB.
 
 Your imports land in one process here, and the supervisor is not it:
 
@@ -95,7 +95,7 @@ one from a master carrying 77 MB of your dependencies.
 ## What it does not claim
 
 **Not faster.** Dispatch costs microseconds; real handlers run for 50ms to minutes. With a 50ms
-handler tarsk, Celery and taskiq all reach 19 tasks/s — identical, as they should be. Anyone
+handler tarsk, Celery and taskiq all reach 18–19 tasks/s — identical, as they should be. Anyone
 selling a task queue on throughput benchmarks is selling the wrong thing.
 
 **Not a hard ceiling regardless of task size.** The ceiling is read while a child is idle, so a

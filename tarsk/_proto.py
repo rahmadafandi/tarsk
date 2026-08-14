@@ -59,6 +59,11 @@ def unpack_args(payload: bytes) -> tuple[list, dict]:
     return args, kwargs
 
 
+def pack_chain(rows: list) -> bytes:
+    """The steps after the first, as the supervisor will read them."""
+    return msgpack.packb(rows, use_bin_type=True)
+
+
 def pack_result(value: Any) -> bytes:
     # ponytail: `default=repr` degrades an unserializable return value instead
     # of failing. Nacking here would redeliver a task that already ran its side

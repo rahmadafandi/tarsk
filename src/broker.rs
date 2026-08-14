@@ -45,6 +45,13 @@ pub struct NewJob {
     pub name: String,
     pub payload: Vec<u8>,
     pub timeout_ms: u32,
+    /// msgpack list of the steps still to run after this one, each
+    /// `[id, name, payload, timeout_ms, queue, feed]`. Empty for a lone job.
+    ///
+    /// Carried on the job rather than resolved by the supervisor, because the
+    /// supervisor cannot import the user's code to look a callable up (spec
+    /// §4.1). A chain is data the whole way through.
+    pub chain: Vec<u8>,
 }
 
 /// What has to be handed back to settle a delivery.
@@ -69,6 +76,8 @@ pub enum Receipt {
 #[derive(Clone, Debug)]
 pub struct Delivery {
     pub id: String,
+    /// The steps queued to run after this one. See `NewJob::chain`.
+    pub chain: Vec<u8>,
     pub name: String,
     pub payload: Vec<u8>,
     pub attempt: u32,
@@ -396,6 +405,7 @@ impl MemoryBroker {
             receipt: Receipt::Memory { id },
             id: job.id.clone(),
             ready_at_ms: 0,
+            chain: job.chain.clone(),
         })
     }
 
@@ -599,6 +609,8 @@ impl RedisBroker {
                 .arg(job.timeout_ms)
                 .arg("i")
                 .arg(&job.id)
+                .arg("c")
+                .arg(&job.chain)
                 .query_async(&mut conn)
                 .await?;
             return Ok(());
@@ -752,6 +764,7 @@ impl RedisBroker {
                     payload,
                     attempt: entry.delivered_count.unwrap_or(1) as u32,
                     ready_at_ms: stream_id_ms(&entry.id),
+                    chain: entry.get("c").unwrap_or_default(),
                     receipt: Receipt::Redis {
                         queue: queue.clone(),
                         id: entry.id,
@@ -1121,6 +1134,7 @@ impl RedisBroker {
                         payload,
                         attempt: candidate.times_delivered as u32 + 1,
                         ready_at_ms: stream_id_ms(&candidate.id),
+                        chain: entry.get("c").unwrap_or_default(),
                         receipt: Receipt::Redis {
                             queue: queue.clone(),
                             id: candidate.id,
@@ -1150,6 +1164,7 @@ create table if not exists tarsk_jobs (
     name        text        not null,
     payload     bytea       not null,
     timeout_ms  integer     not null,
+    chain       bytea,
     attempt     integer     not null default 0,
     run_lease   bigint      not null default 0,
     lease_until timestamptz,
@@ -1196,6 +1211,7 @@ create table if not exists tarsk_revoked (
     expires_at timestamptz not null
 );
 create index if not exists tarsk_revoked_expiry on tarsk_revoked (expires_at);
+alter table tarsk_jobs add column if not exists chain      bytea;
 alter table tarsk_dead add column if not exists job_id     text;
 alter table tarsk_dead add column if not exists timeout_ms integer not null default 0;
 ";
@@ -1221,7 +1237,7 @@ update tarsk_jobs set
     run_lease   = run_lease + 1
 from picked
 where tarsk_jobs.id = picked.id
-returning tarsk_jobs.id, name, payload, attempt, run_lease, job_id, picked.ready_at
+returning tarsk_jobs.id, name, payload, attempt, run_lease, job_id, picked.ready_at, chain
 ";
 
 pub struct PgBroker {
@@ -1251,9 +1267,10 @@ impl PgBroker {
     async fn push(&self, job: NewJob, delay: Duration) -> Res<()> {
         self.client
             .execute(
-                "insert into tarsk_jobs (job_id, queue, name, payload, timeout_ms, lease_until)
+                "insert into tarsk_jobs
+                     (job_id, queue, name, payload, timeout_ms, lease_until, chain)
                  values ($6, $1, $2, $3, $4, case when $5::double precision > 0
-                     then now() + make_interval(secs => $5::double precision) else null end)",
+                     then now() + make_interval(secs => $5::double precision) else null end, $7)",
                 &[
                     &job.queue,
                     &job.name,
@@ -1261,6 +1278,7 @@ impl PgBroker {
                     &(job.timeout_ms as i32),
                     &delay.as_secs_f64(),
                     &job.id,
+                    &job.chain,
                 ],
             )
             .await?;
@@ -1290,6 +1308,7 @@ impl PgBroker {
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_millis() as u64)
                         .unwrap_or(0),
+                    chain: row.get::<_, Option<Vec<u8>>>(7).unwrap_or_default(),
                     receipt: Receipt::Postgres {
                         row: row.get(0),
                         run_lease,

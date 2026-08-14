@@ -327,6 +327,39 @@ def check_broker(url: str, label: str) -> None:
             stop_worker(worker)
         assert ticks == ["tick"], f"{label}: expected exactly one tick, got {ticks}"
 
+        # --- a chain runs in order and feeds each result to the next ------
+        log.write_text("")
+        from tarsk import chain
+
+        pipeline = chain(
+            app.registry["double"].s(5),      # 10
+            app.registry["add_to"].s(3),      # 10 + 3 = 13
+            app.registry["shout"].si("done"), # ignores 13, returns "DONE"
+        )
+        final_id = pipeline.send()
+        worker = start_worker(env, TARSK_LEASE_GRACE=1)
+        try:
+            answer = app.result(final_id).get(timeout=60)
+        finally:
+            stop_worker(worker)
+        assert answer == "DONE", f"{label}: chain ended with {answer!r}"
+        ran = tags_in(log)
+        assert ran == ["double-5", "add_to-10+3", "shout-done"], f"{label}: {ran}"
+
+        # --- a group hands back every id before any of them has run -------
+        log.write_text("")
+        from tarsk import group
+
+        fan = group(app.registry["double"].s(n) for n in (1, 2, 3))
+        ids = fan.send()
+        assert len(set(ids)) == 3, f"{label}: group reused an id: {ids}"
+        worker = start_worker(env, TARSK_LEASE_GRACE=1)
+        try:
+            answers = sorted(h.get(timeout=60) for h in fan.results(app))
+        finally:
+            stop_worker(worker)
+        assert answers == [2, 4, 6], f"{label}: group returned {answers}"
+
         # --- a job that waited too long is dropped, not run ---------------
         #
         # Enqueued with no worker running, so the wait is real queue time

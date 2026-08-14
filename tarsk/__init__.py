@@ -19,8 +19,9 @@ import time
 from dataclasses import dataclass
 
 __all__ = [
-    "App", "AsyncResult", "Context", "Depends", "Task", "TaskFailed", "TaskSpec",
-    "Reject", "Retry", "load_app",
+    "App", "AsyncResult", "Chain", "Context", "Depends", "Group", "Signature",
+    "Task", "TaskFailed", "TaskSpec", "Reject", "Retry", "chain", "group",
+    "load_app",
 ]
 
 DEFAULT_TIMEOUT = 300.0  # seconds — spec §9, doubles as the hard cap
@@ -151,6 +152,14 @@ class Task:
         # enqueueing fast enough to see the pool rather than the network.
         return await asyncio.to_thread(self.send, *args, **kwargs)
 
+    def s(self, *args, **kwargs) -> "Signature":
+        """This task with these arguments, fed the previous step's result."""
+        return Signature(self, args, kwargs, feed=True)
+
+    def si(self, *args, **kwargs) -> "Signature":
+        """This task with these arguments and nothing else — `i` for immutable."""
+        return Signature(self, args, kwargs, feed=False)
+
     def send_in(self, delay: float, /, *args, **kwargs) -> str:
         """Enqueue, to run no earlier than `delay` seconds from now.
 
@@ -193,6 +202,7 @@ class Enqueue:
     """One send, with the registration's defaults optionally overridden."""
 
     def __init__(self, task: Task, *, queue=None, timeout=None, delay=0.0, when=None,
+                 chain: bytes = b"",
                  task_id=None):
         if delay and when is not None:
             raise ValueError("give a delay or a time, not both")
@@ -213,6 +223,7 @@ class Enqueue:
         # A caller-supplied id is an idempotency key: send the same one twice
         # and the second result overwrites the first rather than adding a row.
         self.task_id = task_id or secrets.token_hex(8)
+        self.chain = chain
 
     def send(self, *args, **kwargs) -> str:
         from . import _proto  # lazy — see App.producer
@@ -236,7 +247,7 @@ class Enqueue:
         payload = _proto.pack_args(args, kwargs)
         self.task.app.producer().send(
             self.task_id, self.queue, self.task.spec.name, payload,
-            self.timeout_ms, self.delay,
+            self.timeout_ms, self.delay, self.chain,
         )
         return self.task_id
 
@@ -448,6 +459,123 @@ def parse_rate(text: str) -> tuple[float, int]:
     count, every, unit = match.groups()
     seconds = _PER[unit] * (int(every) if every else 1)
     return float(count) / seconds, max(1, int(float(count)))
+
+
+class Signature:
+    """A task with its arguments, not yet sent.
+
+    `t.s(1)` feeds the previous step's result in front of those arguments when
+    it runs in a chain; `t.si(1)` ignores it. Celery spells these the same way,
+    and the distinction is load-bearing rather than decorative: most second
+    steps want what came before, and the ones that do not would otherwise break
+    on an argument they never declared.
+    """
+
+    __slots__ = ("task", "args", "kwargs", "feed", "task_id")
+
+    def __init__(self, task: "Task", args: tuple, kwargs: dict, feed: bool):
+        self.task = task
+        self.args = args
+        self.kwargs = kwargs
+        self.feed = feed
+        self.task_id = secrets.token_hex(8)
+
+    def _row(self) -> list:
+        from . import _proto
+
+        return [
+            self.task_id,
+            self.task.spec.name,
+            _proto.pack_args(self.args, self.kwargs),
+            self.task.spec.timeout_ms,
+            self.task.spec.queue,
+            self.feed,
+        ]
+
+    def __repr__(self) -> str:
+        return f"<Signature {self.task.spec.name} feed={self.feed}>"
+
+
+class Chain:
+    """Steps that run one after another, each fed the last one's result."""
+
+    __slots__ = ("steps",)
+
+    def __init__(self, steps: list[Signature]):
+        if not steps:
+            raise ValueError("a chain needs at least one step")
+        self.steps = steps
+
+    @property
+    def result_id(self) -> str:
+        """The id the final step's result will be filed under.
+
+        Known before anything runs, because every step's id is minted here
+        rather than by whichever worker happens to queue it. That is what lets
+        you hold a handle to the end of a chain while its first step is still
+        being written.
+        """
+        return self.steps[-1].task_id
+
+    def send(self) -> str:
+        from . import _proto
+
+        head, rest = self.steps[0], self.steps[1:]
+        chain = _proto.pack_chain([s._row() for s in rest]) if rest else b""
+        Enqueue(head.task, task_id=head.task_id, chain=chain).send(*head.args, **head.kwargs)
+        return self.result_id
+
+    async def send_async(self) -> str:
+        return await asyncio.to_thread(self.send)
+
+
+class Group:
+    """Steps with nothing between them: sent together, run wherever there is room.
+
+    There is no coordination here and none is needed — the queue already runs
+    what it can in parallel. What this adds over a list comprehension is that
+    the ids exist before the sending does, so the handles can be held while the
+    work is still going out.
+    """
+
+    __slots__ = ("steps",)
+
+    def __init__(self, steps: list[Signature]):
+        if not steps:
+            raise ValueError("a group needs at least one step")
+        self.steps = steps
+
+    @property
+    def result_ids(self) -> list[str]:
+        return [s.task_id for s in self.steps]
+
+    def send(self) -> list[str]:
+        for step in self.steps:
+            Enqueue(step.task, task_id=step.task_id).send(*step.args, **step.kwargs)
+        return self.result_ids
+
+    async def send_async(self) -> list[str]:
+        return await asyncio.to_thread(self.send)
+
+    def results(self, app: "App") -> list["AsyncResult"]:
+        return [app.result(i) for i in self.result_ids]
+
+
+def group(*steps: Signature) -> Group:
+    """`group(resize.s(f) for f in files)` — or just pass them positionally."""
+    if len(steps) == 1 and not isinstance(steps[0], Signature):
+        steps = tuple(steps[0])  # an iterable, the way people write it
+    return Group(list(steps))
+
+
+def chain(*steps: Signature) -> Chain:
+    """`chain(fetch.s(url), parse.s(), store.si("bucket")).send()`
+
+    Only the first step is queued now. Each one queues the next when it
+    succeeds, so a chain that fails partway stops there — the remaining steps
+    were never enqueued and there is nothing to cancel.
+    """
+    return Chain(list(steps))
 
 
 def load_app(spec: str) -> App:

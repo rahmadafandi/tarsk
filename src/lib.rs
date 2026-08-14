@@ -89,6 +89,8 @@ struct Job {
     dispatched: Instant,
     /// When the broker says this became runnable. Expiry is measured from here.
     ready_at_ms: u64,
+    /// Steps to run after this one, msgpack, empty for a lone job.
+    chain: Vec<u8>,
 }
 
 /// What the handler asked for, on top of having failed.
@@ -185,6 +187,7 @@ struct Counters {
     retried: AtomicU64,
     rate_limited: AtomicU64,
     expired: AtomicU64,
+    chained: AtomicU64,
     dead_lettered: AtomicU64,
     cron_fired: AtomicU64,
     broker_errors: AtomicU64,
@@ -306,6 +309,10 @@ impl Shared {
             self.metrics
                 .observe(&job.name, true, job.dispatched.elapsed());
             self.keep_result(&job, &outcome).await;
+            // Before the ack, so a crash between the two redelivers this step
+            // rather than losing the rest of the chain. That can run a step
+            // twice, which is the at-least-once this queue already promises.
+            self.advance_chain(&job, &outcome).await;
             if self.broker.ack(&job.receipt).await.is_err() {
                 self.counters.broker_errors.fetch_add(1, Ordering::Relaxed);
             }
@@ -315,6 +322,58 @@ impl Shared {
         self.metrics
             .observe(&job.name, false, job.dispatched.elapsed());
         self.fail_job(job, outcome).await;
+    }
+
+    /// Queue the next step of a chain, if this job was carrying one.
+    ///
+    /// Every step's id was chosen by the client before any of them ran, so a
+    /// caller can hold a handle to the last one's result while the first is
+    /// still being written. The supervisor only moves data: it never has to
+    /// know what any of these names mean (spec §4.1).
+    async fn advance_chain(&self, job: &Job, outcome: &Outcome) {
+        if job.chain.is_empty() {
+            return;
+        }
+        let Ok(Value::Array(steps)) = rmpv::decode::read_value(&mut job.chain.as_slice()) else {
+            return;
+        };
+        let Some((next, rest)) = steps.split_first() else {
+            return;
+        };
+        let Value::Array(f) = next else { return };
+        if f.len() < 6 {
+            return;
+        }
+        let (id, name, payload, timeout_ms, queue, feed) = (
+            f[0].as_str().unwrap_or_default().to_string(),
+            f[1].as_str().unwrap_or_default().to_string(),
+            f[2].as_slice().unwrap_or_default().to_vec(),
+            f[3].as_u64().unwrap_or(0) as u32,
+            f[4].as_str().unwrap_or("default").to_string(),
+            f[5].as_bool().unwrap_or(true),
+        );
+        let payload = if feed {
+            prepend_result(&payload, &outcome.result)
+        } else {
+            payload
+        };
+        let mut tail = Vec::new();
+        if !rest.is_empty() {
+            let _ = rmpv::encode::write_value(&mut tail, &Value::Array(rest.to_vec()));
+        }
+        let next_job = NewJob {
+            id,
+            queue,
+            name,
+            payload,
+            timeout_ms,
+            chain: tail,
+        };
+        if self.broker.push(next_job, Duration::ZERO).await.is_err() {
+            self.counters.broker_errors.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.counters.chained.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// A child died holding this job (spec §4.4) — same policy as any other
@@ -456,6 +515,7 @@ impl Shared {
             receipt: delivery.receipt,
             dispatched: Instant::now(),
             ready_at_ms: delivery.ready_at_ms,
+            chain: delivery.chain,
         }
     }
 }
@@ -517,6 +577,32 @@ fn backoff_for(spec: Option<&Spec>, attempt: u32, seed: &str) -> Duration {
 
 /// A scheduled task takes no arguments: msgpack for `([], {})`, the same shape
 /// the producer sends.
+/// Put the previous step's result in front of the next step's arguments.
+///
+/// A payload is `[args, kwargs]`. Splicing rather than replacing is what lets
+/// `parse.s("utf-8")` receive both what it was given and what came before it.
+fn prepend_result(payload: &[u8], result: &[u8]) -> Vec<u8> {
+    let mut cursor = payload;
+    let Ok(Value::Array(parts)) = rmpv::decode::read_value(&mut cursor) else {
+        return payload.to_vec();
+    };
+    if parts.len() != 2 {
+        return payload.to_vec();
+    }
+    let Value::Array(args) = &parts[0] else {
+        return payload.to_vec();
+    };
+    let feed = rmpv::decode::read_value(&mut &result[..]).unwrap_or(Value::Nil);
+    let mut merged = vec![feed];
+    merged.extend(args.iter().cloned());
+    let mut out = Vec::new();
+    let _ = rmpv::encode::write_value(
+        &mut out,
+        &Value::Array(vec![Value::Array(merged), parts[1].clone()]),
+    );
+    out
+}
+
 fn no_arguments() -> Vec<u8> {
     let mut out = Vec::new();
     let empty = Value::Array(vec![Value::Array(Vec::new()), Value::Map(Vec::new())]);
@@ -540,6 +626,7 @@ fn counter_list(counters: &Counters) -> Vec<(&'static str, u64)> {
         ("task_retries", load(&counters.retried)),
         ("tasks_rate_limited", load(&counters.rate_limited)),
         ("tasks_expired", load(&counters.expired)),
+        ("chain_steps_queued", load(&counters.chained)),
         ("tasks_dead_lettered", load(&counters.dead_lettered)),
         ("cron_fired", load(&counters.cron_fired)),
         ("broker_errors", load(&counters.broker_errors)),
@@ -1460,6 +1547,7 @@ async fn supervise(
                             name: name.clone(),
                             payload: no_arguments(),
                             timeout_ms: spec.timeout_ms as u32,
+                            chain: Vec::new(),
                         };
                         if shared.broker.push(job, Duration::ZERO).await.is_err() {
                             shared
@@ -1684,6 +1772,7 @@ fn run(
                                     name,
                                     payload,
                                     timeout_ms: 0,
+                                    chain: Vec::new(),
                                 },
                                 Duration::ZERO,
                             )
@@ -1783,7 +1872,7 @@ impl Producer {
     }
 
     /// `delay` in seconds; zero enqueues immediately.
-    #[pyo3(signature = (id, queue, name, payload, timeout_ms, delay=0.0))]
+    #[pyo3(signature = (id, queue, name, payload, timeout_ms, delay=0.0, chain=Vec::new()))]
     #[allow(clippy::too_many_arguments)] // a pyo3 entry point, not a call site
     fn send(
         &self,
@@ -1794,6 +1883,7 @@ impl Producer {
         payload: Vec<u8>,
         timeout_ms: u32,
         delay: f64,
+        chain: Vec<u8>,
     ) -> PyResult<()> {
         let job = NewJob {
             id,
@@ -1801,6 +1891,7 @@ impl Producer {
             name,
             payload,
             timeout_ms,
+            chain,
         };
         let delay = Duration::from_secs_f64(delay.max(0.0));
         py.detach(|| self.runtime.block_on(self.broker.push(job, delay)))

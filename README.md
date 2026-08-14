@@ -307,6 +307,38 @@ thread and the loop is free for the whole wait rather than the parts Python was 
 That is a thread hop rather than a native async client: 500 concurrent enqueues take 57ms, and
 the ceiling is asyncio's default executor rather than the network.
 
+## Chains and groups
+
+```python
+from tarsk import chain, group
+
+pipeline = chain(fetch.s(url), parse.s(), store.si("bucket"))
+result_id = pipeline.send()          # only the first step is queued now
+answer = app.result(result_id).get() # the id of the last step, known up front
+
+ids = group(resize.s(f) for f in files).send()
+```
+
+`t.s(...)` is fed the previous step's result as its first argument; `t.si(...)` is not, for
+steps that take only what they were given. Every step's id is minted by the client before
+anything is sent, which is why a handle to the end of a chain exists while its first step is
+still being written.
+
+**The chain travels as data on the job record**, a list of `[id, name, payload, timeout, queue,
+feed]`. The supervisor splices the result into the next step's arguments and queues it; it never
+learns what any of those names mean, which is the same rule that keeps it from importing your
+app (§4.1). The next step is queued before the current one is acked, so a crash in between
+redelivers the step rather than dropping the rest of the chain — at-least-once, as everywhere
+else here.
+
+A chain that fails partway stops there: the remaining steps were never queued, so there is
+nothing to cancel. A group is deliberately thin — the queue already runs what it can in
+parallel, and what `group` adds is handles that exist before the sending does.
+
+**No chord.** Fanning back in needs a counter in the broker and every member's result gathered
+before the callback can run, which is a different kind of machinery from either of these. Ask
+if you want it.
+
 ## Expiry
 
 ```python

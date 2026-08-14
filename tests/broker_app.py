@@ -48,6 +48,26 @@ def medium(tag):
     return tag
 
 
+@app.task(name="double", result_ttl=60)
+def double(n):
+    _log(f"double-{n}")
+    return n * 2
+
+
+@app.task(name="add_to", result_ttl=60)
+def add_to(previous, n):
+    """First argument is what the step before returned."""
+    _log(f"add_to-{previous}+{n}")
+    return previous + n
+
+
+@app.task(name="shout", result_ttl=60)
+def shout(word):
+    """Immutable in a chain: it must not be handed the previous result."""
+    _log(f"shout-{word}")
+    return word.upper()
+
+
 @app.task(name="perishable", expires=2)
 def perishable(tag):
     """Worth doing now, not worth doing later."""

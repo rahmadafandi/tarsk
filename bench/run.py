@@ -238,6 +238,10 @@ class Result:
     peak_sampled: int = 0
     peak_total: int = 0
     peak_total_pss: float = 0.0
+    # What the CPU probe read just before this row was measured. Kept per row
+    # rather than per run: knowing the machine drifted somewhere is not the
+    # same as knowing which numbers to distrust.
+    probe_ms: float = 0.0
     peak_root: int = 0
     gaps: list[float] = field(default_factory=list)
     note: str = ""
@@ -336,9 +340,18 @@ def contamination() -> str | None:
         return None
     return (f"**The machine drifted during this run**: an identical CPU probe took "
             f"{min(PROBES) * 1000:.0f}ms at its fastest and {max(PROBES) * 1000:.0f}ms at "
-            f"its slowest, {spread:.1f}x apart. Rows measured at different times are not "
-            f"comparable with each other. Re-run on an idle machine before believing any "
-            f"ordering here.")
+            f"its slowest, {spread:.1f}x apart. Rows marked `slow` were measured while it "
+            f"was; rows without the mark were measured within 25% of the run's median and "
+            f"are comparable with each other. On a laptop this is usually the benchmark "
+            f"heating the machine it is running on.")
+
+
+def slow_mark(row) -> str:
+    """`slow` when this row was measured on a machine that had fallen behind."""
+    if not PROBES or not row.probe_ms:
+        return ""
+    baseline = statistics.median(PROBES) * 1000
+    return " `slow`" if row.probe_ms > baseline * 1.25 else ""
 
 
 def celery_cmd(max_tasks_per_child: int | None, workers: int | None = 1) -> list[str]:
@@ -566,8 +579,10 @@ def case(framework: str, label: str, task: str, count: int, args: list, timeout:
             submit_taskiq(task, count, args, taskiq_module)
             cmd = taskiq_cmd(taskiq_workers, taskiq_module, taskiq_async)
 
-    PROBES.append(probe())
+    took = probe()
+    PROBES.append(took)
     result = run_worker(cmd, env, count, log, timeout, memory_max, restarts, sample=sample)
+    result.probe_ms = took * 1000
     result.framework, result.label = framework, label
     return result
 
@@ -588,6 +603,7 @@ def table(title: str, note: str, rows: list[Result], columns: list[str]) -> None
     print("|---" * (len(columns) + 1) + "|")
     for r in rows:
         cells = []
+        mark = slow_mark(r)
         for column in columns:
             if column == "peak":
                 cells.append(f"{r.peak_worker / MB:.0f} MB")
@@ -617,7 +633,7 @@ def table(title: str, note: str, rows: list[Result], columns: list[str]) -> None
                 cells.append(f"{quantile(r.gaps, 0.99) * 1000:.0f} ms" if r.gaps else "—")
             elif column == "maxgap":
                 cells.append(f"{max(r.gaps) * 1000:.0f} ms" if r.gaps else "—")
-        print(f"| {r.framework} {r.label} | " + " | ".join(cells) + " |")
+        print(f"| {r.framework} {r.label}{mark} | " + " | ".join(cells) + " |")
 
 
 def quantile(values: list[float], q: float) -> float:
@@ -915,8 +931,8 @@ def scenario_io(redis: Redis, tmp: Path) -> None:
         wall = row.work if row.completed == count else float("nan")
         vs = f"{wall / floor4:.2f}×" if wall == wall else "—"
         shown = f"{wall:.2f}s" if wall == wall else "did not drain"
-        print(f"| {row.label} | {shown} | {vs} | {row.peak_total // MB} MB | "
-              f"{row.completed}/{count} |")
+        print(f"| {row.label}{slow_mark(row)} | {shown} | {vs} | "
+              f"{row.peak_total // MB} MB | {row.completed}/{count} |")
     print(f"\nThe 4-way floor is {floor4:.1f}s.\n")
 
 

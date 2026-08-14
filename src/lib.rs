@@ -241,6 +241,21 @@ pub(crate) struct Shared {
     /// to know this: how early to start is a question about wall-clock, and a
     /// percentage of a limit answers a different question.
     spawn_ms: AtomicU64,
+    /// Observed cost of running one task, in bytes of child RSS that never came
+    /// back. Learned the same way `spawn_ms` is, and for the same reason: the
+    /// ceiling is a question about bytes, and a slot count answers a different
+    /// one. Kept on `Shared` rather than per child so the estimate outlives the
+    /// child that paid for it — otherwise every replacement relearns it at the
+    /// ceiling's expense, which is exactly the cold start this is here to fix.
+    ///
+    /// The running *maximum*, not the mean. A workload whose tasks cost 2MB and
+    /// 80MB by turns has a mean that fits under any ceiling and a tail that does
+    /// not, and the tail is the one that overshoots.
+    task_growth: AtomicU64,
+    /// How many completed tasks the estimate above has seen. Zero means nothing
+    /// is known yet — which is different from knowing the growth is zero, and
+    /// the difference decides whether a fresh child ramps or opens up.
+    growth_samples: AtomicU64,
     counters: Counters,
     metrics: Metrics,
     /// Which trigger fired, per recycle — the leaky-handler demo needs to show
@@ -251,6 +266,29 @@ pub(crate) struct Shared {
 impl Shared {
     fn spawn_estimate(&self) -> Duration {
         Duration::from_millis(self.spawn_ms.load(Ordering::Relaxed))
+    }
+
+    /// Bytes one task is expected to cost, and whether that is a measurement or
+    /// an absence of one.
+    fn growth_estimate(&self) -> Growth {
+        Growth {
+            bytes: self.task_growth.load(Ordering::Relaxed),
+            measured: self.growth_samples.load(Ordering::Relaxed) > 0,
+        }
+    }
+
+    /// Fold one child's RSS reading into the estimate.
+    ///
+    /// `(rss - baseline) / tasks_done` is what this child has cost per task so
+    /// far. Attributing all of it to the tasks is deliberate: a handler that
+    /// grows the interpreter for any other reason still grows it, and a ceiling
+    /// that only counted the growth it approved of would not hold.
+    fn observe_growth(&self, rss: u64, baseline: u64, tasks_done: u64) {
+        let Some(per_task) = per_task_growth(rss, baseline, tasks_done) else {
+            return;
+        };
+        self.task_growth.fetch_max(per_task, Ordering::Relaxed);
+        self.growth_samples.fetch_max(tasks_done, Ordering::Relaxed);
     }
 
     fn batch(&self) -> bool {
@@ -576,6 +614,11 @@ struct ChildHandle {
     started: Instant,
     tasks_done: u64,
     inflight: HashMap<u64, Job>,
+    /// RSS the moment this child finished importing and before it ran anything.
+    /// Every byte above it is what the tasks cost. Zero when no ceiling is set,
+    /// because then nobody reads it and measuring costs a `/proc` walk per
+    /// spawn for nothing.
+    baseline: u64,
 }
 
 #[derive(Clone)]
@@ -868,22 +911,26 @@ async fn spawn_child(shared: &Arc<Shared>, cfg: &Cfg) -> Option<ChildHandle> {
     // would register, be recycled on its first Ready, and hand the same problem
     // to its replacement forever. That is a misconfiguration, not a leak, and it
     // deserves a diagnosis rather than a spawn loop.
+    let mut baseline = 0;
     if cfg.max_rss > 0 && pid != 0 {
         let mut sys = System::new();
         let key = Pid::from_u32(pid);
         sys.refresh_processes(ProcessesToUpdate::Some(&[key]), false);
-        if let Some(baseline) = sys.process(key).map(|p| p.memory()) {
-            if baseline >= cfg.max_rss {
+        if let Some(bytes) = sys.process(key).map(|p| p.memory()) {
+            if bytes >= cfg.max_rss {
                 shared.fail(format!(
                     "child baseline is {}MB but max_rss is {}MB: importing {} already \
                      clears the ceiling before any task runs. Raise the ceiling above the \
                      interpreter plus your task modules.",
-                    baseline / (1024 * 1024),
+                    bytes / (1024 * 1024),
                     cfg.max_rss / (1024 * 1024),
                     cfg.app_spec,
                 ));
                 return None;
             }
+            // Kept, not discarded: this reading is the zero that every later
+            // one is measured against, and it was already paid for.
+            baseline = bytes;
         }
     }
 
@@ -899,11 +946,74 @@ async fn spawn_child(shared: &Arc<Shared>, cfg: &Cfg) -> Option<ChildHandle> {
         started: Instant::now(),
         tasks_done: 0,
         inflight: HashMap::new(),
+        baseline,
     })
 }
 
 async fn drain_owned(shared: Arc<Shared>, child: ChildHandle, cfg: Arc<Cfg>) {
     drain(&shared, child, &cfg).await;
+}
+
+/// Bytes per task from one reading, or `None` when the reading cannot answer.
+///
+/// A baseline of zero means no ceiling was set and nothing was measured at
+/// spawn, so there is no zero to subtract from; a child that has completed
+/// nothing has no per-task cost yet.
+fn per_task_growth(rss: u64, baseline: u64, tasks_done: u64) -> Option<u64> {
+    if tasks_done == 0 || baseline == 0 {
+        return None;
+    }
+    Some(rss.saturating_sub(baseline) / tasks_done)
+}
+
+/// RSS to judge against the ceiling: what it is now, plus what the next task is
+/// expected to add once anything is known about that.
+fn projected_rss(rss: u64, growth: Growth, tasks_done: u64) -> u64 {
+    if tasks_done == 0 {
+        return rss;
+    }
+    rss.saturating_add(growth.bytes)
+}
+
+/// What one task is expected to cost in child RSS.
+#[derive(Clone, Copy)]
+struct Growth {
+    bytes: u64,
+    /// False until a task has completed anywhere in this run. Distinct from
+    /// `bytes == 0`, which is a real answer: handlers that wait on other
+    /// services do not grow, and they are most of what a task queue runs.
+    measured: bool,
+}
+
+/// A fresh child with nothing measured yet may hold this many tasks at once.
+///
+/// The number only applies with a ceiling set and only until the first task
+/// completes, which is a few milliseconds into the run. Four rather than one
+/// because the point is to learn the cost quickly without paying a hundred
+/// times for it: a child that fits under the ceiling at all fits four typical
+/// tasks, and if it does not, the first reading says so and the second batch is
+/// budgeted properly.
+const COLD_START_SLOTS: usize = 4;
+
+/// How many more tasks this child may be holding at once.
+///
+/// Without a ceiling this is not a question anyone asked, so it is not asked:
+/// `--slots N` means N, and the answer is unbounded. With a ceiling it is the
+/// headroom divided by what a task costs — which is the whole reason the
+/// ceiling failed to bind above one slot. A hundred slots handed a child a
+/// hundred tasks while its RSS still read baseline, and the ceiling was next
+/// consulted long after all hundred had allocated.
+fn slot_budget(rss: u64, growth: Growth, max_rss: u64) -> usize {
+    if max_rss == 0 {
+        return usize::MAX;
+    }
+    if !growth.measured {
+        return COLD_START_SLOTS;
+    }
+    if growth.bytes == 0 {
+        return usize::MAX;
+    }
+    (max_rss.saturating_sub(rss) / growth.bytes) as usize
 }
 
 /// How close this child is to the nearest of its recycle triggers.
@@ -915,7 +1025,14 @@ struct Pressure {
     rss: Option<u64>,
 }
 
-fn pressure(sys: &mut System, pid: u32, tasks_done: u64, started: Instant, cfg: &Cfg) -> Pressure {
+fn pressure(
+    sys: &mut System,
+    pid: u32,
+    tasks_done: u64,
+    started: Instant,
+    cfg: &Cfg,
+    growth: Growth,
+) -> Pressure {
     let mut worst = (0.0f64, "");
     let mut rss = None;
     if cfg.max_tasks > 0 {
@@ -933,7 +1050,17 @@ fn pressure(sys: &mut System, pid: u32, tasks_done: u64, started: Instant, cfg: 
         if let Some(bytes) = transport::child_rss_with(sys, pid) {
             rss = Some(bytes);
             if cfg.max_rss > 0 {
-                let ratio = bytes as f64 / cfg.max_rss as f64;
+                // Retire on what the *next* task would cost, not on what the
+                // last one did. Reading `bytes` alone means the ceiling is
+                // crossed before anything reacts, so the peak is always the
+                // ceiling plus a task; adding the task first lands under it,
+                // which is how `--max-tasks-per-child` bounds tighter when it
+                // happens to be tuned right.
+                //
+                // Only once something has been measured. A child that has run
+                // nothing is entitled to try: refusing it here would recycle
+                // every child before its first task and call it a ceiling.
+                let ratio = projected_rss(bytes, growth, tasks_done) as f64 / cfg.max_rss as f64;
                 if ratio > worst.0 {
                     worst = (ratio, "max_rss");
                 }
@@ -987,6 +1114,7 @@ async fn serve(shared: &Arc<Shared>, child: &mut ChildHandle, cfg: &Arc<Cfg>) ->
         started,
         tasks_done,
         inflight,
+        baseline,
         ..
     } = child;
     let mut sys = System::new();
@@ -999,18 +1127,27 @@ async fn serve(shared: &Arc<Shared>, child: &mut ChildHandle, cfg: &Arc<Cfg>) ->
     let mut arming = false;
     // Slots this child has advertised with a Ready and we have not filled.
     let mut free: usize = 0;
+    // How many tasks this child may hold at once, as of the last RSS reading.
+    // Unbounded without a ceiling, which is every run that never asked for one.
+    let mut allowed: usize = usize::MAX;
 
     // Read the pressure, start the replacement if the trigger is close, and
     // report the trigger if it has already fired.
     macro_rules! check {
         () => {{
-            let reading = pressure(&mut sys, *pid, *tasks_done, *started, cfg);
+            let growth = shared.growth_estimate();
+            let reading = pressure(&mut sys, *pid, *tasks_done, *started, cfg, growth);
             if let Some(bytes) = reading.rss {
                 shared.metrics.set_child_rss(*pid, bytes);
                 shared
                     .counters
                     .child_rss_peak
                     .fetch_max(bytes, Ordering::Relaxed);
+                // Learn from this reading before anything acts on it, so the
+                // first child to grow pays for the lesson once and every child
+                // after it starts already knowing.
+                shared.observe_growth(bytes, *baseline, *tasks_done);
+                allowed = slot_budget(bytes, shared.growth_estimate(), cfg.max_rss);
             }
             if spare.is_none()
                 && !arming
@@ -1035,7 +1172,12 @@ async fn serve(shared: &Arc<Shared>, child: &mut ChildHandle, cfg: &Arc<Cfg>) ->
     macro_rules! fill {
         () => {{
             let mut outcome = Fill::Empty;
-            while free > 0 {
+            // `free` is what the child says it can take; `allowed` is what the
+            // ceiling says it can afford. Filling to the first and ignoring the
+            // second is how a hundred slots reached 824MB under a 200MB
+            // ceiling: every one of them was handed a task while the RSS read
+            // baseline, and nothing looked again until they had all allocated.
+            while free > 0 && inflight.len() < allowed {
                 let job = if inflight.is_empty() {
                     match shared.next_job(cfg.lease_grace, cfg.claim_block).await {
                         Some(job) => job,
@@ -1289,12 +1431,12 @@ async fn serve(shared: &Arc<Shared>, child: &mut ChildHandle, cfg: &Arc<Cfg>) ->
                         tokio::spawn(drain_owned(shared.clone(), stale, cfg.clone()));
                     }
                 }
+                let reading = check!();
                 if free > 0 && !inflight.is_empty() {
                     if let Fill::Dead = fill!() {
                         return Served { exit: Exit::Died, spare };
                     }
                 }
-                let reading = check!();
                 // The hard ceiling is the one that does not wait for a good
                 // moment. Draining an idle child gets there just as well and
                 // costs nothing, so only work in flight is worth killing over.
@@ -1781,6 +1923,8 @@ fn new_shared(broker: Broker, total: usize, batch: bool) -> Arc<Shared> {
         max_dead: AtomicU64::new(0),
         revoked: Mutex::new(std::collections::HashSet::new()),
         spawn_ms: AtomicU64::new(250), // replaced by the first real measurement
+        task_growth: AtomicU64::new(0),
+        growth_samples: AtomicU64::new(0),
         counters: Counters::default(),
         metrics: Metrics::default(),
         reasons: Mutex::new(HashMap::new()),
@@ -2243,5 +2387,77 @@ mod tests {
             mode, 0o700,
             "socket dir must not be reachable by other users"
         );
+    }
+}
+
+#[cfg(test)]
+mod ceiling_tests {
+    use super::*;
+
+    const MB: u64 = 1024 * 1024;
+    fn known(bytes: u64) -> Growth {
+        Growth {
+            bytes,
+            measured: true,
+        }
+    }
+    const UNKNOWN: Growth = Growth {
+        bytes: 0,
+        measured: false,
+    };
+
+    #[test]
+    fn no_ceiling_means_no_budget() {
+        // `--slots N` without `--max-rss` is a promise of N, and nothing here
+        // is entitled to quietly deliver fewer.
+        assert_eq!(slot_budget(500 * MB, known(20 * MB), 0), usize::MAX);
+        assert_eq!(slot_budget(0, UNKNOWN, 0), usize::MAX);
+    }
+
+    #[test]
+    fn a_measured_zero_is_not_the_same_as_no_measurement() {
+        // Handlers that wait on other services do not grow, and they are the
+        // reason the default is a hundred slots. Confusing "grows by nothing"
+        // with "nothing known yet" would cap that workload at four for the
+        // life of the run.
+        assert_eq!(slot_budget(30 * MB, known(0), 200 * MB), usize::MAX);
+        assert_eq!(slot_budget(30 * MB, UNKNOWN, 200 * MB), COLD_START_SLOTS);
+    }
+
+    #[test]
+    fn the_ceiling_binds_above_one_slot() {
+        // The 824MB case: a fresh child at 23MB under a 200MB ceiling, tasks
+        // costing 20MB each. Eight fit. A hundred were dispatched.
+        assert_eq!(slot_budget(23 * MB, known(20 * MB), 200 * MB), 8);
+    }
+
+    #[test]
+    fn budget_closes_as_the_child_fills() {
+        let growth = known(20 * MB);
+        assert_eq!(slot_budget(100 * MB, growth, 200 * MB), 5);
+        assert_eq!(slot_budget(185 * MB, growth, 200 * MB), 0);
+        // Past the ceiling entirely — saturating, not wrapping to a huge budget.
+        assert_eq!(slot_budget(900 * MB, growth, 200 * MB), 0);
+    }
+
+    #[test]
+    fn retirement_is_judged_on_the_next_task_not_the_last() {
+        let growth = known(20 * MB);
+        // 190MB against a 200MB ceiling: room by the old reading, none once the
+        // next task is counted. Retiring here is what lands the peak under
+        // budget instead of one task above it.
+        assert_eq!(projected_rss(190 * MB, growth, 5), 210 * MB);
+        // A child that has run nothing is entitled to try, whatever is known
+        // about tasks in general.
+        assert_eq!(projected_rss(190 * MB, growth, 0), 190 * MB);
+    }
+
+    #[test]
+    fn growth_is_per_task_and_ignores_unanswerable_readings() {
+        assert_eq!(per_task_growth(123 * MB, 23 * MB, 5), Some(20 * MB));
+        assert_eq!(per_task_growth(123 * MB, 23 * MB, 0), None);
+        assert_eq!(per_task_growth(123 * MB, 0, 5), None);
+        // A child that shrank is not a negative cost.
+        assert_eq!(per_task_growth(10 * MB, 23 * MB, 5), Some(0));
     }
 }

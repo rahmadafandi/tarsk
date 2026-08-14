@@ -7,7 +7,16 @@ requires-python = ">=3.11"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Rahmad Afandi", email = "rahmadafandiii@gmail.com" }]
-keywords = ["task-queue", "worker", "redis", "postgres", "rust", "memory"]
+# Two groups. The first is what someone types when they want this category at
+# all — celery and taskiq both carry "distributed", and neither hyphenates, so
+# the singular words are here beside the compound ones people also try.
+# The second is the problem this exists for, spelled the way it is searched:
+# nobody with a leaking worker searches "memory", they search OOMKilled.
+keywords = [
+    "task-queue", "queue", "tasks", "jobs", "background-jobs", "worker",
+    "distributed", "async", "scheduler", "cron",
+    "memory-limit", "oom", "rss", "redis", "postgres", "rust",
+]
 dependencies = ["msgpack>=1.0"]
 
 classifiers = [
@@ -17,6 +26,9 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Rust",
     "Topic :: System :: Distributed Computing",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Monitoring",
+    "Framework :: AsyncIO",
     "Typing :: Typed",
     # Each of these runs the test suite in CI. Windows runs the two suites that
     # do not need a broker, because neither Redis nor Postgres ships for it.

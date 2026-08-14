@@ -61,8 +61,8 @@ expiry, send deduplication, an async producer, and a Prometheus endpoint that
 reports queue depth and the supervisor's own RSS so both constants can be checked
 rather than believed.
 
-Pre-release: no published wheel yet. Linux and macOS, both tested in CI on
-3.11 through 3.14 including the free-threaded build.
+Pre-release: no published wheel yet. Linux, macOS and Windows, all three tested
+in CI on 3.11 through 3.14 including the free-threaded build.
 ```
 
 ---

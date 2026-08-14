@@ -472,6 +472,27 @@ be perfectly healthy on throughput while an hour deep in backlog.
 not yet due. On Postgres those two are both a lease in the future and only `run_lease` tells
 them apart — a delayed job has never been claimed.
 
+## Platforms
+
+Linux, macOS and Windows, each running the test suite in CI on every push, across 3.11 to 3.14
+including the free-threaded build.
+
+The supervisor-to-child channel is a Unix socket where there is one and a named pipe on
+Windows. Not a loopback port on either: it carries task payloads and is believed when it says a
+job finished, and a port is reachable by every process on the machine — inside a Kubernetes Pod
+that includes every sidecar. Both of the chosen ones are protected, by directory permissions
+and by an ACL.
+
+Two differences worth knowing. Windows has no SIGTERM, so the polite step before terminating a
+child is skipped; the supervisor has already sent a `Drain` frame and waited by then, so this
+was the second escalation rather than the first. And on Windows the ceiling measures the worker
+*and its descendants*, because a venv's `python.exe` there can be a launcher that runs the real
+interpreter as a child — measured against only the pid it spawned, the supervisor watched a
+four-megabyte stub while the worker held three hundred, and never recycled.
+
+Windows CI skips the broker suites, since neither Redis nor Postgres ships for it. The channel,
+the protocol, recycling and the ceiling are all covered.
+
 ## Metrics
 
 `--metrics HOST:PORT` serves Prometheus text from the supervisor. Nothing is sampled for the
@@ -488,9 +509,8 @@ checked rather than believed.
 - No strict priority. A worker reads `--queues high,low` in that order within one claim, which
   prefers the first without being a priority queue
 - No soft timeout — a task is stopped at its deadline rather than warned before it
-- Linux and macOS run the full suite in CI, on 3.11 through 3.14 including free-threaded.
-  Windows runs the two suites that need no broker, since neither Redis nor Postgres ships for
-  it — the channel there is a named pipe rather than a Unix socket
+- Windows runs the suites that need no broker, since neither Redis nor Postgres ships for it.
+  Everything else — the channel, recycling, the memory ceiling — is tested there
 
 ## Running the tests
 

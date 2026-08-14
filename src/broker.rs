@@ -93,6 +93,22 @@ pub struct Delivery {
     pub ready_at_ms: u64,
 }
 
+/// How much work is sitting in one queue, as an operator needs to see it.
+///
+/// The question "how far behind are we" had no answer here: the metrics
+/// counted tasks finished and never tasks waiting, which reports throughput
+/// while saying nothing about backlog.
+pub struct Depth {
+    pub queue: String,
+    /// Claimable right now.
+    pub ready: u64,
+    /// Handed to a worker and not yet settled.
+    pub in_flight: u64,
+    /// Enqueued for later and not yet due.
+    pub delayed: u64,
+    pub dead: u64,
+}
+
 /// One parked failure, as a human needs to see it.
 pub struct Dead {
     pub id: String,
@@ -213,6 +229,26 @@ impl Broker {
                 Ok(out)
             }
             Broker::Postgres(b) => b.revoked_all().await,
+        }
+    }
+
+    /// Backlog across the queues this broker was opened on — what a worker
+    /// reports about its own queues.
+    pub async fn depth(&self) -> Res<Vec<Depth>> {
+        match self {
+            Broker::Memory(_) => Ok(Vec::new()),
+            Broker::Redis(b) => b.depth(&b.queues).await,
+            Broker::Postgres(b) => b.depth(&b.queues).await,
+        }
+    }
+
+    /// Backlog for named queues, for a caller that opened no queues of its own
+    /// — `tarsk status` is not a worker and subscribes to nothing.
+    pub async fn depth_of(&self, queues: &[String]) -> Res<Vec<Depth>> {
+        match self {
+            Broker::Memory(_) => Ok(Vec::new()),
+            Broker::Redis(b) => b.depth(queues).await,
+            Broker::Postgres(b) => b.depth(queues).await,
         }
     }
 
@@ -860,6 +896,47 @@ impl RedisBroker {
         Ok(())
     }
 
+    async fn depth(&self, queues: &[String]) -> Res<Vec<Depth>> {
+        let mut out = Vec::new();
+        for queue in queues {
+            let key = stream_key(queue);
+            let mut conn = self.conn.clone();
+            // XLEN counts what is still in the stream, and an entry only leaves
+            // on ack — so it is ready plus in-flight, and the pending count
+            // separates them.
+            let (len, dead, delayed): (u64, u64, u64) = redis::pipe()
+                .cmd("XLEN")
+                .arg(&key)
+                .cmd("XLEN")
+                .arg(format!("{key}:dead"))
+                .cmd("ZCARD")
+                .arg(delayed_key(queue))
+                .query_async(&mut conn)
+                .await?;
+            // NOGROUP when nothing has ever been sent to this queue, which is a
+            // real state to report as zeros rather than an error to raise at
+            // someone who typed `tarsk status`.
+            let pending: Option<redis::streams::StreamPendingReply> = redis::cmd("XPENDING")
+                .arg(&key)
+                .arg(REDIS_GROUP)
+                .query_async(&mut conn)
+                .await
+                .ok();
+            let in_flight = match pending {
+                Some(redis::streams::StreamPendingReply::Data(d)) => d.count as u64,
+                _ => 0,
+            };
+            out.push(Depth {
+                queue: queue.clone(),
+                ready: len.saturating_sub(in_flight),
+                in_flight,
+                delayed,
+                dead,
+            });
+        }
+        Ok(out)
+    }
+
     async fn take_token(&self, task: &str, per_sec: f64, burst: u32) -> Res<u64> {
         // Read-refill-write has to be one step or two workers both see the last
         // token. Lua is the only thing Redis offers that is; MULTI would not
@@ -1411,6 +1488,47 @@ impl PgBroker {
     }
 
     /// One statement, so the row cannot be in both tables or neither.
+    async fn depth(&self, queues: &[String]) -> Res<Vec<Depth>> {
+        // run_lease separates the two kinds of future lease_until: a delayed
+        // job has never been claimed, an in-flight one has. Without it the
+        // backlog and the work in progress look identical.
+        let rows = self
+            .client
+            .query(
+                "select queue,
+                        count(*) filter (where lease_until is null or lease_until < now()),
+                        count(*) filter (where lease_until >= now() and run_lease > 0),
+                        count(*) filter (where lease_until >= now() and run_lease = 0)
+                   from tarsk_jobs where queue = any($1) group by queue",
+                &[&queues],
+            )
+            .await?;
+        let dead = self
+            .client
+            .query(
+                "select queue, count(*) from tarsk_dead where queue = any($1) group by queue",
+                &[&queues],
+            )
+            .await?;
+        let mut out = Vec::new();
+        for queue in queues {
+            let row = rows.iter().find(|r| r.get::<_, String>(0) == *queue);
+            let buried = dead
+                .iter()
+                .find(|r| r.get::<_, String>(0) == *queue)
+                .map(|r| r.get::<_, i64>(1))
+                .unwrap_or(0);
+            out.push(Depth {
+                queue: queue.clone(),
+                ready: row.map(|r| r.get::<_, i64>(1)).unwrap_or(0).max(0) as u64,
+                in_flight: row.map(|r| r.get::<_, i64>(2)).unwrap_or(0).max(0) as u64,
+                delayed: row.map(|r| r.get::<_, i64>(3)).unwrap_or(0).max(0) as u64,
+                dead: buried.max(0) as u64,
+            });
+        }
+        Ok(out)
+    }
+
     async fn take_token(&self, task: &str, per_sec: f64, burst: u32) -> Res<u64> {
         // One statement, so a refill and a take cannot be split by another
         // worker. `refill` reads the row inside the same statement that

@@ -409,6 +409,26 @@ Neither command needs `--app`. A cancellation is an id and a dead letter is a na
 and a traceback; none of them needs your code to be importable, which matters exactly when the
 reason the tasks died is that it is not.
 
+## Seeing the backlog
+
+```
+$ tarsk status --broker redis://localhost:6379/0 --queues default,reports
+queue       ready  running  delayed     dead
+default        25        0        5        0
+reports         0        1        0        2
+```
+
+And as `tarsk_queue_jobs{queue,state}` on the metrics endpoint, refreshed by the worker on the
+same timer that pulls cancellations.
+
+This is the question an operator asks first — *how far behind are we* — and until this existed
+the metrics could not answer it. They counted tasks finished, which is throughput; a queue can
+be perfectly healthy on throughput while an hour deep in backlog.
+
+`running` is work handed to a worker and not yet settled, `delayed` is enqueued for later and
+not yet due. On Postgres those two are both a lease in the future and only `run_lease` tells
+them apart — a delayed job has never been claimed.
+
 ## Metrics
 
 `--metrics HOST:PORT` serves Prometheus text from the supervisor. Nothing is sampled for the

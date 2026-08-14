@@ -29,6 +29,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="tarsk")
     sub = parser.add_subparsers(dest="command", required=True)
 
+    status = sub.add_parser("status", help="how much work is waiting")
+    status.add_argument("--broker", default=os.environ.get("TARSK_BROKER"),
+                        help="redis://…, postgres://… (or TARSK_BROKER)")
+    status.add_argument("--queues", default="default", help="comma separated")
+
     cancel = sub.add_parser("cancel", help="stop queued jobs from running")
     cancel.add_argument("ids", nargs="+", metavar="ID")
     cancel.add_argument("--broker", default=os.environ.get("TARSK_BROKER"),
@@ -142,6 +147,18 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if not args.broker:
         sys.exit("no broker: pass --broker or set TARSK_BROKER")
+    if args.command == "status":
+        from ._core import Producer
+
+        wanted = [q.strip() for q in args.queues.split(",") if q.strip()]
+        rows = Producer(broker_url=args.broker).depth(wanted)
+        width = max((len(r[0]) for r in rows), default=5)
+        print(f"{'queue':<{width}}  {'ready':>8} {'running':>8} {'delayed':>8} {'dead':>8}")
+        for queue, ready, running, delayed, dead in rows:
+            print(f"{queue:<{width}}  {ready:>8} {running:>8} {delayed:>8} {dead:>8}")
+        if not rows:
+            print("(no such queue, or nothing has ever been sent to it)")
+        return 0
     if args.command == "cancel":
         from ._core import Producer
 

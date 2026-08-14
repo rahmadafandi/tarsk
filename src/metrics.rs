@@ -48,6 +48,10 @@ pub struct Metrics {
     /// Last RSS reading per live child, from the supervision loop that was
     /// already taking it. Nothing is sampled for the sake of metrics alone.
     child_rss: Mutex<HashMap<u32, u64>>,
+    /// Backlog per queue: (ready, in flight, delayed, dead). Polled on a timer
+    /// rather than counted here, because the numbers live in the broker and
+    /// this process is not the only one working the queue.
+    depth: Mutex<Vec<(String, [u64; 4])>>,
 }
 
 impl Metrics {
@@ -64,6 +68,10 @@ impl Metrics {
         self.duration_count.fetch_add(1, Ordering::Relaxed);
         let mut tasks = self.tasks.lock().unwrap();
         tasks.entry(task.to_string()).or_default()[usize::from(!ok)] += 1;
+    }
+
+    pub fn set_depth(&self, rows: Vec<(String, [u64; 4])>) {
+        *self.depth.lock().unwrap() = rows;
     }
 
     pub fn set_child_rss(&self, pid: u32, bytes: u64) {
@@ -94,6 +102,25 @@ pub fn render(
         out.push_str(&format!("# TYPE tarsk_{name}_total counter\n"));
         out.push_str(&format!("tarsk_{name}_total {value}\n"));
     }
+
+    let depth = metrics.depth.lock().unwrap();
+    if !depth.is_empty() {
+        out.push_str("# HELP tarsk_queue_jobs How much work is waiting, by queue and state.\n");
+        out.push_str("# TYPE tarsk_queue_jobs gauge\n");
+        for (queue, [ready, in_flight, delayed, dead]) in depth.iter() {
+            for (state, value) in [
+                ("ready", ready),
+                ("in_flight", in_flight),
+                ("delayed", delayed),
+                ("dead", dead),
+            ] {
+                out.push_str(&format!(
+                    "tarsk_queue_jobs{{queue=\"{queue}\",state=\"{state}\"}} {value}\n"
+                ));
+            }
+        }
+    }
+    drop(depth);
 
     out.push_str("# HELP tarsk_recycles_by_reason_total Which limit retired a child.\n");
     out.push_str("# TYPE tarsk_recycles_by_reason_total counter\n");

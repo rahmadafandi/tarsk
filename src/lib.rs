@@ -1454,6 +1454,19 @@ async fn supervise(
         let shared = shared.clone();
         tokio::spawn(async move {
             while !shared.done.load(Ordering::SeqCst) {
+                match shared.broker.depth().await {
+                    Ok(rows) => shared.metrics.set_depth(
+                        rows.into_iter()
+                            .map(|d| (d.queue, [d.ready, d.in_flight, d.delayed, d.dead]))
+                            .collect(),
+                    ),
+                    Err(_) => {
+                        shared
+                            .counters
+                            .broker_errors
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
                 match shared.broker.revoked_all().await {
                     Ok(ids) => *shared.revoked.lock().unwrap() = ids.into_iter().collect(),
                     Err(_) => {
@@ -1850,6 +1863,9 @@ fn work(
 /// when it died in milliseconds since the epoch.
 type DeadRow = (String, String, String, String, u64);
 
+/// One queue's backlog crossing into Python: name, ready, in flight, delayed, dead.
+type DepthRow = (String, u64, u64, u64, u64);
+
 /// Producer handle. Holds its own runtime and connection so enqueueing from a
 /// web request is one round trip, not a reconnect.
 #[pyclass]
@@ -1925,6 +1941,18 @@ impl Producer {
             )
         })
         .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+
+    /// Backlog per queue: (queue, ready, in flight, delayed, dead).
+    #[pyo3(signature = (queues))]
+    fn depth(&self, py: Python<'_>, queues: Vec<String>) -> PyResult<Vec<DepthRow>> {
+        let rows = py
+            .detach(|| self.runtime.block_on(self.broker.depth_of(&queues)))
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(|d| (d.queue, d.ready, d.in_flight, d.delayed, d.dead))
+            .collect())
     }
 
     /// Parked failures, oldest first.

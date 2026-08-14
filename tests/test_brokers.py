@@ -327,6 +327,33 @@ def check_broker(url: str, label: str) -> None:
             stop_worker(worker)
         assert ticks == ["tick"], f"{label}: expected exactly one tick, got {ticks}"
 
+        # --- the backlog is visible before, during and after -------------
+        log.write_text("")
+        from tarsk._core import Producer
+
+        producer = Producer(broker_url=url)
+
+        def depth():
+            rows = producer.depth(["default"])
+            return rows[0][1:] if rows else (0, 0, 0, 0)
+
+        before = depth()
+        for i in range(4):
+            app.registry["note"].send(f"depth-{i}")
+        ready, running, delayed, _dead = depth()
+        assert ready == before[0] + 4, f"{label}: four sent, ready went {before[0]} → {ready}"
+        assert delayed == before[2], f"{label}: nothing was delayed, but delayed={delayed}"
+        worker = start_worker(env, TARSK_LEASE_GRACE=1)
+        try:
+            deadline = time.time() + 30
+            while time.time() < deadline and len(tags_in(log)) < 4:
+                time.sleep(0.2)
+        finally:
+            stop_worker(worker)
+        ready, running, _delayed, _dead = depth()
+        assert (ready, running) == (0, 0), \
+            f"{label}: queue drained but reports ready={ready} running={running}"
+
         # --- a chain runs in order and feeds each result to the next ------
         log.write_text("")
         from tarsk import chain

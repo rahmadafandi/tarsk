@@ -7,11 +7,6 @@ requires-python = ">=3.11"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Rahmad Afandi", email = "rahmadafandiii@gmail.com" }]
-# Two groups. The first is what someone types when they want this category at
-# all — celery and taskiq both carry "distributed", and neither hyphenates, so
-# the singular words are here beside the compound ones people also try.
-# The second is the problem this exists for, spelled the way it is searched:
-# nobody with a leaking worker searches "memory", they search OOMKilled.
 keywords = [
     "task-queue", "queue", "tasks", "jobs", "background-jobs", "worker",
     "distributed", "async", "scheduler", "cron",
@@ -20,7 +15,6 @@ keywords = [
 dependencies = ["msgpack>=1.0"]
 
 classifiers = [
-    # Pre-release, and the trove classifier is the one place people look first.
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
@@ -30,8 +24,6 @@ classifiers = [
     "Topic :: System :: Monitoring",
     "Framework :: AsyncIO",
     "Typing :: Typed",
-    # Each of these runs the test suite in CI. Windows runs the two suites that
-    # do not need a broker, because neither Redis nor Postgres ships for it.
     "Operating System :: POSIX :: Linux",
     "Operating System :: MacOS :: MacOS X",
     "Operating System :: Microsoft :: Windows",
@@ -53,5 +45,4 @@ build-backend = "maturin"
 module-name = "tarsk._core"
 python-source = "."
 features = ["pyo3/extension-module"]
-# Ship the marker: the annotations are useless to a caller without it.
 include = [{ path = "tarsk/py.typed", format = "sdist" }]

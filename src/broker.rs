@@ -368,11 +368,24 @@ impl Broker {
     }
 
     /// Retries are exhausted: park the job somewhere a human can find it.
-    pub async fn dead_letter(&self, receipt: &Receipt, error: &str, traceback: &str) -> Res<()> {
+    /// `keep` is how many failures a queue's dead letters may hold; zero keeps
+    /// everything. Every other store here expires on its own — results and
+    /// progress by TTL, the live stream by acking, the buckets and reservations
+    /// by their own clocks — and this one grew forever, carrying a payload and
+    /// a full traceback per row. For a queue whose whole claim is bounded
+    /// memory, the store of last resort filling Redis is a poor way to be
+    /// proved wrong.
+    pub async fn dead_letter(
+        &self,
+        receipt: &Receipt,
+        error: &str,
+        traceback: &str,
+        keep: u64,
+    ) -> Res<()> {
         match (self, receipt) {
             (Broker::Memory(b), Receipt::Memory { id }) => b.settle(*id),
-            (Broker::Redis(b), r) => b.dead_letter(r, error, traceback).await,
-            (Broker::Postgres(b), r) => b.dead_letter(r, error, traceback).await,
+            (Broker::Redis(b), r) => b.dead_letter(r, error, traceback, keep).await,
+            (Broker::Postgres(b), r) => b.dead_letter(r, error, traceback, keep).await,
             _ => Err("receipt does not belong to this broker".into()),
         }
     }
@@ -1373,7 +1386,13 @@ impl RedisBroker {
     /// MULTI is enough: every field is already in hand from the delivery, so
     /// there is nothing to read and decide between the writes. That is the line
     /// where a Lua script would become necessary rather than decorative.
-    async fn dead_letter(&self, receipt: &Receipt, error: &str, traceback: &str) -> Res<()> {
+    async fn dead_letter(
+        &self,
+        receipt: &Receipt,
+        error: &str,
+        traceback: &str,
+        keep: u64,
+    ) -> Res<()> {
         let Receipt::Redis { queue, id } = receipt else {
             return Err("not a redis receipt".into());
         };
@@ -1391,10 +1410,21 @@ impl RedisBroker {
             .first()
             .map(entry_fields)
             .unwrap_or_else(|| (String::new(), Vec::new(), 0));
+        let mut trim: Vec<String> = Vec::new();
+        if keep > 0 {
+            // Approximate trimming, which Redis does at whole-node granularity
+            // and charges almost nothing for. An exact cap would cost more than
+            // the few extra entries it saves.
+            trim = vec!["MAXLEN".into(), "~".into(), keep.to_string()];
+        }
+        let mut add = redis::cmd("XADD");
+        add.arg(&grave);
+        for part in &trim {
+            add.arg(part);
+        }
         let _: redis::Value = redis::pipe()
             .atomic()
-            .cmd("XADD")
-            .arg(&grave)
+            .add_command(add)
             .arg("*")
             .arg("n")
             .arg(name)
@@ -2094,7 +2124,13 @@ impl PgBroker {
         Ok(n as usize)
     }
 
-    async fn dead_letter(&self, receipt: &Receipt, error: &str, traceback: &str) -> Res<()> {
+    async fn dead_letter(
+        &self,
+        receipt: &Receipt,
+        error: &str,
+        traceback: &str,
+        keep: u64,
+    ) -> Res<()> {
         let Receipt::Postgres { row, run_lease } = receipt else {
             return Err("not a postgres receipt".into());
         };
@@ -2111,6 +2147,20 @@ impl PgBroker {
                 &[row, run_lease, &error, &traceback],
             )
             .await?;
+        if keep > 0 {
+            // Trimmed on write like the Redis side, rather than on a timer:
+            // the row that pushes a queue over its cap is the one that should
+            // pay for the trim, and nothing else has to remember to run.
+            self.client
+                .execute(
+                    "delete from tarsk_dead where id in (
+                         select id from tarsk_dead
+                          where queue = (select queue from tarsk_dead where id = $1)
+                          order by died_at desc offset $2)",
+                    &[row, &(keep as i64)],
+                )
+                .await?;
+        }
         Ok(())
     }
 }

@@ -462,6 +462,33 @@ def check_broker(url: str, label: str) -> None:
         assert spliced == sent["when"], f"{label}: the splicer changed it: {spliced!r}"
         assert type(spliced) is _dt.datetime, f"{label}: came back {type(spliced).__name__}"
 
+        # --- the dead letters stop growing at the cap ---------------------
+        #
+        # Everything else here expires on its own; this one grew forever, one
+        # payload and one full traceback per row. Twelve failures against a cap
+        # of three must leave three.
+        log.write_text("")
+        from tarsk._core import Producer
+
+        producer = Producer(broker_url=url)
+        producer.dead_purge(queue="default")
+        worker = start_worker(env, TARSK_LEASE_GRACE=1, TARSK_MAX_DEAD=3)
+        try:
+            for i in range(12):
+                app.registry["always_fails"].send(f"doomed-{i}")
+            deadline = time.time() + 90
+            while time.time() < deadline and len(producer.dead_list(queue="default", limit=50)) < 3:
+                time.sleep(0.3)
+            time.sleep(2.0)                       # let the rest arrive and be trimmed
+            kept = producer.dead_list(queue="default", limit=50)
+        finally:
+            stop_worker(worker)
+        # Redis trims approximately — it drops whole nodes — so the cap is a
+        # bound rather than an exact count. What matters is that twelve
+        # failures did not leave twelve rows.
+        assert 0 < len(kept) <= 8, f"{label}: cap of 3 left {len(kept)} dead letters"
+        assert len(kept) < 12, f"{label}: nothing was trimmed"
+
         # --- what the sender attached reaches the handler and the listing --
         #
         # Carried beside the arguments, not inside them: the listing reads it
@@ -469,9 +496,7 @@ def check_broker(url: str, label: str) -> None:
         # never declared a parameter for it still gets it through Context.
         log.write_text("")
         from tarsk import _proto
-        from tarsk._core import Producer
 
-        producer = Producer(broker_url=url)
         tagged = app.registry["labelled"].options(
             meta={"trace": "abc123", "tenant": 7}
         ).send("t")

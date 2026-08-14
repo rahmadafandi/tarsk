@@ -299,6 +299,15 @@ queue for it: Postgres already has a visibility timer, and Redis has the idle cl
 sweep reads. What runs out of retries lands in `tarsk:{queue}:dead` or the `tarsk_dead` table,
 with the error and traceback.
 
+**Nothing here grows without a bound.** Results and progress carry the TTL the task asked for
+and expire on their own; the live stream loses an entry when it is acked; reservations, buckets
+and cancellations run on their own clocks. Dead letters were the exception — one payload and
+one full traceback per row, kept forever — so `--max-dead` caps them at 10,000 a queue and
+drops the oldest past that. `--max-dead 0` keeps every failure and lets the store grow, which
+is the right choice only if something else is emptying it. On Redis the trim is approximate,
+because Redis drops whole nodes and charges almost nothing for it; the cap is a bound, not an
+exact count.
+
 ## Enqueueing from async code
 
 ```python

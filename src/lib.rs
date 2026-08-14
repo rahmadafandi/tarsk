@@ -166,6 +166,9 @@ struct Cfg {
     lease_grace: Duration,
     /// How long a claim may wait for work before returning empty-handed.
     claim_block: Duration,
+    /// Dead letters a queue may keep before the oldest are dropped. Zero keeps
+    /// everything, which is safe for the record and unbounded for the store.
+    max_dead: u64,
     /// Tasks a single child may have in flight at once.
     ///
     /// One is the default and the reason the ceiling is precise: a child with
@@ -226,6 +229,9 @@ pub(crate) struct Shared {
     /// Set when the run cannot proceed at all, as opposed to a task failing.
     fatal: Mutex<Option<String>>,
     next_child_id: AtomicU64,
+    /// How many dead letters a queue may keep. Zero means every one of them,
+    /// which is what this did before there was a choice.
+    max_dead: AtomicU64,
     /// Job ids cancelled by a caller, refreshed from the broker on a timer.
     ///
     /// Checked where the ceiling is checked — at the dispatch decision — so a
@@ -476,7 +482,12 @@ impl Shared {
         self.keep_result(&job, &outcome).await;
         if self
             .broker
-            .dead_letter(&job.receipt, &outcome.error_type, &outcome.traceback)
+            .dead_letter(
+                &job.receipt,
+                &outcome.error_type,
+                &outcome.traceback,
+                self.max_dead.load(Ordering::Relaxed),
+            )
             .await
             .is_err()
         {
@@ -1511,6 +1522,7 @@ async fn supervise(
 
     // Both platforms' details live in transport: a 0600 socket inside a 0700
     // directory here, an ACL'd named pipe there.
+    shared.max_dead.store(cfg.max_dead, Ordering::Relaxed);
     let listener = transport::Listener::bind(&cfg.socket)?;
     let cfg = Arc::new(cfg);
     let acceptor = tokio::spawn(accept_loop(listener, shared.clone()));
@@ -1766,6 +1778,7 @@ fn new_shared(broker: Broker, total: usize, batch: bool) -> Arc<Shared> {
         exits: Mutex::new(Vec::new()),
         fatal: Mutex::new(None),
         next_child_id: AtomicU64::new(0),
+        max_dead: AtomicU64::new(0),
         revoked: Mutex::new(std::collections::HashSet::new()),
         spawn_ms: AtomicU64::new(250), // replaced by the first real measurement
         counters: Counters::default(),
@@ -1812,6 +1825,7 @@ fn build_cfg(
     hard_max_rss: u64,
     spawn_slack: u64,
     slots: usize,
+    max_dead: u64,
 ) -> Cfg {
     Cfg {
         app_spec,
@@ -1833,6 +1847,7 @@ fn build_cfg(
         hard_max_rss,
         claim_block: Duration::from_millis(250),
         slots: slots.max(1),
+        max_dead,
     }
 }
 
@@ -1890,6 +1905,7 @@ fn run(
         hard_max_rss,
         total as u64,
         slots,
+        0, // batch mode keeps no dead letters worth trimming
     );
 
     let outcome = py.detach(move || {
@@ -1963,7 +1979,8 @@ fn console_only(
 /// Worker mode: consume `queues` from a real broker until SIGINT or SIGTERM.
 #[pyfunction]
 #[pyo3(signature = (app_spec, broker_url, queues, python, children=2, slots=1, max_rss=0, max_tasks=0,
-                    max_lifetime=0.0, lease_grace=30.0, metrics_addr=None, hard_max_rss=0))]
+                    max_lifetime=0.0, lease_grace=30.0, metrics_addr=None, hard_max_rss=0,
+                    max_dead=10_000))]
 #[allow(clippy::too_many_arguments)]
 fn work(
     py: Python<'_>,
@@ -1979,6 +1996,7 @@ fn work(
     lease_grace: f64,
     metrics_addr: Option<String>,
     hard_max_rss: u64,
+    max_dead: u64,
 ) -> PyResult<HashMap<String, u64>> {
     let dir = socket_dir()?;
     let cfg = build_cfg(
@@ -1994,6 +2012,7 @@ fn work(
         hard_max_rss,
         u64::MAX / 2, // no batch to bound the spawn cap against
         slots,
+        max_dead,
     );
 
     let outcome = py.detach(move || {

@@ -27,7 +27,8 @@ class Supervisor:
         max_rss: int = 0,          # bytes, 0 = unbounded
         max_tasks: int = 0,        # 0 = unlimited
         max_lifetime: float = 0.0, # seconds, 0 = unlimited
-        hard_max_rss: int = 0,     # bytes, 0 = never kill a running task
+        hard_max_rss: int = 0,      # bytes, 0 = never kill a running task
+        max_dead: int = 10_000,     # per queue, 0 = keep every failure forever
         python: str | None = None,
     ):
         if hard_max_rss and max_rss and hard_max_rss <= max_rss:
@@ -42,6 +43,7 @@ class Supervisor:
         self.max_tasks = max_tasks
         self.max_lifetime = max_lifetime
         self.hard_max_rss = hard_max_rss
+        self.max_dead = max_dead
         self.python = python or sys.executable
         self.stats: dict[str, int] = {}
         self.exits: list[int] = []
@@ -99,5 +101,6 @@ class Supervisor:
             lease_grace,
             metrics_addr,
             self.hard_max_rss,
+            self.max_dead,
         )
         return self.stats

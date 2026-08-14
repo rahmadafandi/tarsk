@@ -102,8 +102,10 @@ def test_slots_overlap_sync_handlers_too():
 
     assert len(results) == 12, results
     assert all(r[0] == "ack" for r in results.values()), results
-    # Twelve 0.2s sleeps: 2.4s in a row, 0.2s at once. Startup is in both.
-    assert parallel < serial - 1.0, (
+    # Twelve 0.2s sleeps: 2.4s in a row, 0.2s at once, with the same startup in
+    # both. Compared as a ratio rather than a margin, because a busy machine
+    # stretches both numbers and only a fixed difference notices.
+    assert parallel < serial / 2, (
         f"twelve sync slots took {parallel:.2f}s against {serial:.2f}s at one slot — "
         "the thread pool is the cap, not the slot count"
     )

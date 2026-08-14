@@ -29,6 +29,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="tarsk")
     sub = parser.add_subparsers(dest="command", required=True)
 
+    web = sub.add_parser("web", help="serve the console without running a worker")
+    web.add_argument("--broker", default=os.environ.get("TARSK_BROKER"),
+                     help="redis://…, postgres://… (or TARSK_BROKER)")
+    web.add_argument("--queues", default="default", help="comma separated")
+    web.add_argument("--addr", default="127.0.0.1:9099",
+                     help="where to listen. Off loopback it refuses to start without "
+                          "TARSK_ADMIN_TOKEN, since the console shows task payloads")
+
     status = sub.add_parser("status", help="how much work is waiting")
     status.add_argument("--broker", default=os.environ.get("TARSK_BROKER"),
                         help="redis://…, postgres://… (or TARSK_BROKER)")
@@ -171,6 +179,14 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if not args.broker:
         sys.exit("no broker: pass --broker or set TARSK_BROKER")
+    if args.command == "web":
+        from ._core import console
+
+        # A worker already serves this on --metrics. This is for the times
+        # every worker is down, which is when the queue most needs looking at.
+        console(args.broker, [q.strip() for q in args.queues.split(",") if q.strip()],
+                args.addr)
+        return 0
     if args.command == "status":
         from ._core import Producer
 

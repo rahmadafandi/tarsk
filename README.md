@@ -512,6 +512,41 @@ four-megabyte stub while the worker held three hundred, and never recycled.
 Windows CI skips the broker suites, since neither Redis nor Postgres ships for it. The channel,
 the protocol, recycling and the ceiling are all covered.
 
+## The console
+
+A worker already runs an HTTP listener for `/metrics`. The same one serves an admin page at
+`/`, so there is nothing extra to deploy:
+
+```
+tarsk worker --app myapp:app --broker redis://… --metrics 127.0.0.1:9090
+```
+
+Queues and their depth, the individual jobs with their state and age and which worker holds
+them, and the dead letters with their tracebacks. With actions enabled, buttons to cancel a
+job, replay a dead letter, or purge the lot. Server-rendered from the standard library — no
+framework, no JavaScript build, and tarsk's only dependency is still msgpack.
+
+**It is not `/metrics`.** That endpoint serves numbers; this one serves task payloads and can
+destroy work. Three defaults follow from that:
+
+- Binding anywhere but loopback **refuses to start** without `TARSK_ADMIN_TOKEN`. The flag that
+  was harmless for metrics yesterday exposes an admin console today, and a warning nobody reads
+  is not a control.
+- With a token set, the page asks for it over HTTP Basic — user `tarsk`, password the token —
+  compared in constant time.
+- Cancel, replay and purge are **off** until `TARSK_ADMIN_ACTIONS=1`. A console reached by
+  accident should be a viewer.
+
+`/metrics` itself stays unauthenticated. It was before this existed, it carries no payloads,
+and breaking every scrape config to add a console would be a poor trade.
+
+```
+tarsk web --broker redis://… --addr 127.0.0.1:9099
+```
+
+The same pages with no worker attached, for when every worker is down — which is when a queue
+most needs looking at, and the one case a console living inside the worker cannot cover.
+
 ## Metrics
 
 `--metrics HOST:PORT` serves Prometheus text from the supervisor. Nothing is sampled for the

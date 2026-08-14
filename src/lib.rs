@@ -9,6 +9,7 @@
 //! (step 5). Jobs arrive as an in-memory list from the caller.
 
 mod broker;
+mod console;
 mod cron;
 mod metrics;
 mod transport;
@@ -207,7 +208,7 @@ struct Counters {
 /// None means the child was rejected and the slot should stop waiting.
 type Handoff = oneshot::Sender<Option<(transport::Reader, transport::Writer)>>;
 
-struct Shared {
+pub(crate) struct Shared {
     broker: Broker,
     /// Only populated in batch mode. A worker draining a real broker runs for
     /// weeks; keeping every outcome in a map would be a leak with a schedule.
@@ -1503,25 +1504,7 @@ async fn supervise(
 )> {
     broker.set_prefetch_cap(children);
     let batch = broker.drains_when_empty();
-    let shared = Arc::new(Shared {
-        broker,
-        results: Mutex::new(HashMap::new()),
-        total,
-        next_task_id: AtomicU64::new(0),
-        work: Notify::new(),
-        done: AtomicBool::new(batch && total == 0),
-        registry: Mutex::new(None),
-        specs: Mutex::new(HashMap::new()),
-        conns: Mutex::new(HashMap::new()),
-        exits: Mutex::new(Vec::new()),
-        fatal: Mutex::new(None),
-        next_child_id: AtomicU64::new(0),
-        revoked: Mutex::new(std::collections::HashSet::new()),
-        spawn_ms: AtomicU64::new(250), // replaced by the first real measurement
-        counters: Counters::default(),
-        metrics: Metrics::default(),
-        reasons: Mutex::new(HashMap::new()),
-    });
+    let shared = new_shared(broker, total, batch);
     if batch && total == 0 {
         return Ok((Vec::new(), HashMap::new(), Vec::new(), None));
     }
@@ -1617,7 +1600,8 @@ async fn supervise(
 
     let exporter = cfg.metrics_addr.clone().map(|addr| {
         let shared = shared.clone();
-        tokio::spawn(metrics::serve(addr, move || {
+        let console_shared = shared.clone();
+        tokio::spawn(console::serve(addr, console_shared, move || {
             let mut sys = System::new();
             let me = Pid::from_u32(std::process::id());
             sys.refresh_processes(ProcessesToUpdate::Some(&[me]), false);
@@ -1765,6 +1749,30 @@ async fn supervise(
 }
 
 // ----------------------------------------------------------- python facing
+
+/// Everything the supervision loop shares, and everything the console needs to
+/// answer a page. The console builds one with nothing to supervise.
+fn new_shared(broker: Broker, total: usize, batch: bool) -> Arc<Shared> {
+    Arc::new(Shared {
+        broker,
+        results: Mutex::new(HashMap::new()),
+        total,
+        next_task_id: AtomicU64::new(0),
+        work: Notify::new(),
+        done: AtomicBool::new(batch && total == 0),
+        registry: Mutex::new(None),
+        specs: Mutex::new(HashMap::new()),
+        conns: Mutex::new(HashMap::new()),
+        exits: Mutex::new(Vec::new()),
+        fatal: Mutex::new(None),
+        next_child_id: AtomicU64::new(0),
+        revoked: Mutex::new(std::collections::HashSet::new()),
+        spawn_ms: AtomicU64::new(250), // replaced by the first real measurement
+        counters: Counters::default(),
+        metrics: Metrics::default(),
+        reasons: Mutex::new(HashMap::new()),
+    })
+}
 
 fn io_err(err: Box<dyn std::error::Error + Send + Sync>) -> io::Error {
     io::Error::other(err.to_string())
@@ -1920,6 +1928,36 @@ fn run(
         return Err(PyValueError::new_err(message));
     }
     Ok((to_python(py, outcomes)?, stats, exits))
+}
+
+/// Console only: serve the admin pages without running any children.
+///
+/// The console rides on the supervisor, which is right until every worker is
+/// down — which is the moment you most want to look at the queue. This is the
+/// same pages against the same broker, with nothing to supervise.
+#[pyfunction]
+#[pyo3(name = "console", signature = (broker_url, queues, addr))]
+fn console_only(
+    py: Python<'_>,
+    broker_url: String,
+    queues: Vec<String>,
+    addr: String,
+) -> PyResult<()> {
+    py.detach(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(async move {
+            let broker = Broker::connect(&broker_url, queues).await.map_err(io_err)?;
+            let shared = new_shared(broker, 0, false);
+            // No counters worth reporting: nothing here has run a task. The
+            // page's numbers all come from the broker, which is shared.
+            let snapshot = || String::new();
+            console::serve(addr, shared, snapshot).await;
+            Ok::<(), io::Error>(())
+        })
+    })
+    .map_err(|e: io::Error| PyValueError::new_err(e.to_string()))
 }
 
 /// Worker mode: consume `queues` from a real broker until SIGINT or SIGTERM.
@@ -2165,6 +2203,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(run, m)?)?;
     m.add_function(wrap_pyfunction!(work, m)?)?;
     m.add_function(wrap_pyfunction!(rss_of, m)?)?;
+    m.add_function(wrap_pyfunction!(console_only, m)?)?;
     m.add_class::<Producer>()
 }
 

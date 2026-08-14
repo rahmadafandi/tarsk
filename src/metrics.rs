@@ -14,9 +14,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
-
 /// Seconds. Wide because task durations here span an IPC round trip to a
 /// handler that may legitimately run for minutes (spec §5, §9).
 const BUCKETS: [f64; 15] = [
@@ -189,30 +186,6 @@ pub fn render(
     out
 }
 
-/// Answer scrapes on `addr` until the task is dropped.
-pub async fn serve<F>(addr: String, snapshot: F)
-where
-    F: Fn() -> String + Send + Sync + 'static,
-{
-    let Ok(listener) = TcpListener::bind(&addr).await else {
-        return;
-    };
-    loop {
-        let Ok((mut stream, _)) = listener.accept().await else {
-            return;
-        };
-        // Read and discard the request. Only one path is served, and a scraper
-        // that asked for something else still gets numbers rather than a 404 it
-        // would have to be configured around.
-        let mut scratch = [0u8; 1024];
-        let _ = stream.read(&mut scratch).await;
-        let body = snapshot();
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\n\
-             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        let _ = stream.write_all(response.as_bytes()).await;
-        let _ = stream.shutdown().await;
-    }
-}
+// The HTTP server that used to live here now serves the console as well, and
+// moved to `console.rs` with it. This module went back to being what its name
+// says: turning counters into text.

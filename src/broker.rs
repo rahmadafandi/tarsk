@@ -310,6 +310,16 @@ impl Broker {
         }
     }
 
+    /// The queues this broker was opened on, for a caller that needs to name
+    /// them and was not told which they are.
+    pub fn queue_names(&self) -> Vec<String> {
+        match self {
+            Broker::Memory(_) => Vec::new(),
+            Broker::Redis(b) => b.queues.clone(),
+            Broker::Postgres(b) => b.queues.clone(),
+        }
+    }
+
     /// The individual jobs in named queues, oldest first.
     pub async fn jobs(&self, queues: &[String], limit: usize) -> Res<Vec<Listed>> {
         let mut rows = match self {

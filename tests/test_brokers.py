@@ -327,6 +327,31 @@ def check_broker(url: str, label: str) -> None:
             stop_worker(worker)
         assert ticks == ["tick"], f"{label}: expected exactly one tick, got {ticks}"
 
+        # --- identical sends collapse into one job ------------------------
+        log.write_text("")
+        first = [app.registry["once"].send("dup") for _ in range(4)]
+        assert len(set(first)) == 1, f"{label}: four identical sends gave {set(first)}"
+        # A different argument is a different job, not a collision.
+        app.registry["once"].send("other")
+        # An explicit key overrides the argument hash, so these two collapse
+        # even though their arguments differ.
+        keyed = [
+            app.registry["once"].options(dedup_key="k", dedup_ttl=30).send(f"keyed-{i}")
+            for i in range(3)
+        ]
+        assert len(set(keyed)) == 1, f"{label}: explicit keys gave {set(keyed)}"
+
+        worker = start_worker(env, TARSK_LEASE_GRACE=1)
+        try:
+            deadline = time.time() + 30
+            while time.time() < deadline and len(tags_in(log)) < 3:
+                time.sleep(0.2)
+            time.sleep(0.5)
+        finally:
+            stop_worker(worker)
+        ran = sorted(tags_in(log))
+        assert ran == ["once-dup", "once-keyed-0", "once-other"], f"{label}: {ran}"
+
         # --- a concurrency cap holds across workers, not per worker -------
         #
         # Four children with four slots each is sixteen places a job could run.

@@ -51,6 +51,10 @@ class TaskSpec:
     # unlimited. Different from a rate limit: that bounds how often something
     # starts, this bounds how many are in progress.
     max_concurrency: int = 0
+    # Milliseconds during which an identical send is dropped. Zero is off.
+    unique_ms: int = 0
+    # Milliseconds during which an identical send is dropped. Zero is off.
+    unique_ms: int = 0
 
     def as_row(self) -> list:
         """Positional form that crosses the wire (spec §4.2)."""
@@ -190,6 +194,8 @@ class Task:
         delay: float = 0.0,
         when: "datetime.datetime | None" = None,
         task_id: str | None = None,
+        dedup_key: str = "",
+        dedup_ttl: float | None = None,
     ) -> "Enqueue":
         """Override what this one send does, without touching the registration.
 
@@ -197,6 +203,7 @@ class Task:
         with an argument the task itself takes.
         """
         return Enqueue(self, queue=queue, timeout=timeout, delay=delay, when=when,
+                       dedup_key=dedup_key, dedup_ttl=dedup_ttl,
                        task_id=task_id)
 
     def __repr__(self) -> str:
@@ -207,7 +214,7 @@ class Enqueue:
     """One send, with the registration's defaults optionally overridden."""
 
     def __init__(self, task: Task, *, queue=None, timeout=None, delay=0.0, when=None,
-                 chain: bytes = b"",
+                 chain: bytes = b"", dedup_key: str = "", dedup_ttl: float | None = None,
                  task_id=None):
         if delay and when is not None:
             raise ValueError("give a delay or a time, not both")
@@ -225,10 +232,14 @@ class Enqueue:
         self.queue = queue or task.spec.queue
         self.timeout_ms = task.spec.timeout_ms if timeout is None else int(timeout * 1000)
         self.delay = delay
-        # A caller-supplied id is an idempotency key: send the same one twice
-        # and the second result overwrites the first rather than adding a row.
+        # A caller-supplied id files both sends' results under one key. It is
+        # NOT deduplication — the queue takes both jobs and runs them both,
+        # and only the answers collide. `dedup_key` or `unique=` is what stops
+        # the second send; this used to claim otherwise.
         self.task_id = task_id or secrets.token_hex(8)
         self.chain = chain
+        self.dedup_key = dedup_key
+        self.dedup_ttl = dedup_ttl
 
     def send(self, *args, **kwargs) -> str:
         from . import _proto  # lazy — see App.producer
@@ -250,11 +261,27 @@ class Enqueue:
                     hook(ctx)
             kwargs = ctx.kwargs  # mutable, so a trace id can be attached here
         payload = _proto.pack_args(args, kwargs)
-        self.task.app.producer().send(
+        key, ttl_ms = self._dedup(payload)
+        held = self.task.app.producer().send(
             self.task_id, self.queue, self.task.spec.name, payload,
-            self.timeout_ms, self.delay, self.chain,
+            self.timeout_ms, self.delay, self.chain, key, ttl_ms,
         )
-        return self.task_id
+        # A deduplicated send hands back the id of the job already covering it,
+        # so the caller waits on the same answer instead of on a job that was
+        # never queued.
+        return held or self.task_id
+
+    def _dedup(self, payload: bytes) -> tuple[str, int]:
+        ttl = self.dedup_ttl if self.dedup_ttl is not None else self.task.spec.unique_ms / 1000
+        if not ttl:
+            return "", 0
+        if self.dedup_key:
+            return f"{self.task.spec.name}:{self.dedup_key}", int(ttl * 1000)
+        # No key given, so the arguments are the key: same task, same call.
+        import hashlib
+
+        digest = hashlib.blake2b(payload, digest_size=16).hexdigest()
+        return f"{self.task.spec.name}:{digest}", int(ttl * 1000)
 
 
 class App:
@@ -294,6 +321,7 @@ class App:
         rate_limit: str = "",
         expires: float = 0.0,
         max_concurrency: int = 0,
+        unique: float = 0.0,
     ):
         def decorate(fn):
             t = self.default_timeout if timeout is None else timeout
@@ -329,7 +357,7 @@ class App:
             spec = TaskSpec(
                 task_name, int(t * 1000), retries, backoff, queue,
                 int(result_ttl * 1000), cron, per_sec, burst, int(expires * 1000),
-                max(0, max_concurrency),
+                max(0, max_concurrency), int(max(0.0, unique) * 1000),
             )
             task = Task(fn, spec, self)
             self.registry[task_name] = task

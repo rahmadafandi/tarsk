@@ -1955,7 +1955,8 @@ impl Producer {
     }
 
     /// `delay` in seconds; zero enqueues immediately.
-    #[pyo3(signature = (id, queue, name, payload, timeout_ms, delay=0.0, chain=Vec::new()))]
+    #[pyo3(signature = (id, queue, name, payload, timeout_ms, delay=0.0, chain=Vec::new(),
+                        dedup_key=String::new(), dedup_ttl_ms=0))]
     #[allow(clippy::too_many_arguments)] // a pyo3 entry point, not a call site
     fn send(
         &self,
@@ -1967,9 +1968,11 @@ impl Producer {
         timeout_ms: u32,
         delay: f64,
         chain: Vec<u8>,
-    ) -> PyResult<()> {
+        dedup_key: String,
+        dedup_ttl_ms: u64,
+    ) -> PyResult<Option<String>> {
         let job = NewJob {
-            id,
+            id: id.clone(),
             queue,
             name,
             payload,
@@ -1977,8 +1980,25 @@ impl Producer {
             chain,
         };
         let delay = Duration::from_secs_f64(delay.max(0.0));
-        py.detach(|| self.runtime.block_on(self.broker.push(job, delay)))
-            .map_err(|e| PyValueError::new_err(e.to_string()))
+        py.detach(|| {
+            self.runtime.block_on(async {
+                if !dedup_key.is_empty() {
+                    // Reserve before pushing. The other order would let two
+                    // callers both queue and only then discover one of them
+                    // should not have.
+                    if let Some(held) =
+                        self.broker.claim_dedup(&dedup_key, &id, dedup_ttl_ms).await?
+                    {
+                        return Ok(Some(held));
+                    }
+                }
+                self.broker.push(job, delay).await?;
+                Ok(None)
+            })
+        })
+        .map_err(|e: Box<dyn std::error::Error + Send + Sync>| {
+            PyValueError::new_err(e.to_string())
+        })
     }
 
     /// The stored envelope for `id`, or None while it is unfinished, was never

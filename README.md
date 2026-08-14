@@ -364,6 +364,28 @@ There is no default and no app-wide setting. How long a task stays worth doing i
 knowledge, and the asymmetry is one-sided: without expiry, work runs late and you can see it;
 with the wrong expiry, work disappears and you cannot.
 
+## Not sending the same thing twice
+
+```python
+@app.task(unique=30)              # identical arguments collapse for 30 seconds
+def refresh(user_id): ...
+
+refresh.options(dedup_key=f"user:{uid}", dedup_ttl=60).send(uid, force=True)
+```
+
+The second send is dropped and **hands back the first job's id**, so the caller waits on the
+same answer rather than on a job that was never queued. With no explicit key the arguments are
+the key, hashed from the same bytes that go on the wire.
+
+This is a window, not "until it has run": the reservation expires on its own timer and nothing
+clears it early. That is the honest shape for "don't refresh this more than once a minute", and
+it is the wrong tool for "run this exactly once ever" — say so with a database constraint,
+where exactly-once actually lives.
+
+**`task_id=` is not this.** It files two sends' results under one key; the queue still takes
+both jobs and runs them both, and only the answers collide. This README used to imply
+otherwise.
+
 ## Concurrency caps
 
 ```python

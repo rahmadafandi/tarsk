@@ -367,6 +367,20 @@ impl Broker {
         }
     }
 
+    /// Reserve `key` for `job_id` for `ttl_ms`, or report who holds it.
+    ///
+    /// `None` means this caller won and should send. `Some(id)` means an
+    /// identical send is already covered by that job, and its id is returned so
+    /// the caller can wait on the same answer rather than being handed one for
+    /// a job that was never queued.
+    pub async fn claim_dedup(&self, key: &str, job_id: &str, ttl_ms: u64) -> Res<Option<String>> {
+        match self {
+            Broker::Memory(_) => Ok(None),
+            Broker::Redis(b) => b.claim_dedup(key, job_id, ttl_ms).await,
+            Broker::Postgres(b) => b.claim_dedup(key, job_id, ttl_ms).await,
+        }
+    }
+
     /// File a finished task's answer under its id, to expire after `ttl`.
     /// Only called for tasks that asked for it: writing every result to a
     /// broker nobody reads from is most of why Celery feels heavy (spec §2).
@@ -615,6 +629,10 @@ fn stream_id_ms(id: &str) -> u64 {
         .next()
         .and_then(|m| m.parse().ok())
         .unwrap_or(0)
+}
+
+fn dedup_key(key: &str) -> String {
+    format!("tarsk:dedup:{key}")
 }
 
 fn slots_key(task: &str) -> String {
@@ -969,6 +987,30 @@ impl RedisBroker {
             });
         }
         Ok(out)
+    }
+
+    async fn claim_dedup(&self, key: &str, job_id: &str, ttl_ms: u64) -> Res<Option<String>> {
+        let mut conn = self.conn.clone();
+        // SET NX is the whole mechanism: whoever writes first owns the window,
+        // and the loser reads back the winner rather than guessing.
+        let won: Option<String> = redis::cmd("SET")
+            .arg(dedup_key(key))
+            .arg(job_id)
+            .arg("NX")
+            .arg("PX")
+            .arg(ttl_ms.max(1))
+            .query_async(&mut conn)
+            .await?;
+        if won.is_some() {
+            return Ok(None);
+        }
+        let holder: Option<String> = redis::cmd("GET")
+            .arg(dedup_key(key))
+            .query_async(&mut conn)
+            .await?;
+        // Empty means the window lapsed between the two commands, so nobody
+        // holds it and this send should go ahead.
+        Ok(holder)
     }
 
     async fn acquire_slot(&self, task: &str, job_id: &str, max: u32, lease_ms: u64) -> Res<bool> {
@@ -1349,6 +1391,12 @@ create table if not exists tarsk_dead (
 -- back. Nothing noticed, because nothing read them: a store you can only write
 -- to cannot tell you it is missing a column. Added separately from the CREATE
 -- so a table made by an earlier version gains them too.
+create table if not exists tarsk_dedup (
+    key        text        primary key,
+    job_id     text        not null,
+    expires_at timestamptz not null
+);
+create index if not exists tarsk_dedup_expiry on tarsk_dedup (expires_at);
 create table if not exists tarsk_slots (
     task       text        not null,
     job_id     text        not null,
@@ -1606,6 +1654,31 @@ impl PgBroker {
             });
         }
         Ok(out)
+    }
+
+    async fn claim_dedup(&self, key: &str, job_id: &str, ttl_ms: u64) -> Res<Option<String>> {
+        let rows = self
+            .client
+            .query(
+                "with fresh as (delete from tarsk_dedup where expires_at <= now())
+                 insert into tarsk_dedup (key, job_id, expires_at)
+                 values ($1, $2, now() + make_interval(secs => $3))
+                 on conflict (key) do nothing
+                 returning job_id",
+                &[&key, &job_id, &(ttl_ms.max(1) as f64 / 1000.0)],
+            )
+            .await?;
+        if !rows.is_empty() {
+            return Ok(None); // inserted, so this caller owns the window
+        }
+        let held = self
+            .client
+            .query(
+                "select job_id from tarsk_dedup where key = $1 and expires_at > now()",
+                &[&key],
+            )
+            .await?;
+        Ok(held.first().map(|r| r.get(0)))
     }
 
     async fn acquire_slot(&self, task: &str, job_id: &str, max: u32, lease_ms: u64) -> Res<bool> {

@@ -48,6 +48,12 @@ def medium(tag):
     return tag
 
 
+@app.task(name="once", unique=30)
+def once(tag):
+    _log(f"once-{tag}")
+    return tag
+
+
 @app.task(name="capped", max_concurrency=2, timeout=30)
 def capped(tag):
     """Logs its own start and end, so overlap is measurable rather than assumed."""

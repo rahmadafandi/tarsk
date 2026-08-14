@@ -32,7 +32,15 @@ def test_leaky_handler_is_bounded():
     # Unbounded, one child would end at ~{JOBS * LEAK_MB}MB. Distinct pids mean
     # the ceiling actually forced replacements.
     pids = {pid for _, (pid, _) in results.values()}
-    assert len(pids) > 1, f"never recycled — one child ran all {JOBS} jobs"
+    # Carrying the stats matters when this runs where its author cannot: the
+    # supervisor's own peak reading says whether the ceiling was never crossed
+    # or crossed and ignored, and those want different fixes.
+    assert len(pids) > 1, (
+        f"never recycled — one child ran all {JOBS} jobs. "
+        f"ceiling {CEILING / 1e6:.0f}MB, supervisor saw a peak of "
+        f"{sup.stats.get('child_rss_peak', 0) / 1e6:.1f}MB across "
+        f"{sup.stats.get('children_spawned', 0)} spawns; {sup.stats}"
+    )
     assert sup.stats.get("recycle_max_rss", 0) > 0, sup.stats
 
     # The real contract: the ceiling is checked while a child is idle, so a

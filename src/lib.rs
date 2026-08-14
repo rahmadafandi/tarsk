@@ -188,6 +188,14 @@ struct Counters {
     expired: AtomicU64,
     chained: AtomicU64,
     at_capacity: AtomicU64,
+    /// Largest child RSS this supervisor ever read, in bytes.
+    ///
+    /// A counter rather than a gauge because it only ever climbs, and it
+    /// answers the question a failed ceiling asks first: was the limit never
+    /// crossed, or crossed and not acted on? Those want different fixes, and
+    /// on a platform the author cannot run, the difference has to arrive in
+    /// the failure message.
+    child_rss_peak: AtomicU64,
     dead_lettered: AtomicU64,
     cron_fired: AtomicU64,
     broker_errors: AtomicU64,
@@ -679,6 +687,7 @@ fn counter_list(counters: &Counters) -> Vec<(&'static str, u64)> {
         ("tasks_expired", load(&counters.expired)),
         ("chain_steps_queued", load(&counters.chained)),
         ("tasks_at_capacity", load(&counters.at_capacity)),
+        ("child_rss_peak", load(&counters.child_rss_peak)),
         ("tasks_dead_lettered", load(&counters.dead_lettered)),
         ("cron_fired", load(&counters.cron_fired)),
         ("broker_errors", load(&counters.broker_errors)),
@@ -983,6 +992,10 @@ async fn serve(shared: &Arc<Shared>, child: &mut ChildHandle, cfg: &Arc<Cfg>) ->
             let reading = pressure(&mut sys, *pid, *tasks_done, *started, cfg);
             if let Some(bytes) = reading.rss {
                 shared.metrics.set_child_rss(*pid, bytes);
+                shared
+                    .counters
+                    .child_rss_peak
+                    .fetch_max(bytes, Ordering::Relaxed);
             }
             if spare.is_none()
                 && !arming

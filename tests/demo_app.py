@@ -71,7 +71,7 @@ def glutton(megabytes):
 
 
 # Lifecycle hooks: a file per child, so a test can count how often they ran.
-HOOK_LOG = Path(os.environ.get("TARSK_HOOK_LOG", "/dev/null"))
+HOOK_LOG = Path(os.environ.get("TARSK_HOOK_LOG", os.devnull))
 
 
 @app.on_start
@@ -87,7 +87,7 @@ def closed():
 
 
 # --- middleware and injection ------------------------------------------
-TRACE = Path(os.environ.get("TARSK_TRACE_LOG", "/dev/null"))
+TRACE = Path(os.environ.get("TARSK_TRACE_LOG", os.devnull))
 
 
 def _note(line):

@@ -912,10 +912,7 @@ fn pressure(sys: &mut System, pid: u32, tasks_done: u64, started: Instant, cfg: 
     if pid != 0 {
         // RSS is read by the parent (spec §4.4) — a thrashing child is the
         // least reliable reporter of its own state.
-        let pid = Pid::from_u32(pid);
-        sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), false);
-        if let Some(proc) = sys.process(pid) {
-            let bytes = proc.memory();
+        if let Some(bytes) = transport::child_rss_with(sys, pid) {
             rss = Some(bytes);
             if cfg.max_rss > 0 {
                 let ratio = bytes as f64 / cfg.max_rss as f64;
@@ -2119,9 +2116,7 @@ impl Producer {
 #[pyfunction]
 fn rss_of(pid: u32) -> u64 {
     let mut sys = System::new();
-    let key = Pid::from_u32(pid);
-    sys.refresh_processes(ProcessesToUpdate::Some(&[key]), false);
-    sys.process(key).map(|p| p.memory()).unwrap_or(0)
+    transport::child_rss_with(&mut sys, pid).unwrap_or(0)
 }
 
 #[pymodule]

@@ -49,7 +49,7 @@ mod unix {
 mod windows {
     use std::io;
     use tokio::io::{ReadHalf, WriteHalf};
-    use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeServer, ServerOptions};
+    use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 
     pub type Reader = ReadHalf<NamedPipeServer>;
     pub type Writer = WriteHalf<NamedPipeServer>;
@@ -96,4 +96,75 @@ mod windows {
             .unwrap_or_else(|| "tarsk".into());
         format!(r"\\.\pipe\{tag}")
     }
+}
+
+/// Resident memory of one process, in bytes.
+///
+/// sysinfo does this everywhere except Windows, where it reported the same
+/// 4.1MB for every process regardless of what they held — measured against a
+/// child allocating 300MB in fifty-megabyte steps, which it followed exactly
+/// nowhere. The ceiling is only as good as this number, so on that platform it
+/// is read from the API sysinfo was aiming at, declared here rather than
+/// pulled in as a dependency for three functions.
+#[cfg(windows)]
+pub fn child_rss(pid: u32) -> Option<u64> {
+    // PROCESS_MEMORY_COUNTERS: two DWORDs then eight SIZE_Ts, which on x86-64
+    // means the pair of u32s share the first eight bytes.
+    #[repr(C)]
+    #[derive(Default)]
+    struct Counters {
+        cb: u32,
+        page_fault_count: u32,
+        peak_working_set: usize,
+        working_set: usize,
+        quota_peak_paged: usize,
+        quota_paged: usize,
+        quota_peak_non_paged: usize,
+        quota_non_paged: usize,
+        pagefile: usize,
+        peak_pagefile: usize,
+    }
+
+    // K32GetProcessMemoryInfo lives in kernel32, which is linked already;
+    // GetProcessMemoryInfo is the same call forwarded through psapi.dll and
+    // would need a second library on the link line.
+    unsafe extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
+        fn K32GetProcessMemoryInfo(process: isize, counters: *mut Counters, cb: u32) -> i32;
+        fn CloseHandle(handle: isize) -> i32;
+    }
+
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle == 0 {
+            return None;
+        }
+        let mut counters = Counters {
+            cb: std::mem::size_of::<Counters>() as u32,
+            ..Default::default()
+        };
+        let ok = K32GetProcessMemoryInfo(
+            handle,
+            &mut counters,
+            std::mem::size_of::<Counters>() as u32,
+        );
+        CloseHandle(handle);
+        (ok != 0).then_some(counters.working_set as u64)
+    }
+}
+
+/// Everywhere else sysinfo is right, and reusing the caller's `System` keeps
+/// the process table warm between polls.
+#[cfg(unix)]
+pub fn child_rss_with(sys: &mut sysinfo::System, pid: u32) -> Option<u64> {
+    let key = sysinfo::Pid::from_u32(pid);
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[key]), false);
+    sys.process(key).map(|p| p.memory())
+}
+
+#[cfg(windows)]
+pub fn child_rss_with(_sys: &mut sysinfo::System, pid: u32) -> Option<u64> {
+    child_rss(pid)
 }

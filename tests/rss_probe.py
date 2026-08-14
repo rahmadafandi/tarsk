@@ -13,7 +13,8 @@ import time
 from tarsk._core import rss_of
 
 CHILD = """
-import sys, time
+import os, sys, time
+print("child pid", os.getpid(), flush=True)
 blocks = []
 for i in range(6):
     blocks.append(bytearray(50 * 1024 * 1024))
@@ -51,12 +52,20 @@ def main() -> int:
         [sys.executable, "-c", CHILD], stdout=subprocess.PIPE, text=True
     )
     readings = []
+    reported_pid = ""
     try:
         for _ in range(8):
             time.sleep(0.5)
             mb = rss_of(child.pid) / 1e6
             readings.append(mb)
             print(f"  child rss {mb:7.1f} MB   (os says {second_opinion(child.pid)})")
+            if not reported_pid:
+                # A venv's python.exe on Windows can be a launcher that re-execs
+                # the real interpreter, in which case the pid we hold belongs to
+                # a 4MB stub and the memory is in a grandchild we never see.
+                line = child.stdout.readline() if child.stdout else ""
+                reported_pid = line.strip()
+                print(f"  we are watching pid {child.pid}; the child says {reported_pid!r}")
     finally:
         child.kill()
         said = child.stdout.read() if child.stdout else ""

@@ -40,7 +40,15 @@ def test_leaky_handler_is_bounded():
     # weaker is achievable without killing running work.
     bound = CEILING + LEAK_MB * 1024 * 1024
     peak = max(rss for _, (_, rss) in results.values())
-    assert peak <= bound, f"peak child RSS {peak / 1e6:.1f}MB exceeded {bound / 1e6:.1f}MB"
+    if peak == 0:
+        # Windows has no `resource`, so the handler cannot weigh itself and
+        # every reading is zero — which would satisfy `peak <= bound` while
+        # measuring nothing. Say so instead of collecting the pass. The ceiling
+        # itself is still proven above by recycle_max_rss, which the supervisor
+        # reports from its own reading.
+        print("  (overshoot bound not checked: no per-handler RSS on this platform)")
+    else:
+        assert peak <= bound, f"peak child RSS {peak / 1e6:.1f}MB exceeded {bound / 1e6:.1f}MB"
 
     # Overlap replacement, not kill-then-spawn: nothing should have needed a signal.
     assert sup.stats["children_killed"] == 0, f"a child had to be killed: {sup.stats}"

@@ -98,7 +98,9 @@ is not a clever optimisation — the Redis driver used to hold a mutex round its
 serialising every command from every child, and removing it is the whole difference. A no-op
 handler is also the case most favourable to whoever dispatches fastest, and nobody runs one.
 Full tables in [`bench/`](bench/README.md), measured on a GitHub Actions runner so anyone can
-reproduce them — the same 1.45× holds on a 16-core laptop where both figures are half these.
+reproduce them. On a 16-core laptop the same pair is 1.1×, which is a tie — this file used to
+claim the 1.45× held on both machines, and re-measuring three commits found it does not hold
+on either the current code or the code that first reported it.
 
 ## What it does not claim
 

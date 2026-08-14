@@ -240,8 +240,21 @@ The two `streams, acked` rows are the like-for-like pair — same guarantee, sam
 same handler. **tarsk is the faster one at ten thousand**, 1.88s against 2.71s, and the two
 sets of five runs do not overlap: tarsk's slowest is 1.92s, taskiq's fastest 2.68s.
 
-The gap is the same 1.45× on a 16-core laptop, where both figures are roughly half these. That
-is the whole reason to read this table as a ratio.
+This gap did not travel, and an earlier version of this page said it did. On a 16-core laptop
+the same pair reads 1.42s against 1.30s — 1.1×, across four runs where tarsk ranged 1.21s to
+1.38s and the ratio 1.03× to 1.18×. By the ~10% rule at the top of this page that is a tie: on
+sixteen cores these two brokers drain a no-op queue at the same speed, and only the two-core
+runner separates them.
+
+The 0.95s this page used to report for tarsk on that laptop does not reproduce, and the reason
+is not a regression. Three commits were rebuilt in worktrees and re-run on the same machine
+within minutes of each other — the one that first published 0.95s, the one 27 later that
+restated it, and HEAD — and they measure 1.32s, 1.22s and 1.31s. Whatever produced 0.95s, it
+was not code that has since been lost. The honest part is what stays unexplained: taskiq's
+figure from the same old run, 1.48s, reproduces exactly, so a machine that was simply faster
+that day does not fit either. That run was taken before this harness had a CPU probe at all,
+which is the only thing about it that can still be checked, and it fails that check by not
+having one. Read the ratio within this table; it is not a constant across machines.
 
 That gap is a change, and the cause is not a clever optimisation. This page used to report a
 tie, and the reason for the tie was a mutex the Redis driver held round its own connection —
@@ -256,9 +269,10 @@ fastest, and nobody runs one.
 
 **Acking cost almost nothing here, and that is a change.** taskiq's own list broker against
 its own stream broker is the cleanest measure of it: 2.67s against 2.71s at ten thousand, a
-1.5% difference. On a 16-core laptop the same pair reads 0.85s against 1.48s — 73%. Two cores
-is enough to bury the acknowledgement under the dispatch, so the earlier claim that acking is
-what separates these brokers holds on one machine and not on the other. What tarsk pays on top
+1.5% difference. On a 16-core laptop the same pair reads 1.21s against 1.42s — 17%. An earlier
+version of this page put that at 73%, from a laptop run that does not reproduce either. Two
+cores is enough to bury the acknowledgement under the dispatch and sixteen is not, but by far
+less than that number claimed. What tarsk pays on top
 of either is a Unix socket round trip per task, about 63µs, because the handler runs in a child
 the supervisor can meter and replace.
 
@@ -381,15 +395,19 @@ Two cores is also why Celery's out-of-the-box row is a hundred seconds. `-c` def
 core count, so it gets two workers where taskiq's defaults get two hundred concurrent tasks.
 That is what the flag does, not a handicap applied to it.
 
-**The ratios travelled and the absolute numbers did not**, which is the more useful fact about
-this page. Ten thousand tasks across four processes, tarsk against taskiq's stream broker:
-1.45× on the runner, 1.45× on a 16-core laptop, on figures that differ by a factor of two in
-both directions. The I/O and out-of-the-box comparisons moved by less than a tenth between the
-two machines. Compare rows within a table; do not carry a second across.
+**Some ratios travelled and some did not**, and telling them apart took re-measuring. Ten
+thousand tasks across four processes, tarsk against taskiq's stream broker, is 1.45× on the
+runner and 1.1× on a 16-core laptop; an earlier version of this page reported 1.45× on both,
+and the laptop half of that pair turned out to be unreproducible even from the commit that
+produced it. The I/O and out-of-the-box comparisons did move by less than a tenth between the
+two machines. Compare rows within a table; do not carry a second across, and do not take a
+ratio for a constant because it held twice.
 
 Every run prints a CPU probe taken before each row and marks the row `slow` when that reading
-sits more than 25% above the run's median, so a table can be trusted cell by cell rather than
-run by run. On a laptop the usual cause is the benchmark heating the machine it is running on:
+sits more than 25% above the run's fastest, so a table can be trusted cell by cell rather than
+run by run. It compared against the median until a run warned that it had drifted 1.7× and then
+marked nothing — the warning measures fastest against slowest and the mark measured against the
+middle, so the two could disagree about the same run and the guard said nothing useful. On a laptop the usual cause is the benchmark heating the machine it is running on:
 a twenty-minute local run drifted from 11ms to 27ms with nothing else competing, which is most
 of why these came from a runner instead.
 

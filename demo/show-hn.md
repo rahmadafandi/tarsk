@@ -42,8 +42,9 @@ ceiling is exact when one task is running while it is read, and that is somethin
 you configure rather than something you get.
 
 What it does not claim: speed. It drains a no-op queue about 1.45x faster than
-taskiq -- the same ratio on a two-core runner and a sixteen-core laptop, on numbers
-that differ by half -- but with a 50 ms handler all three reach 20 tasks/s,
+taskiq on a two-core runner and ties it on a sixteen-core laptop -- the ratio is
+not a constant, and an earlier draft of this said it was -- but with a
+50 ms handler all three reach 20 tasks/s,
 identical, as they should be. Nor is the ceiling absolute: it is read between
 tasks, so a child never starts one it cannot afford, but a handler that allocates
 300 MB will allocate it. Overshoot is one task's peak, not zero. A ceiling that
@@ -134,8 +135,14 @@ workload changes between columns.
 | tarsk | 2,859/s | 20/s | 0.15s |
 
 Draining a 10,000-task queue across four processes, same guarantee for both: taskiq 2.71s,
-tarsk 1.88s. Celery takes 7.6s. On a sixteen-core laptop those first two read 1.37s and 0.95s —
-half the numbers, the same 1.45×.
+tarsk 1.88s. Celery takes 7.6s. On a sixteen-core laptop the same pair reads 1.42s and 1.30s —
+1.1×, not the runner's 1.45×, and by the ~10% rule at the bottom of this page that is a tie.
+An earlier draft claimed both machines gave 1.45×, from a laptop figure of 0.95s that no
+longer reproduces. Three commits were rebuilt and re-run to find out why — the one that first
+published it, the one 27 later that restated it, and HEAD — and all three measure 1.2–1.3s, so
+it is not a regression. It is also not simply a faster machine that day: taskiq's figure from
+the same old run reproduces exactly. That run predates this harness having a CPU probe, and
+what it actually shows is that a number taken without one cannot be defended later.
 
 **Out of the box**, no concurrency flags at all, 2,000 tasks that each await 100 ms: tarsk
 0.95s on 72 MB, taskiq 1.24s on 145 MB, Celery 100.7s on 133 MB. Celery's `-c` defaults to the
@@ -184,7 +191,12 @@ would rather lose the task, and it is off by default.
 They were, twice, and both runs were thrown away: a twenty-minute CPU-bound benchmark heats the
 machine it runs on, and an identical CPU probe drifted from 11 ms to 27 ms with nothing else
 competing. The harness now takes that probe before every row and marks the row when it reads
-slow. These come from a runner anyone can dispatch.
+more than 25% slower than the run's fastest. These come from a runner anyone can dispatch.
+
+The laptop numbers that survived from before that guard existed did not survive being checked.
+One of them, tarsk draining ten thousand tasks in 0.95s, is retracted above: three rebuilt
+commits all measure 1.2–1.3s and none of them explains where 0.95s came from. A benchmark page
+is only worth as much as the numbers on it that someone has tried to break.
 
 **Why not contribute this to Celery?**
 The supervision model is the whole design — pull-based children, a registry that crosses IPC so

@@ -54,6 +54,19 @@ def once(tag):
     return tag
 
 
+@app.task(name="unhurried", result_ttl=60)
+def unhurried(tag):
+    """Long enough that awaiting it is a real wait, short enough for a test.
+
+    The async check needs something to wait *for*: if the answer lands before
+    the event loop has come round twice, a responsive loop and a blocked one
+    look the same.
+    """
+    time.sleep(1.0)
+    _log(tag)
+    return tag
+
+
 @app.task(name="capped", max_concurrency=2, timeout=30)
 def capped(tag):
     """Logs its own start and end, so overlap is measurable rather than assumed."""

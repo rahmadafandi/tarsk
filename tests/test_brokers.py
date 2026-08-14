@@ -272,31 +272,43 @@ def check_broker(url: str, label: str) -> None:
         assert app.result(forgotten_id).ready() is False, f"{label}: stored an unasked result"
 
         # The async pair has to leave the event loop free, which is the whole
-        # reason it exists — so count how often a neighbouring coroutine got to
-        # run while the enqueue and the wait were in flight. If either blocked,
-        # the counter barely moves.
+        # reason it exists. Measured as the longest a neighbouring coroutine
+        # went without running, while awaiting a task that takes a second: if
+        # either call blocked, that gap is the length of the block.
+        #
+        # Counting the coroutine's turns instead — which this did first — fails
+        # on a fast machine for the opposite reason, because work that finishes
+        # before the loop comes round twice looks exactly like work that wedged
+        # it. A free-threaded build reported one turn and was simply quick.
         import asyncio
 
         async def check_async_path():
-            ticks = 0
+            gaps = []
             stop = asyncio.Event()
 
             async def ticker():
-                nonlocal ticks
+                last = time.perf_counter()
                 while not stop.is_set():
-                    ticks += 1
                     await asyncio.sleep(0.001)
+                    now = time.perf_counter()
+                    gaps.append(now - last)
+                    last = now
 
             spin = asyncio.create_task(ticker())
-            job = await app.registry["answers"].send_async(4, 5)
+            await asyncio.sleep(0.05)
+            gaps.clear()
+            job = await app.registry["unhurried"].send_async("async")
             answer = await app.result(job).get_async(timeout=60)
             stop.set()
             await spin
-            return answer, ticks
+            return answer, max(gaps) if gaps else 99.0
 
-        answer, ticks = asyncio.run(check_async_path())
-        assert answer == {"sum": 9, "pid": ANY_PID}, f"{label}: {answer}"
-        assert ticks > 20, f"{label}: the loop only ran {ticks} times — something blocked it"
+        answer, worst = asyncio.run(check_async_path())
+        assert answer == "async", f"{label}: {answer!r}"
+        # The handler alone is a second. Anything approaching that means the
+        # loop sat inside a call instead of around it.
+        assert worst < 0.3, f"{label}: the loop stalled for {worst:.2f}s"
+
         stop_worker(worker)
 
         # --- per-call overrides: a different queue, an absolute time ----

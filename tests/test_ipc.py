@@ -81,21 +81,32 @@ def test_slots_overlap_inside_one_child():
 def test_slots_overlap_sync_handlers_too():
     """A sync handler holds a thread, and asyncio's default pool is small.
 
-    Without sizing the executor to the slot count, 24 slots would run
+    Without sizing the executor to the slot count, twelve slots would run
     min(32, cpu + 4) at a time — silently, and only on sync handlers.
+
+    Timed against itself rather than a constant: the first version asserted a
+    wall-clock ceiling tuned to one laptop and failed on macOS, where a slower
+    interpreter startup pushed a fully overlapped run past it.
     """
     import time
 
-    jobs = [("blocks", (), {}) for _ in range(24)]
-    start = time.monotonic()
-    results = Supervisor("tests.demo_app:app", children=1, slots=24).run(jobs)
-    wall = time.monotonic() - start
+    jobs = [("blocks", (), {}) for _ in range(12)]
 
-    assert len(results) == 24, results
+    start = time.monotonic()
+    Supervisor("tests.demo_app:app", children=1, slots=1).run(jobs)
+    serial = time.monotonic() - start
+
+    start = time.monotonic()
+    results = Supervisor("tests.demo_app:app", children=1, slots=12).run(jobs)
+    parallel = time.monotonic() - start
+
+    assert len(results) == 12, results
     assert all(r[0] == "ack" for r in results.values()), results
-    # 24 × 0.2s serialised is 4.8s; overlapped it is 0.2s plus interpreter
-    # startup. Anything past a second means the pool, not the slots, decided.
-    assert wall < 1.5, f"24 sync slots took {wall:.2f}s — the thread pool is the cap"
+    # Twelve 0.2s sleeps: 2.4s in a row, 0.2s at once. Startup is in both.
+    assert parallel < serial - 1.0, (
+        f"twelve sync slots took {parallel:.2f}s against {serial:.2f}s at one slot — "
+        "the thread pool is the cap, not the slot count"
+    )
 
 
 def test_end_to_end():

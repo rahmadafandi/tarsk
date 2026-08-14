@@ -77,6 +77,7 @@ jobs:
           python -m venv .venv
           .venv/bin/pip install -q maturin msgpack
           .venv/bin/maturin develop --release
+          .venv/bin/python tests/rss_probe.py
           .venv/bin/python tests/test_ipc.py
           .venv/bin/python tests/test_recycle.py
           .venv/bin/python tests/test_brokers.py
@@ -98,6 +99,7 @@ jobs:
           python -m venv .venv
           .venv\Scripts\pip install -q maturin msgpack
           .venv\Scripts\maturin develop --release
+          .venv\Scripts\python tests/rss_probe.py
           .venv\Scripts\python tests/test_ipc.py
           .venv\Scripts\python tests/test_recycle.py
 

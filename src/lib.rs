@@ -2111,10 +2111,24 @@ impl Producer {
     }
 }
 
+/// The resident set of one process, as the supervisor reads it.
+///
+/// Exposed because the ceiling is only as good as this number, and when it is
+/// wrong — as it was on Windows, reporting 4MB for a child holding hundreds —
+/// there is no way to tell a broken reading from a broken trigger without it.
+#[pyfunction]
+fn rss_of(pid: u32) -> u64 {
+    let mut sys = System::new();
+    let key = Pid::from_u32(pid);
+    sys.refresh_processes(ProcessesToUpdate::Some(&[key]), false);
+    sys.process(key).map(|p| p.memory()).unwrap_or(0)
+}
+
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(run, m)?)?;
     m.add_function(wrap_pyfunction!(work, m)?)?;
+    m.add_function(wrap_pyfunction!(rss_of, m)?)?;
     m.add_class::<Producer>()
 }
 

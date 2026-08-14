@@ -327,6 +327,35 @@ def check_broker(url: str, label: str) -> None:
             stop_worker(worker)
         assert ticks == ["tick"], f"{label}: expected exactly one tick, got {ticks}"
 
+        # --- a concurrency cap holds across workers, not per worker -------
+        #
+        # Four children with four slots each is sixteen places a job could run.
+        # The cap says two, and the proof is overlap: each job logs its own
+        # start and end, so the deepest nesting is measured rather than inferred
+        # from how long the whole thing took.
+        log.write_text("")
+        for i in range(8):
+            app.registry["capped"].send(f"c{i}")
+        worker = start_worker(env, TARSK_LEASE_GRACE=1, TARSK_CHILDREN=4, TARSK_SLOTS=4)
+        try:
+            deadline = time.time() + 60
+            while time.time() < deadline and \
+                    len([t for t in tags_in(log) if t.startswith("end-")]) < 8:
+                time.sleep(0.2)
+        finally:
+            stop_worker(worker)
+        live = peak = 0
+        for tag in tags_in(log):
+            if tag.startswith("start-"):
+                live += 1
+                peak = max(peak, live)
+            elif tag.startswith("end-"):
+                live -= 1
+        finished = len([t for t in tags_in(log) if t.startswith("end-")])
+        assert finished == 8, f"{label}: only {finished}/8 capped jobs finished"
+        assert peak <= 2, f"{label}: max_concurrency=2 but {peak} ran at once"
+        assert peak == 2, f"{label}: never reached the cap ({peak}) — is anything parallel?"
+
         # --- the backlog is visible before, during and after -------------
         log.write_text("")
         from tarsk._core import Producer

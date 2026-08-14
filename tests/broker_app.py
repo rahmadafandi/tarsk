@@ -48,6 +48,15 @@ def medium(tag):
     return tag
 
 
+@app.task(name="capped", max_concurrency=2, timeout=30)
+def capped(tag):
+    """Logs its own start and end, so overlap is measurable rather than assumed."""
+    _log(f"start-{tag}")
+    time.sleep(0.6)
+    _log(f"end-{tag}")
+    return tag
+
+
 @app.task(name="double", result_ttl=60)
 def double(n):
     _log(f"double-{n}")

@@ -47,6 +47,10 @@ class TaskSpec:
     # instead of run. Zero means never, which is the default: work that
     # disappears by default would be a strange promise for this project.
     expires_ms: int = 0
+    # How many of this task may run at once across every worker. Zero is
+    # unlimited. Different from a rate limit: that bounds how often something
+    # starts, this bounds how many are in progress.
+    max_concurrency: int = 0
 
     def as_row(self) -> list:
         """Positional form that crosses the wire (spec §4.2)."""
@@ -61,6 +65,7 @@ class TaskSpec:
             self.rate_per_sec,
             self.rate_burst,
             self.expires_ms,
+            self.max_concurrency,
         ]
 
 
@@ -288,6 +293,7 @@ class App:
         cron: str = "",
         rate_limit: str = "",
         expires: float = 0.0,
+        max_concurrency: int = 0,
     ):
         def decorate(fn):
             t = self.default_timeout if timeout is None else timeout
@@ -323,6 +329,7 @@ class App:
             spec = TaskSpec(
                 task_name, int(t * 1000), retries, backoff, queue,
                 int(result_ttl * 1000), cron, per_sec, burst, int(expires * 1000),
+                max(0, max_concurrency),
             )
             task = Task(fn, spec, self)
             self.registry[task_name] = task

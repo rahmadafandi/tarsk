@@ -188,6 +188,7 @@ struct Counters {
     rate_limited: AtomicU64,
     expired: AtomicU64,
     chained: AtomicU64,
+    at_capacity: AtomicU64,
     dead_lettered: AtomicU64,
     cron_fired: AtomicU64,
     broker_errors: AtomicU64,
@@ -306,6 +307,7 @@ impl Shared {
 
     async fn settle(&self, job: Job, outcome: Outcome) {
         if outcome.ok {
+            self.free_slot(&job).await;
             self.metrics
                 .observe(&job.name, true, job.dispatched.elapsed());
             self.keep_result(&job, &outcome).await;
@@ -322,6 +324,19 @@ impl Shared {
         self.metrics
             .observe(&job.name, false, job.dispatched.elapsed());
         self.fail_job(job, outcome).await;
+    }
+
+    /// Hand back a concurrency slot, if this task holds any.
+    async fn free_slot(&self, job: &Job) {
+        let capped = self
+            .specs
+            .lock()
+            .unwrap()
+            .get(&job.name)
+            .is_some_and(|s| s.max_concurrency > 0);
+        if capped {
+            let _ = self.broker.release_slot(&job.name, &job.id).await;
+        }
     }
 
     /// Queue the next step of a chain, if this job was carrying one.
@@ -421,6 +436,12 @@ impl Shared {
     /// `attempt` is what the broker counted, not what this process remembers,
     /// so a job that has been passed between workers still runs out of retries.
     async fn fail_job(&self, job: Job, outcome: Outcome) {
+        // Every way out of "running" that is not a success arrives here —
+        // including a child that died holding the job and a hard-ceiling kill,
+        // neither of which goes through settle. A slot left behind throttles
+        // the task until its lease expires, which reads as a task that
+        // mysteriously stopped running.
+        self.free_slot(&job).await;
         let spec = self.specs.lock().unwrap().get(&job.name).cloned();
         let retries = spec.as_ref().map(|s| s.retries).unwrap_or(0);
         // A rejection skips whatever attempts are left: the handler is saying
@@ -549,6 +570,8 @@ struct Spec {
     rate_burst: u32,
     /// Milliseconds a job may wait after becoming runnable. Zero is never.
     expires_ms: u64,
+    /// How many of this task may be in progress at once. Zero is unlimited.
+    max_concurrency: u32,
 }
 
 /// Wait before the next attempt. Exponential from one second, capped so a
@@ -627,6 +650,7 @@ fn counter_list(counters: &Counters) -> Vec<(&'static str, u64)> {
         ("tasks_rate_limited", load(&counters.rate_limited)),
         ("tasks_expired", load(&counters.expired)),
         ("chain_steps_queued", load(&counters.chained)),
+        ("tasks_at_capacity", load(&counters.at_capacity)),
         ("tasks_dead_lettered", load(&counters.dead_lettered)),
         ("cron_fired", load(&counters.cron_fired)),
         ("broker_errors", load(&counters.broker_errors)),
@@ -683,6 +707,8 @@ async fn accept_loop(listener: UnixListener, shared: Arc<Shared>) {
                             rate_per_sec: fields.get(7).and_then(|v| v.as_f64()).unwrap_or(0.0),
                             rate_burst: fields.get(8).and_then(|v| v.as_u64()).unwrap_or(0) as u32,
                             expires_ms: fields.get(9).and_then(|v| v.as_u64()).unwrap_or(0),
+                            max_concurrency: fields.get(10).and_then(|v| v.as_u64()).unwrap_or(0)
+                                as u32,
                         },
                     )),
                     _ => None,
@@ -1027,6 +1053,47 @@ async fn serve(shared: &Arc<Shared>, child: &mut ChildHandle, cfg: &Arc<Cfg>) ->
                             // database, someone else's API. Dispatching when the
                             // bucket cannot be read trades a delay the caller
                             // asked for against a breach they did not.
+                            shared
+                                .counters
+                                .broker_errors
+                                .fetch_add(1, Ordering::Relaxed);
+                            let _ = shared
+                                .broker
+                                .retry(&job.receipt, Duration::from_millis(1000))
+                                .await;
+                            continue;
+                        }
+                    }
+                }
+                // Too many of this task already in progress. Checked after the
+                // rate limit so a job refused for one reason is not also
+                // holding a slot for the other.
+                let (cap, lease_ms) = shared
+                    .specs
+                    .lock()
+                    .unwrap()
+                    .get(&job.name)
+                    .map(|s| (s.max_concurrency, s.timeout_ms))
+                    .unwrap_or((0, 0));
+                if cap > 0 {
+                    let lease = lease_ms + cfg.lease_grace.as_millis() as u64;
+                    match shared
+                        .broker
+                        .acquire_slot(&job.name, &job.id, cap, lease)
+                        .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            shared.counters.at_capacity.fetch_add(1, Ordering::Relaxed);
+                            let _ = shared
+                                .broker
+                                .retry(&job.receipt, Duration::from_millis(250))
+                                .await;
+                            continue;
+                        }
+                        Err(_) => {
+                            // Fail closed, for the same reason the rate limit
+                            // does: the cap is protecting something outside.
                             shared
                                 .counters
                                 .broker_errors

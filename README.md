@@ -364,6 +364,26 @@ There is no default and no app-wide setting. How long a task stays worth doing i
 knowledge, and the asymmetry is one-sided: without expiry, work runs late and you can see it;
 with the wrong expiry, work disappears and you cannot.
 
+## Concurrency caps
+
+```python
+@app.task(max_concurrency=2)
+def rebuild_report(account_id): ...
+```
+
+At most this many in progress at once, across every worker. That is a different question from
+the rate limit above: `"5/s"` bounds how often something *starts* and does nothing to stop a
+hundred slow ones piling onto the database at the same time.
+
+**The slot carries its own expiry** rather than being a counter, and its expiry is the job's own
+lease. A worker that dies holding a slot would otherwise throttle that task forever, and the
+symptom — a task that quietly stops running, with nothing in the logs — is the worst kind to
+debug. Here the slot lapses exactly when the job it was holding does, and the job comes back
+through the same reclaim path as any other lost lease.
+
+Refused jobs are handed back with a short delay, so the worker slot goes to other work rather
+than idling. Measured with sixteen worker slots free and `max_concurrency=2`: two ran at a time.
+
 ## Rate limits
 
 ```python

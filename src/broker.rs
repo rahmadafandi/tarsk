@@ -185,6 +185,36 @@ impl Broker {
         }
     }
 
+    /// Take one of `task`'s concurrency slots, or report that none is free.
+    ///
+    /// The slot carries its own expiry rather than being a plain counter: a
+    /// worker that dies holding one would otherwise throttle that task forever,
+    /// and the failure would look like a task that mysteriously stopped
+    /// running. `lease_ms` should be the job's lease, so a lost slot expires
+    /// exactly when the job it was holding does.
+    pub async fn acquire_slot(
+        &self,
+        task: &str,
+        job_id: &str,
+        max: u32,
+        lease_ms: u64,
+    ) -> Res<bool> {
+        match self {
+            Broker::Memory(_) => Ok(true),
+            Broker::Redis(b) => b.acquire_slot(task, job_id, max, lease_ms).await,
+            Broker::Postgres(b) => b.acquire_slot(task, job_id, max, lease_ms).await,
+        }
+    }
+
+    /// Give the slot back. Idempotent, so settling twice cannot free two.
+    pub async fn release_slot(&self, task: &str, job_id: &str) -> Res<()> {
+        match self {
+            Broker::Memory(_) => Ok(()),
+            Broker::Redis(b) => b.release_slot(task, job_id).await,
+            Broker::Postgres(b) => b.release_slot(task, job_id).await,
+        }
+    }
+
     /// Take one token for `task`, or say how long to wait in milliseconds.
     ///
     /// The counter lives in the broker because a per-worker limit is not a
@@ -587,6 +617,10 @@ fn stream_id_ms(id: &str) -> u64 {
         .unwrap_or(0)
 }
 
+fn slots_key(task: &str) -> String {
+    format!("tarsk:slots:{task}")
+}
+
 fn revoked_key(queue: &str) -> String {
     format!("{}:revoked", stream_key(queue))
 }
@@ -937,6 +971,44 @@ impl RedisBroker {
         Ok(out)
     }
 
+    async fn acquire_slot(&self, task: &str, job_id: &str, max: u32, lease_ms: u64) -> Res<bool> {
+        // Prune, count and add cannot be three commands: two workers would both
+        // see the last slot free. A sorted set scored by expiry gives the prune
+        // for free, which a counter would need a separate reaper for.
+        let script = redis::Script::new(
+            r"local now, until_ms, max = tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3])
+              redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, now)
+              if redis.call('ZCARD', KEYS[1]) >= max
+                 and redis.call('ZSCORE', KEYS[1], ARGV[4]) == false then
+                return 0
+              end
+              redis.call('ZADD', KEYS[1], until_ms, ARGV[4])
+              redis.call('PEXPIRE', KEYS[1], until_ms - now + 60000)
+              return 1",
+        );
+        let mut conn = self.conn.clone();
+        let now = now_ms();
+        let taken: i64 = script
+            .key(slots_key(task))
+            .arg(now)
+            .arg(now + lease_ms.max(1))
+            .arg(max)
+            .arg(job_id)
+            .invoke_async(&mut conn)
+            .await?;
+        Ok(taken == 1)
+    }
+
+    async fn release_slot(&self, task: &str, job_id: &str) -> Res<()> {
+        let mut conn = self.conn.clone();
+        let _: i64 = redis::cmd("ZREM")
+            .arg(slots_key(task))
+            .arg(job_id)
+            .query_async(&mut conn)
+            .await?;
+        Ok(())
+    }
+
     async fn take_token(&self, task: &str, per_sec: f64, burst: u32) -> Res<u64> {
         // Read-refill-write has to be one step or two workers both see the last
         // token. Lua is the only thing Redis offers that is; MULTI would not
@@ -1277,6 +1349,13 @@ create table if not exists tarsk_dead (
 -- back. Nothing noticed, because nothing read them: a store you can only write
 -- to cannot tell you it is missing a column. Added separately from the CREATE
 -- so a table made by an earlier version gains them too.
+create table if not exists tarsk_slots (
+    task       text        not null,
+    job_id     text        not null,
+    expires_at timestamptz not null,
+    primary key (task, job_id)
+);
+create index if not exists tarsk_slots_expiry on tarsk_slots (expires_at);
 create table if not exists tarsk_buckets (
     task   text             primary key,
     tokens double precision not null,
@@ -1527,6 +1606,50 @@ impl PgBroker {
             });
         }
         Ok(out)
+    }
+
+    async fn acquire_slot(&self, task: &str, job_id: &str, max: u32, lease_ms: u64) -> Res<bool> {
+        // One statement again: the delete of expired holders, the count and the
+        // insert have to be indivisible or two workers both find room.
+        // `on conflict do update` makes a redelivery renew its own slot rather
+        // than be refused by it.
+        let row = self
+            .client
+            .query_one(
+                "with gone as (delete from tarsk_slots where expires_at <= now())
+                 insert into tarsk_slots (task, job_id, expires_at)
+                 select $1, $2, now() + make_interval(secs => $4)
+                  where (select count(*) from tarsk_slots
+                          where task = $1 and expires_at > now()
+                            and job_id <> $2) < $3
+                 on conflict (task, job_id) do update set expires_at = excluded.expires_at
+                 returning true",
+                &[
+                    &task,
+                    &job_id,
+                    &(max as i64),
+                    &(lease_ms.max(1) as f64 / 1000.0),
+                ],
+            )
+            .await;
+        match row {
+            Ok(_) => Ok(true),
+            // No row inserted means the where-clause found no room. tokio-postgres
+            // reports that as "unexpected number of rows", which is the answer
+            // rather than a fault.
+            Err(e) if e.to_string().contains("unexpected number of rows") => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    async fn release_slot(&self, task: &str, job_id: &str) -> Res<()> {
+        self.client
+            .execute(
+                "delete from tarsk_slots where task = $1 and job_id = $2",
+                &[&task, &job_id],
+            )
+            .await?;
+        Ok(())
     }
 
     async fn take_token(&self, task: &str, per_sec: f64, burst: u32) -> Res<u64> {

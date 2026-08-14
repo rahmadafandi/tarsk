@@ -16,7 +16,7 @@ import inspect
 import re
 import secrets
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 __all__ = [
     "App", "AsyncResult", "Chain", "Context", "Depends", "Group", "Signature",
@@ -85,6 +85,10 @@ class Context:
     attempt: int
     args: tuple
     kwargs: dict
+    #: Whatever the sender attached with `meta=`, and empty when they did not.
+    #: Carried beside the arguments rather than inside them, so a listing can
+    #: read it without unpacking a call it does not understand.
+    meta: dict = field(default_factory=dict)
     #: Set by the worker. Sends progress to the supervisor, which is the only
     #: process here holding a broker connection (spec §4.1).
     _emit: object = None
@@ -196,6 +200,7 @@ class Task:
         task_id: str | None = None,
         dedup_key: str = "",
         dedup_ttl: float | None = None,
+        meta: dict | None = None,
     ) -> "Enqueue":
         """Override what this one send does, without touching the registration.
 
@@ -203,7 +208,7 @@ class Task:
         with an argument the task itself takes.
         """
         return Enqueue(self, queue=queue, timeout=timeout, delay=delay, when=when,
-                       dedup_key=dedup_key, dedup_ttl=dedup_ttl,
+                       dedup_key=dedup_key, dedup_ttl=dedup_ttl, meta=meta,
                        task_id=task_id)
 
     def __repr__(self) -> str:
@@ -215,7 +220,7 @@ class Enqueue:
 
     def __init__(self, task: Task, *, queue=None, timeout=None, delay=0.0, when=None,
                  chain: bytes = b"", dedup_key: str = "", dedup_ttl: float | None = None,
-                 task_id=None):
+                 meta: dict | None = None, task_id=None):
         if delay and when is not None:
             raise ValueError("give a delay or a time, not both")
         if when is not None:
@@ -240,6 +245,7 @@ class Enqueue:
         self.chain = chain
         self.dedup_key = dedup_key
         self.dedup_ttl = dedup_ttl
+        self.meta = meta or {}
 
     def send(self, *args, **kwargs) -> str:
         from . import _proto  # lazy — see App.producer
@@ -264,7 +270,9 @@ class Enqueue:
         key, ttl_ms = self._dedup(payload)
         held = self.task.app.producer().send(
             self.task_id, self.queue, self.task.spec.name, payload,
-            self.timeout_ms, self.delay, self.chain, key, ttl_ms,
+            self.timeout_ms, self.delay, self.chain,
+            _proto.pack_result(self.meta) if self.meta else b"",
+            key, ttl_ms,
         )
         # A deduplicated send hands back the id of the job already covering it,
         # so the caller waits on the same answer instead of on a job that was

@@ -410,15 +410,38 @@ def check_broker(url: str, label: str) -> None:
         assert peak <= 2, f"{label}: max_concurrency=2 but {peak} ran at once"
         assert peak == 2, f"{label}: never reached the cap ({peak}) — is anything parallel?"
 
+        # --- what the sender attached reaches the handler and the listing --
+        #
+        # Carried beside the arguments, not inside them: the listing reads it
+        # without unpacking a call it does not understand, and a handler that
+        # never declared a parameter for it still gets it through Context.
+        log.write_text("")
+        from tarsk import _proto
+        from tarsk._core import Producer
+
+        producer = Producer(broker_url=url)
+        tagged = app.registry["labelled"].options(
+            meta={"trace": "abc123", "tenant": 7}
+        ).send("t")
+        rows = {r[0]: r for r in producer.jobs(["default"], 50)}
+        assert tagged in rows, f"{label}: the tagged job is not listed"
+        assert _proto.unpack_result(rows[tagged][7]) == {"trace": "abc123", "tenant": 7}, \
+            f"{label}: listing lost the meta: {rows[tagged][7]!r}"
+
+        worker = start_worker(env, TARSK_LEASE_GRACE=1)
+        try:
+            answer = app.result(tagged).get(timeout=60)
+        finally:
+            stop_worker(worker)
+        assert answer == {"trace": "abc123", "tenant": 7}, f"{label}: handler saw {answer!r}"
+        assert "labelled-abc123" in tags_in(log), f"{label}: {tags_in(log)}"
+
         # --- the individual jobs are visible, not only the count ----------
         #
         # The depth counters say how far behind; this says behind on what. A
         # delayed job is listed too, and reports time remaining rather than
         # time waited — it has not started waiting yet.
         log.write_text("")
-        from tarsk._core import Producer
-
-        producer = Producer(broker_url=url)
         soon = app.registry["note"].send("listed-now")
         later = app.registry["note"].options(delay=600).send("listed-later")
         listed = {row[0]: row for row in producer.jobs(["default"], 50)}

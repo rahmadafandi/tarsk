@@ -90,6 +90,8 @@ struct Job {
     ready_at_ms: u64,
     /// Steps to run after this one, msgpack, empty for a lone job.
     chain: Vec<u8>,
+    /// Whatever the caller attached, handed to the child untouched.
+    meta: Vec<u8>,
 }
 
 /// What the handler asked for, on top of having failed.
@@ -390,6 +392,9 @@ impl Shared {
             payload,
             timeout_ms,
             chain: tail,
+            // A chain's steps inherit nothing: the meta belonged to the send,
+            // and a later step is a different job with a different id.
+            meta: Vec::new(),
         };
         if self.broker.push(next_job, Duration::ZERO).await.is_err() {
             self.counters.broker_errors.fetch_add(1, Ordering::Relaxed);
@@ -544,6 +549,7 @@ impl Shared {
             dispatched: Instant::now(),
             ready_at_ms: delivery.ready_at_ms,
             chain: delivery.chain,
+            meta: delivery.meta,
         }
     }
 }
@@ -1160,6 +1166,10 @@ async fn serve(shared: &Arc<Shared>, child: &mut ChildHandle, cfg: &Arc<Cfg>) ->
                     Value::from(job.task_id),
                     Value::from(job.name.as_str()),
                     Value::Binary(job.payload.clone()),
+                    // Appended rather than folded into the payload: a listing
+                    // reads this without unpacking the user's arguments, and
+                    // the chain splicer would have had to learn about it.
+                    Value::Binary(job.meta.clone()),
                 ]);
                 inflight.insert(job.task_id, job);
                 free -= 1;
@@ -1667,6 +1677,7 @@ async fn supervise(
                             payload: no_arguments(),
                             timeout_ms: spec.timeout_ms as u32,
                             chain: Vec::new(),
+                            meta: Vec::new(),
                         };
                         if shared.broker.push(job, Duration::ZERO).await.is_err() {
                             shared
@@ -1892,6 +1903,7 @@ fn run(
                                     payload,
                                     timeout_ms: 0,
                                     chain: Vec::new(),
+                                    meta: Vec::new(),
                                 },
                                 Duration::ZERO,
                             )
@@ -1972,8 +1984,9 @@ type DeadRow = (String, String, String, String, u64);
 /// One queue's backlog crossing into Python: name, ready, in flight, delayed, dead.
 type DepthRow = (String, u64, u64, u64, u64);
 
-/// One job crossing into Python: id, queue, name, state, attempt, age in ms.
-type JobRow = (String, String, String, String, u32, i64);
+/// One job crossing into Python: id, queue, name, state, attempt, age, worker,
+/// and whatever the sender attached, still packed.
+type JobRow = (String, String, String, String, u32, i64, String, Py<PyAny>);
 
 /// Producer handle. Holds its own runtime and connection so enqueueing from a
 /// web request is one round trip, not a reconnect.
@@ -1998,7 +2011,7 @@ impl Producer {
 
     /// `delay` in seconds; zero enqueues immediately.
     #[pyo3(signature = (id, queue, name, payload, timeout_ms, delay=0.0, chain=Vec::new(),
-                        dedup_key=String::new(), dedup_ttl_ms=0))]
+                        meta=Vec::new(), dedup_key=String::new(), dedup_ttl_ms=0))]
     #[allow(clippy::too_many_arguments)] // a pyo3 entry point, not a call site
     fn send(
         &self,
@@ -2010,6 +2023,7 @@ impl Producer {
         timeout_ms: u32,
         delay: f64,
         chain: Vec<u8>,
+        meta: Vec<u8>,
         dedup_key: String,
         dedup_ttl_ms: u64,
     ) -> PyResult<Option<String>> {
@@ -2020,6 +2034,7 @@ impl Producer {
             payload,
             timeout_ms,
             chain,
+            meta,
         };
         let delay = Duration::from_secs_f64(delay.max(0.0));
         py.detach(|| {
@@ -2100,6 +2115,8 @@ impl Producer {
                     j.state.to_string(),
                     j.attempt,
                     j.age_ms,
+                    j.worker,
+                    PyBytes::new(py, &j.meta).into_any().unbind(),
                 )
             })
             .collect())

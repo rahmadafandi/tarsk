@@ -45,6 +45,10 @@ pub struct NewJob {
     pub name: String,
     pub payload: Vec<u8>,
     pub timeout_ms: u32,
+    /// Opaque msgpack the caller attached, carried to the handler and readable
+    /// from a listing. Never parsed here: the supervisor has no business
+    /// knowing what a trace id looks like.
+    pub meta: Vec<u8>,
     /// msgpack list of the steps still to run after this one, each
     /// `[id, name, payload, timeout_ms, queue, feed]`. Empty for a lone job.
     ///
@@ -78,6 +82,8 @@ pub struct Delivery {
     pub id: String,
     /// The steps queued to run after this one. See `NewJob::chain`.
     pub chain: Vec<u8>,
+    /// Whatever the caller attached. See `NewJob::meta`.
+    pub meta: Vec<u8>,
     pub name: String,
     pub payload: Vec<u8>,
     pub attempt: u32,
@@ -123,6 +129,12 @@ pub struct Listed {
     /// Milliseconds in this state, or negative for how long until a delayed
     /// job is due. One field because a listing reads better with one column.
     pub age_ms: i64,
+    /// Which worker holds it, empty unless it is running. Answers the question
+    /// that follows "what is stuck": stuck *where*.
+    pub worker: String,
+    /// Whatever the sender attached, still msgpack — decoded by the caller,
+    /// which is the only side that knows what it means.
+    pub meta: Vec<u8>,
 }
 
 /// One parked failure, as a human needs to see it.
@@ -516,6 +528,7 @@ impl MemoryBroker {
             id: job.id.clone(),
             ready_at_ms: 0,
             chain: job.chain.clone(),
+            meta: job.meta.clone(),
         })
     }
 
@@ -729,6 +742,8 @@ impl RedisBroker {
                 .arg(&job.id)
                 .arg("c")
                 .arg(&job.chain)
+                .arg("m")
+                .arg(&job.meta)
                 .query_async(&mut conn)
                 .await?;
             return Ok(());
@@ -883,6 +898,7 @@ impl RedisBroker {
                     attempt: entry.delivered_count.unwrap_or(1) as u32,
                     ready_at_ms: stream_id_ms(&entry.id),
                     chain: entry.get("c").unwrap_or_default(),
+                    meta: entry.get("m").unwrap_or_default(),
                     receipt: Receipt::Redis {
                         queue: queue.clone(),
                         id: entry.id,
@@ -997,11 +1013,20 @@ impl RedisBroker {
                 .query_async(&mut conn)
                 .await
                 .ok();
-            let claimed: HashMap<String, (i64, u32)> = pending
+            let claimed: HashMap<String, (i64, u32, String)> = pending
                 .map(|p| {
                     p.ids
                         .into_iter()
-                        .map(|e| (e.id, (e.last_delivered_ms as i64, e.times_delivered as u32)))
+                        .map(|e| {
+                            (
+                                e.id,
+                                (
+                                    e.last_delivered_ms as i64,
+                                    e.times_delivered as u32,
+                                    e.consumer,
+                                ),
+                            )
+                        })
                         .collect()
                 })
                 .unwrap_or_default();
@@ -1016,12 +1041,14 @@ impl RedisBroker {
                 .await?;
             for entry in entries.ids {
                 let (name, _payload, _timeout) = entry_fields(&entry);
-                let (state, age_ms, attempt) = match claimed.get(&entry.id) {
-                    Some((idle, delivered)) => ("running", *idle, *delivered),
+                let meta: Vec<u8> = entry.get("m").unwrap_or_default();
+                let (state, age_ms, attempt, worker) = match claimed.get(&entry.id) {
+                    Some((idle, delivered, who)) => ("running", *idle, *delivered, who.clone()),
                     None => (
                         "ready",
                         now.saturating_sub(stream_id_ms(&entry.id)) as i64,
                         0,
+                        String::new(),
                     ),
                 };
                 out.push(Listed {
@@ -1031,6 +1058,8 @@ impl RedisBroker {
                     state,
                     attempt,
                     age_ms,
+                    worker,
+                    meta,
                 });
             }
 
@@ -1062,6 +1091,8 @@ impl RedisBroker {
                     state: "delayed",
                     attempt: 0,
                     age_ms: now as i64 - at as i64,
+                    worker: String::new(),
+                    meta: Vec::new(),
                 });
             }
         }
@@ -1446,6 +1477,7 @@ impl RedisBroker {
                         attempt: candidate.times_delivered as u32 + 1,
                         ready_at_ms: stream_id_ms(&candidate.id),
                         chain: entry.get("c").unwrap_or_default(),
+                        meta: entry.get("m").unwrap_or_default(),
                         receipt: Receipt::Redis {
                             queue: queue.clone(),
                             id: candidate.id,
@@ -1536,6 +1568,8 @@ create table if not exists tarsk_revoked (
 );
 create index if not exists tarsk_revoked_expiry on tarsk_revoked (expires_at);
 alter table tarsk_jobs add column if not exists chain      bytea;
+alter table tarsk_jobs add column if not exists claimed_by text;
+alter table tarsk_jobs add column if not exists meta       bytea;
 alter table tarsk_dead add column if not exists job_id     text;
 alter table tarsk_dead add column if not exists timeout_ms integer not null default 0;
 ";
@@ -1558,16 +1592,21 @@ with picked as (
 update tarsk_jobs set
     lease_until = now() + make_interval(secs => timeout_ms / 1000.0 + $2::double precision),
     attempt     = attempt + 1,
-    run_lease   = run_lease + 1
+    run_lease   = run_lease + 1,
+    claimed_by  = $3
 from picked
 where tarsk_jobs.id = picked.id
-returning tarsk_jobs.id, name, payload, attempt, run_lease, job_id, picked.ready_at, chain
+returning tarsk_jobs.id, name, payload, attempt, run_lease, job_id, picked.ready_at,
+          chain, meta
 ";
 
 pub struct PgBroker {
     client: tokio_postgres::Client,
     queues: Vec<String>,
     stores: AtomicU64,
+    /// The same identity Redis gets for free from its consumer group. Postgres
+    /// has no equivalent, so a claim writes it down.
+    consumer: String,
 }
 
 impl PgBroker {
@@ -1579,6 +1618,7 @@ impl PgBroker {
         });
         client.batch_execute(PG_SCHEMA).await?;
         Ok(PgBroker {
+            consumer: format!("tarsk-{}", std::process::id()),
             client,
             queues,
             stores: AtomicU64::new(0),
@@ -1592,9 +1632,10 @@ impl PgBroker {
         self.client
             .execute(
                 "insert into tarsk_jobs
-                     (job_id, queue, name, payload, timeout_ms, lease_until, chain)
+                     (job_id, queue, name, payload, timeout_ms, lease_until, chain, meta)
                  values ($6, $1, $2, $3, $4, case when $5::double precision > 0
-                     then now() + make_interval(secs => $5::double precision) else null end, $7)",
+                     then now() + make_interval(secs => $5::double precision) else null end,
+                     $7, $8)",
                 &[
                     &job.queue,
                     &job.name,
@@ -1603,6 +1644,7 @@ impl PgBroker {
                     &delay.as_secs_f64(),
                     &job.id,
                     &job.chain,
+                    &job.meta,
                 ],
             )
             .await?;
@@ -1618,7 +1660,10 @@ impl PgBroker {
         loop {
             let rows = self
                 .client
-                .query(PG_CLAIM, &[&self.queues, &grace.as_secs_f64()])
+                .query(
+                    PG_CLAIM,
+                    &[&self.queues, &grace.as_secs_f64(), &self.consumer],
+                )
                 .await?;
             if let Some(row) = rows.first() {
                 let run_lease: i64 = row.get(4);
@@ -1633,6 +1678,7 @@ impl PgBroker {
                         .map(|d| d.as_millis() as u64)
                         .unwrap_or(0),
                     chain: row.get::<_, Option<Vec<u8>>>(7).unwrap_or_default(),
+                    meta: row.get::<_, Option<Vec<u8>>>(8).unwrap_or_default(),
                     receipt: Receipt::Postgres {
                         row: row.get(0),
                         run_lease,
@@ -1747,7 +1793,8 @@ impl PgBroker {
                              when run_lease > 0 then 'running'
                              else 'delayed' end as state,
                         (extract(epoch from
-                            now() - coalesce(lease_until, created_at)) * 1000)::bigint as age_ms
+                            now() - coalesce(lease_until, created_at)) * 1000)::bigint as age_ms,
+                        coalesce(claimed_by, '') as worker, meta
                    from tarsk_jobs
                   where queue = any($1)
                   order by id
@@ -1768,6 +1815,12 @@ impl PgBroker {
                     _ => "ready",
                 },
                 age_ms: r.get(5),
+                worker: if r.get::<_, &str>(4) == "running" {
+                    r.get(6)
+                } else {
+                    String::new()
+                },
+                meta: r.get::<_, Option<Vec<u8>>>(7).unwrap_or_default(),
             })
             .collect())
     }

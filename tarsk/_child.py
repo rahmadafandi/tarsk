@@ -138,7 +138,8 @@ async def _shutdown(app, writer) -> None:
         traceback.print_exc()
 
 
-async def _one(app, wire: Wire, app_spec: str, task_id: int, name: str, payload) -> None:
+async def _one(app, wire: Wire, app_spec: str, task_id: int, name: str, payload,
+               meta: bytes = b"") -> None:
     """Run a single dispatched task and report it. Never raises."""
     task = app.registry.get(name)
     if task is None:
@@ -160,6 +161,7 @@ async def _one(app, wire: Wire, app_spec: str, task_id: int, name: str, payload)
             attempt=1,
             args=tuple(call_args),
             kwargs=call_kwargs,
+            meta=_proto.unpack_result(meta) if meta else {},
             _emit=emit,
         )
         result = await _call(app, task, ctx, call_args, call_kwargs)
@@ -247,9 +249,9 @@ async def main(socket_path: str, app_spec: str, child_id: int, slots: int = 1) -
     for _ in range(slots):
         await wire.send("Ready")
 
-    async def run_and_report(task_id, name, payload):
+    async def run_and_report(task_id, name, payload, meta):
         try:
-            await _one(app, wire, app_spec, task_id, name, payload)
+            await _one(app, wire, app_spec, task_id, name, payload, meta)
         except _SyncTimeout:
             # Nothing above is awaiting this task, so the exit has to happen
             # here — letting it settle into the task object would leave the
@@ -268,7 +270,11 @@ async def main(socket_path: str, app_spec: str, child_id: int, slots: int = 1) -
             break
         if tag != "Dispatch":
             raise RuntimeError(f"unexpected frame from supervisor: {tag!r}")
-        job = asyncio.create_task(run_and_report(*args))
+        # Indexed rather than unpacked: the frame grew a field for the sender's
+        # metadata, and an older supervisor still sends three.
+        task_id, name, payload = args[0], args[1], args[2]
+        meta = args[3] if len(args) > 3 else b""
+        job = asyncio.create_task(run_and_report(task_id, name, payload, meta))
         running.add(job)
         job.add_done_callback(running.discard)
 

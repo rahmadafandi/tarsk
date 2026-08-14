@@ -41,6 +41,8 @@ def build_parser() -> argparse.ArgumentParser:
     jobs.add_argument("--state", choices=["ready", "running", "delayed"],
                       help="only this one")
     jobs.add_argument("--limit", type=int, default=50)
+    jobs.add_argument("--meta", action="store_true",
+                      help="show what the sender attached, on its own line")
 
     cancel = sub.add_parser("cancel", help="stop queued jobs from running")
     cancel.add_argument("ids", nargs="+", metavar="ID")
@@ -192,11 +194,17 @@ def main(argv: list[str] | None = None) -> int:
             print("nothing waiting or running")
             return 0
         width = max(len(r[2]) for r in rows)
-        for job_id, queue, name, state, attempt, age_ms in rows:
+        for job_id, queue, name, state, attempt, age_ms, worker, meta in rows:
             when = (f"due in {_span(-age_ms)}" if state == "delayed"
                     else f"{_span(age_ms)} ago")
             tries = f"  attempt {attempt}" if attempt > 1 else ""
-            print(f"{job_id}  {state:<7}  {name:<{width}}  {when}{tries}")
+            # Only running jobs have a holder, and only then is it worth a column.
+            held = f"  on {worker}" if worker else ""
+            print(f"{job_id}  {state:<7}  {name:<{width}}  {when}{tries}{held}")
+            if args.meta and meta:
+                from . import _proto
+
+                print(f"    {_proto.unpack_result(meta)}")
         print(f"\n{len(rows)} shown of at most {args.limit}. "
               f"`tarsk status` for the totals.", file=sys.stderr)
         return 0

@@ -48,6 +48,13 @@ def medium(tag):
     return tag
 
 
+@app.task(name="labelled", result_ttl=60)
+def labelled(tag, ctx=Depends(Context)):
+    """Reads what the sender attached rather than what it was called with."""
+    _log(f"labelled-{ctx.meta.get('trace', 'none')}")
+    return ctx.meta
+
+
 @app.task(name="once", unique=30)
 def once(tag):
     _log(f"once-{tag}")

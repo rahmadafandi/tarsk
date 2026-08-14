@@ -461,13 +461,24 @@ default        25        0        5        0
 reports         0        1        0        2
 
 $ tarsk jobs --broker redis://localhost:6379/0 --state running
-70cd39698ff0f529  running  rebuild_report  14m ago  attempt 2
+70cd39698ff0f529  running  rebuild_report  14m ago  attempt 2  on tarsk-25530
 ```
 
 `tarsk status` says how far behind; `tarsk jobs` says behind on what. The second question is
 the one asked when something is stuck, and a count cannot answer it. `--state ready`,
 `running` or `delayed` narrows the list; a delayed job reports the time until it is due rather
-than the time it has waited, because it has not started waiting.
+than the time it has waited, because it has not started waiting. A running job names the worker
+holding it, which is the question after "what is stuck": stuck *where*.
+
+```python
+send_invoice.options(meta={"trace": trace_id, "tenant": tenant.id}).send(invoice.id)
+```
+
+`meta` is anything the sender wants to carry alongside a job. The handler reads it from
+`Context.meta` without having declared a parameter for it, and `tarsk jobs --meta` prints it,
+so a trace id survives from the send to the listing. It travels beside the arguments rather
+than inside them: a listing can read it without unpacking a call it does not understand, and
+nothing in the supervisor ever looks at what is in it.
 
 And as `tarsk_queue_jobs{queue,state}` on the metrics endpoint, refreshed by the worker on the
 same timer that pulls cancellations.

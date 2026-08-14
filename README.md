@@ -407,6 +407,29 @@ through the same reclaim path as any other lost lease.
 Refused jobs are handed back with a short delay, so the worker slot goes to other work rather
 than idling. Measured with sixteen worker slots free and `max_concurrency=2`: two ran at a time.
 
+## What a task can be sent
+
+JSON-shaped values, plus `datetime`, `date`, `time`, `timedelta`, `Decimal`, `UUID`, `set` and
+`frozenset` — as msgpack extension types, so they come back as themselves rather than as
+strings you have to parse. A `Decimal` that returned as a float would be the exact bug
+`Decimal` exists to avoid.
+
+Anything else raises at the call site, where you can still fix it:
+
+```
+TypeError: cannot send a Session: tarsk carries JSON-shaped values plus datetime, date,
+time, timedelta, Decimal, UUID, set and frozenset. Convert it at the call site, or send
+an id and load it in the handler.
+```
+
+**There is no pickle option, and there will not be.** Unpickling is arbitrary code execution
+by design: anyone who can write to your broker owns every worker. A supervisor built to contain
+a leaking process is not much use if the channel into it runs whatever it is sent. Sending an
+id and loading the object in the handler costs one query and closes that door.
+
+A return value is treated differently from an argument: it degrades to `repr` rather than
+raising, because by then the task has run and its side effects are already spent.
+
 ## Rate limits
 
 ```python

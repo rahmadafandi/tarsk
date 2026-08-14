@@ -48,6 +48,13 @@ def medium(tag):
     return tag
 
 
+@app.task(name="echoes", result_ttl=60)
+def echoes(value):
+    """Hands back exactly what it was given, so the codec is what is measured."""
+    _log(f"echoes-{type(value).__name__}")
+    return value
+
+
 @app.task(name="labelled", result_ttl=60)
 def labelled(tag, ctx=Depends(Context)):
     """Reads what the sender attached rather than what it was called with."""

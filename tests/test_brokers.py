@@ -410,6 +410,58 @@ def check_broker(url: str, label: str) -> None:
         assert peak <= 2, f"{label}: max_concurrency=2 but {peak} ran at once"
         assert peak == 2, f"{label}: never reached the cap ({peak}) — is anything parallel?"
 
+        # --- the types people actually pass survive the round trip --------
+        #
+        # Through the broker, the socket and a child interpreter, not just
+        # through the codec in one process: msgpack carries these as extension
+        # types, and the chain splicer in Rust decodes and re-encodes payloads
+        # on the way past.
+        import datetime as _dt
+        import decimal as _dec
+        import uuid as _uuid
+
+        log.write_text("")
+        sent = {
+            "when": _dt.datetime(2026, 8, 14, 7, 30, tzinfo=_dt.timezone.utc),
+            "day": _dt.date(2026, 8, 14),
+            "wait": _dt.timedelta(days=1, microseconds=7),
+            "amount": _dec.Decimal("1.50"),
+            "who": _uuid.UUID(int=99),
+            "tags": {"a", "b"},
+        }
+        echo_id = app.registry["echoes"].send(sent)
+        worker = start_worker(env, TARSK_LEASE_GRACE=1)
+        try:
+            back = app.result(echo_id).get(timeout=60)
+        finally:
+            stop_worker(worker)
+        assert back == sent, f"{label}: round trip changed the value: {back!r}"
+        for key, value in sent.items():
+            assert type(back[key]) is type(value), (
+                f"{label}: {key} came back as {type(back[key]).__name__}, "
+                f"sent {type(value).__name__}"
+            )
+        # A Decimal that returned as a float would be the exact bug Decimal exists to avoid.
+        assert str(back["amount"]) == "1.50", f"{label}: {back['amount']!r}"
+
+        # And through the chain splicer, which is the part written in Rust: it
+        # decodes a payload, inserts the previous result and re-encodes, so an
+        # extension type it did not understand would be lost right there.
+        from tarsk import chain as _chain
+
+        piped = _chain(
+            app.registry["echoes"].s(sent["when"]),
+            app.registry["echoes"].s(),
+        )
+        piped_id = piped.send()
+        worker = start_worker(env, TARSK_LEASE_GRACE=1)
+        try:
+            spliced = app.result(piped_id).get(timeout=60)
+        finally:
+            stop_worker(worker)
+        assert spliced == sent["when"], f"{label}: the splicer changed it: {spliced!r}"
+        assert type(spliced) is _dt.datetime, f"{label}: came back {type(spliced).__name__}"
+
         # --- what the sender attached reaches the handler and the listing --
         #
         # Carried beside the arguments, not inside them: the listing reads it

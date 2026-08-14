@@ -484,9 +484,12 @@ checked rather than believed.
 ## What is missing
 
 - Not on PyPI yet — the wheel builds and installs, it just has not been uploaded
-- No cron or recurring schedule — `send_in(60, ...)` covers one-off delays only
-- No chains, groups or chords
-- Linux and macOS only; Windows needs a decision about the IPC transport
+- No chord. `chain` and `group` are here; fanning back in to a callback is not
+- No strict priority. A worker reads `--queues high,low` in that order within one claim, which
+  prefers the first without being a priority queue
+- No soft timeout — a task is stopped at its deadline rather than warned before it
+- Linux and macOS; Windows needs a decision about the IPC transport. Both platforms run the
+  full test suite in CI, on 3.11 through 3.14 including free-threaded
 
 ## Running the tests
 

@@ -61,7 +61,8 @@ expiry, send deduplication, an async producer, and a Prometheus endpoint that
 reports queue depth and the supervisor's own RSS so both constants can be checked
 rather than believed.
 
-Pre-release: no published wheel yet. Linux and macOS.
+Pre-release: no published wheel yet. Linux and macOS, both tested in CI on
+3.11 through 3.14 including the free-threaded build.
 ```
 
 ---
@@ -196,7 +197,7 @@ gets the byte budget without the handover, which is the 139 ms column.
 
 - Not on PyPI yet — the wheel builds and installs, it just has not been uploaded
 - No chord; chains and groups are there, fanning back in is not
-- Linux and macOS; the macOS wheel builds in CI but nothing runs the tests there
+- No soft timeout — a task is stopped at its deadline rather than warned before it
 - The hour-long trace records child RSS but not the supervisor's own gauge — the other constant
   this project claims, still unproven at that length
 - No strict priority. `--queues high,low` prefers the first within a read, which is not a

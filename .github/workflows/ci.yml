@@ -53,6 +53,34 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --lib
 
+  test-macos:
+    # The wheel has been built for macOS since the first CI commit and nothing
+    # had ever run there, so "Linux and macOS" in pyproject.toml was a guess.
+    # Everything platform-specific here is a candidate: RSS accounting through
+    # sysinfo, ru_maxrss being bytes rather than kilobytes, and the spawn and
+    # socket paths.
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Redis and Postgres
+        run: |
+          brew install -q redis postgresql@16
+          # The harness starts its own instances and finds initdb by globbing
+          # Homebrew's opt directory, so nothing needs to be on PATH or running.
+          brew services stop redis 2>/dev/null || true
+      - name: Build and test
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install -q maturin msgpack
+          .venv/bin/maturin develop --release
+          .venv/bin/python tests/test_ipc.py
+          .venv/bin/python tests/test_recycle.py
+          .venv/bin/python tests/test_brokers.py
+
   wheels:
     # Proves the matrix builds; publishing is a separate, deliberate step.
     runs-on: ${{ matrix.os }}

@@ -24,8 +24,25 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 os.chdir(ROOT)
 
-PG_BIN = next((p for p in sorted(Path("/usr/lib/postgresql").glob("*/bin"), reverse=True)
-               if (p / "initdb").exists()), None) if Path("/usr/lib/postgresql").exists() else None
+def _find_pg() -> Path | None:
+    """Where initdb lives, on Debian and on Homebrew.
+
+    Only the Debian path was searched, so on macOS this returned None and the
+    Postgres test printed "skip" — which reads exactly like a pass in CI output
+    and would have hidden the backend being broken there entirely.
+    """
+    roots = [Path("/usr/lib/postgresql"), Path("/opt/homebrew/opt"), Path("/usr/local/opt")]
+    for root in roots:
+        if not root.exists():
+            continue
+        for candidate in sorted(root.glob("*/bin"), reverse=True):
+            if (candidate / "initdb").exists():
+                return candidate
+    found = shutil.which("initdb")
+    return Path(found).parent if found else None
+
+
+PG_BIN = _find_pg()
 
 
 def free_port() -> int:

@@ -218,11 +218,27 @@ async def main(socket_path: str, app_spec: str, child_id: int, slots: int = 1) -
     if slots > 1:
         # asyncio's default executor is min(32, cpu + 4) threads, so a sync
         # handler would cap at that regardless of the slot count — 64 slots
-        # quietly running 20 at a time. Threads are cheap next to the
-        # interpreter they live in; match the number the caller asked for.
+        # quietly running 20 at a time.
+        #
+        # One thread per slot is not enough. A sync middleware runs in a thread
+        # and then *blocks that thread* waiting for the layers inside it, so a
+        # sync handler behind two sync middlewares needs three threads at once
+        # for one task. Sized to slots alone, every slot takes a thread for its
+        # outermost layer and then waits for one that will never come free:
+        # a deadlock that lasts until the task timeout, and one that only shows
+        # up when the dispatches arrive close enough together to fill the pool
+        # before any of them finishes. A fast machine wins that race and a
+        # loaded one does not, which is a bug that hides in exactly the place
+        # it will eventually be found.
+        blocking_layers = sum(
+            1
+            for m in app.middlewares
+            if hasattr(m, "execute") and not inspect.iscoroutinefunction(m.execute)
+        )
         asyncio.get_running_loop().set_default_executor(
             concurrent.futures.ThreadPoolExecutor(
-                max_workers=slots, thread_name_prefix="tarsk-task"
+                max_workers=slots * (1 + blocking_layers),
+                thread_name_prefix="tarsk-task",
             )
         )
 

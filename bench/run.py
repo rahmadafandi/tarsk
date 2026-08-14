@@ -341,7 +341,7 @@ def contamination() -> str | None:
     return (f"**The machine drifted during this run**: an identical CPU probe took "
             f"{min(PROBES) * 1000:.0f}ms at its fastest and {max(PROBES) * 1000:.0f}ms at "
             f"its slowest, {spread:.1f}x apart. Rows marked `slow` were measured while it "
-            f"was; rows without the mark were measured within 25% of the run's median and "
+            f"was; rows without the mark were measured within 25% of the run's fastest and "
             f"are comparable with each other. On a laptop this is usually the benchmark "
             f"heating the machine it is running on.")
 
@@ -356,11 +356,18 @@ def slow_by(*probe_ms: float) -> str:
 
     A cell that aggregates five runs has five readings, and one unlucky run
     does not make the median it reports untrustworthy.
+
+    Measured against the run's *fastest* probe, which is the same reference
+    `contamination()` warns on. Against the median instead, the two disagree:
+    a run that drifted 19ms to 33ms warns at 1.7x apart and then marks nothing,
+    because 33 is only 1.18x a median of 28. The fastest reading is the machine
+    at its own capability, and a row measured well below it was measured on a
+    different machine than the one the fast rows were.
     """
     live = [p for p in probe_ms if p]
     if not PROBES or not live:
         return ""
-    baseline = statistics.median(PROBES) * 1000
+    baseline = min(PROBES) * 1000
     return " `slow`" if statistics.median(live) > baseline * 1.25 else ""
 
 

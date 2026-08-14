@@ -410,11 +410,40 @@ def check_broker(url: str, label: str) -> None:
         assert peak <= 2, f"{label}: max_concurrency=2 but {peak} ran at once"
         assert peak == 2, f"{label}: never reached the cap ({peak}) — is anything parallel?"
 
-        # --- the backlog is visible before, during and after -------------
+        # --- the individual jobs are visible, not only the count ----------
+        #
+        # The depth counters say how far behind; this says behind on what. A
+        # delayed job is listed too, and reports time remaining rather than
+        # time waited — it has not started waiting yet.
         log.write_text("")
         from tarsk._core import Producer
 
         producer = Producer(broker_url=url)
+        soon = app.registry["note"].send("listed-now")
+        later = app.registry["note"].options(delay=600).send("listed-later")
+        listed = {row[0]: row for row in producer.jobs(["default"], 50)}
+        assert soon in listed, f"{label}: a queued job is not in the listing"
+        assert later in listed, f"{label}: a delayed job is not in the listing"
+        assert listed[soon][2] == "note", f"{label}: wrong name {listed[soon][2]!r}"
+        assert listed[soon][3] == "ready", f"{label}: {listed[soon][3]!r}"
+        assert listed[later][3] == "delayed", f"{label}: {listed[later][3]!r}"
+        # Ten minutes out, so the age is negative by roughly that much.
+        assert listed[later][5] < -500_000, f"{label}: due-in looks wrong: {listed[later][5]}"
+        # The name has to survive: the payload beside it is msgpack, and
+        # reading the whole record as text used to blank every field.
+        assert listed[later][2] == "note", f"{label}: delayed name {listed[later][2]!r}"
+
+        app.cancel(later)
+        worker = start_worker(env, TARSK_LEASE_GRACE=1)
+        try:
+            deadline = time.time() + 30
+            while time.time() < deadline and "listed-now" not in tags_in(log):
+                time.sleep(0.2)
+        finally:
+            stop_worker(worker)
+
+        # --- the backlog is visible before, during and after -------------
+        log.write_text("")
 
         def depth():
             rows = producer.depth(["default"])

@@ -34,6 +34,14 @@ def build_parser() -> argparse.ArgumentParser:
                         help="redis://…, postgres://… (or TARSK_BROKER)")
     status.add_argument("--queues", default="default", help="comma separated")
 
+    jobs = sub.add_parser("jobs", help="which jobs are waiting or running")
+    jobs.add_argument("--broker", default=os.environ.get("TARSK_BROKER"),
+                      help="redis://…, postgres://… (or TARSK_BROKER)")
+    jobs.add_argument("--queues", default="default", help="comma separated")
+    jobs.add_argument("--state", choices=["ready", "running", "delayed"],
+                      help="only this one")
+    jobs.add_argument("--limit", type=int, default=50)
+
     cancel = sub.add_parser("cancel", help="stop queued jobs from running")
     cancel.add_argument("ids", nargs="+", metavar="ID")
     cancel.add_argument("--broker", default=os.environ.get("TARSK_BROKER"),
@@ -134,6 +142,20 @@ def run_dead(args) -> int:
     return 0
 
 
+def _span(millis: int) -> str:
+    """`4s`, `12m`, `3h` — a duration, not a clock time.
+
+    A listing is read to find what is stuck, and "how long" answers that where
+    a timestamp makes the reader do the subtraction.
+    """
+    seconds = max(0, millis) / 1000
+    if seconds < 90:
+        return f"{seconds:.0f}s"
+    if seconds < 5400:
+        return f"{seconds / 60:.0f}m"
+    return f"{seconds / 3600:.1f}h"
+
+
 def _when(millis: int) -> str:
     if not millis:
         return "unknown" + " " * 9
@@ -158,6 +180,25 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{queue:<{width}}  {ready:>8} {running:>8} {delayed:>8} {dead:>8}")
         if not rows:
             print("(no such queue, or nothing has ever been sent to it)")
+        return 0
+    if args.command == "jobs":
+        from ._core import Producer
+
+        wanted = [q.strip() for q in args.queues.split(",") if q.strip()]
+        rows = Producer(broker_url=args.broker).jobs(wanted, args.limit)
+        if args.state:
+            rows = [r for r in rows if r[3] == args.state]
+        if not rows:
+            print("nothing waiting or running")
+            return 0
+        width = max(len(r[2]) for r in rows)
+        for job_id, queue, name, state, attempt, age_ms in rows:
+            when = (f"due in {_span(-age_ms)}" if state == "delayed"
+                    else f"{_span(age_ms)} ago")
+            tries = f"  attempt {attempt}" if attempt > 1 else ""
+            print(f"{job_id}  {state:<7}  {name:<{width}}  {when}{tries}")
+        print(f"\n{len(rows)} shown of at most {args.limit}. "
+              f"`tarsk status` for the totals.", file=sys.stderr)
         return 0
     if args.command == "cancel":
         from ._core import Producer

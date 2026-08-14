@@ -459,7 +459,15 @@ $ tarsk status --broker redis://localhost:6379/0 --queues default,reports
 queue       ready  running  delayed     dead
 default        25        0        5        0
 reports         0        1        0        2
+
+$ tarsk jobs --broker redis://localhost:6379/0 --state running
+70cd39698ff0f529  running  rebuild_report  14m ago  attempt 2
 ```
+
+`tarsk status` says how far behind; `tarsk jobs` says behind on what. The second question is
+the one asked when something is stuck, and a count cannot answer it. `--state ready`,
+`running` or `delayed` narrows the list; a delayed job reports the time until it is due rather
+than the time it has waited, because it has not started waiting.
 
 And as `tarsk_queue_jobs{queue,state}` on the metrics endpoint, refreshed by the worker on the
 same timer that pulls cancellations.

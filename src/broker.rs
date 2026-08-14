@@ -109,6 +109,22 @@ pub struct Depth {
     pub dead: u64,
 }
 
+/// One job in a queue, as someone looking for a stuck one needs to see it.
+///
+/// The depth counters answer "how far behind are we". This answers the
+/// question that follows it, which is "behind on what".
+pub struct Listed {
+    pub id: String,
+    pub queue: String,
+    pub name: String,
+    /// "ready", "running" or "delayed".
+    pub state: &'static str,
+    pub attempt: u32,
+    /// Milliseconds in this state, or negative for how long until a delayed
+    /// job is due. One field because a listing reads better with one column.
+    pub age_ms: i64,
+}
+
 /// One parked failure, as a human needs to see it.
 pub struct Dead {
     pub id: String,
@@ -280,6 +296,20 @@ impl Broker {
             Broker::Redis(b) => b.depth(queues).await,
             Broker::Postgres(b) => b.depth(queues).await,
         }
+    }
+
+    /// The individual jobs in named queues, oldest first.
+    pub async fn jobs(&self, queues: &[String], limit: usize) -> Res<Vec<Listed>> {
+        let mut rows = match self {
+            Broker::Memory(_) => Vec::new(),
+            Broker::Redis(b) => b.jobs(queues, limit).await?,
+            Broker::Postgres(b) => b.jobs(queues, limit).await?,
+        };
+        // The Redis side reads the stream and the delayed set separately, so
+        // the bound has to be applied again to the two of them together — a
+        // caller asking for fifty should not be handed fifty-one.
+        rows.truncate(limit);
+        Ok(rows)
     }
 
     /// What is parked in the dead letters, newest last.
@@ -946,6 +976,96 @@ impl RedisBroker {
             .query_async(&mut conn)
             .await?;
         Ok(())
+    }
+
+    async fn jobs(&self, queues: &[String], limit: usize) -> Res<Vec<Listed>> {
+        let mut out = Vec::new();
+        let now = now_ms();
+        for queue in queues {
+            let key = stream_key(queue);
+            let mut conn = self.conn.clone();
+
+            // Which entries are claimed, and how long ago. An entry in the
+            // stream is ready unless it is in the group's pending list; there
+            // is no other flag to read.
+            let pending: Option<redis::streams::StreamPendingCountReply> = redis::cmd("XPENDING")
+                .arg(&key)
+                .arg(REDIS_GROUP)
+                .arg("-")
+                .arg("+")
+                .arg(limit)
+                .query_async(&mut conn)
+                .await
+                .ok();
+            let claimed: HashMap<String, (i64, u32)> = pending
+                .map(|p| {
+                    p.ids
+                        .into_iter()
+                        .map(|e| (e.id, (e.last_delivered_ms as i64, e.times_delivered as u32)))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let entries: redis::streams::StreamRangeReply = redis::cmd("XRANGE")
+                .arg(&key)
+                .arg("-")
+                .arg("+")
+                .arg("COUNT")
+                .arg(limit)
+                .query_async(&mut conn)
+                .await?;
+            for entry in entries.ids {
+                let (name, _payload, _timeout) = entry_fields(&entry);
+                let (state, age_ms, attempt) = match claimed.get(&entry.id) {
+                    Some((idle, delivered)) => ("running", *idle, *delivered),
+                    None => (
+                        "ready",
+                        now.saturating_sub(stream_id_ms(&entry.id)) as i64,
+                        0,
+                    ),
+                };
+                out.push(Listed {
+                    id: entry_id(&entry),
+                    queue: queue.clone(),
+                    name,
+                    state,
+                    attempt,
+                    age_ms,
+                });
+            }
+
+            // Delayed jobs are not in the stream at all: they wait in a sorted
+            // set scored by when they come due, with their fields beside them.
+            let due: Vec<(String, u64)> = redis::cmd("ZRANGE")
+                .arg(delayed_key(queue))
+                .arg(0)
+                .arg(limit as i64 - 1)
+                .arg("WITHSCORES")
+                .query_async(&mut conn)
+                .await
+                .unwrap_or_default();
+            for (member, at) in due {
+                // HMGET, not HGETALL: the payload field beside these is msgpack,
+                // and asking for the whole hash as strings fails on the first
+                // byte that is not UTF-8 — silently, leaving every row blank.
+                let (name, job_id): (Option<String>, Option<String>) = redis::cmd("HMGET")
+                    .arg(format!("{}:{member}", delayed_key(queue)))
+                    .arg("n")
+                    .arg("i")
+                    .query_async(&mut conn)
+                    .await
+                    .unwrap_or((None, None));
+                out.push(Listed {
+                    id: job_id.unwrap_or(member),
+                    queue: queue.clone(),
+                    name: name.unwrap_or_default(),
+                    state: "delayed",
+                    attempt: 0,
+                    age_ms: now as i64 - at as i64,
+                });
+            }
+        }
+        Ok(out)
     }
 
     async fn depth(&self, queues: &[String]) -> Res<Vec<Depth>> {
@@ -1615,6 +1735,43 @@ impl PgBroker {
     }
 
     /// One statement, so the row cannot be in both tables or neither.
+    async fn jobs(&self, queues: &[String], limit: usize) -> Res<Vec<Listed>> {
+        // The same three states the depth query counts, named here instead.
+        // extract(epoch) is milliseconds since the row became relevant:
+        // positive for time waited, negative for time still to wait.
+        let rows = self
+            .client
+            .query(
+                "select job_id, queue, name, attempt,
+                        case when lease_until is null or lease_until < now() then 'ready'
+                             when run_lease > 0 then 'running'
+                             else 'delayed' end as state,
+                        (extract(epoch from
+                            now() - coalesce(lease_until, created_at)) * 1000)::bigint as age_ms
+                   from tarsk_jobs
+                  where queue = any($1)
+                  order by id
+                  limit $2",
+                &[&queues, &(limit as i64)],
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|r| Listed {
+                id: r.get(0),
+                queue: r.get(1),
+                name: r.get(2),
+                attempt: r.get::<_, i32>(3).max(0) as u32,
+                state: match r.get::<_, &str>(4) {
+                    "running" => "running",
+                    "delayed" => "delayed",
+                    _ => "ready",
+                },
+                age_ms: r.get(5),
+            })
+            .collect())
+    }
+
     async fn depth(&self, queues: &[String]) -> Res<Vec<Depth>> {
         // run_lease separates the two kinds of future lease_until: a delayed
         // job has never been claimed, an in-flight one has. Without it the

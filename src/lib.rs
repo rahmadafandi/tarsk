@@ -1972,6 +1972,9 @@ type DeadRow = (String, String, String, String, u64);
 /// One queue's backlog crossing into Python: name, ready, in flight, delayed, dead.
 type DepthRow = (String, u64, u64, u64, u64);
 
+/// One job crossing into Python: id, queue, name, state, attempt, age in ms.
+type JobRow = (String, String, String, String, u32, i64);
+
 /// Producer handle. Holds its own runtime and connection so enqueueing from a
 /// web request is one round trip, not a reconnect.
 #[pyclass]
@@ -2078,6 +2081,27 @@ impl Producer {
         Ok(rows
             .into_iter()
             .map(|d| (d.queue, d.ready, d.in_flight, d.delayed, d.dead))
+            .collect())
+    }
+
+    /// The individual jobs waiting or running, oldest first.
+    #[pyo3(signature = (queues, limit=50))]
+    fn jobs(&self, py: Python<'_>, queues: Vec<String>, limit: usize) -> PyResult<Vec<JobRow>> {
+        let rows = py
+            .detach(|| self.runtime.block_on(self.broker.jobs(&queues, limit)))
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(|j| {
+                (
+                    j.id,
+                    j.queue,
+                    j.name,
+                    j.state.to_string(),
+                    j.attempt,
+                    j.age_ms,
+                )
+            })
             .collect())
     }
 

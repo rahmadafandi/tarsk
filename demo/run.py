@@ -132,6 +132,11 @@ def main() -> int:
     worker = subprocess.Popen(
         [sys.executable, "-m", "tarsk._cli", "worker", "--app", "demo.leaky_app:app",
          "--broker", url, "--children", str(args.children),
+         # One task per child, explicitly. The default is a hundred, which is
+         # right for handlers that wait and ruinous here: this demo's handler
+         # allocates, and a hundred of them allocating between two readings of
+         # the ceiling is how the same 200MB budget turns into 826MB.
+         "--slots", "1",
          "--max-rss", str(args.ceiling), "--metrics", f"127.0.0.1:{metrics_port}"],
         env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
     )

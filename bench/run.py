@@ -348,10 +348,20 @@ def contamination() -> str | None:
 
 def slow_mark(row) -> str:
     """`slow` when this row was measured on a machine that had fallen behind."""
-    if not PROBES or not row.probe_ms:
+    return slow_by(getattr(row, "probe_ms", 0.0))
+
+
+def slow_by(*probe_ms: float) -> str:
+    """The same, for rows built from several runs: mark if the middle one was slow.
+
+    A cell that aggregates five runs has five readings, and one unlucky run
+    does not make the median it reports untrustworthy.
+    """
+    live = [p for p in probe_ms if p]
+    if not PROBES or not live:
         return ""
     baseline = statistics.median(PROBES) * 1000
-    return " `slow`" if row.probe_ms > baseline * 1.25 else ""
+    return " `slow`" if statistics.median(live) > baseline * 1.25 else ""
 
 
 def celery_cmd(max_tasks_per_child: int | None, workers: int | None = 1) -> list[str]:
@@ -855,11 +865,12 @@ def scenario_scale(redis: Redis, tmp: Path) -> None:
     print("|---|---|---|---|---|---|---|")
     for name, kwargs in runtimes.items():
         for count in counts:
-            works, boots = [], []
+            works, boots, probes = [], [], []
             for _ in range(repeats):
                 framework = name.split()[0]
                 result = case(framework, f"scale-{count}", "noop", count, [], 300,
                               redis, tmp, sample=False, **kwargs)
+                probes.append(result.probe_ms)
                 if result.completed < count:
                     works.append(float("nan"))
                     continue
@@ -869,7 +880,8 @@ def scenario_scale(redis: Redis, tmp: Path) -> None:
             if not good:
                 print(f"| {name} | {count:,} | did not drain | | | | |")
                 continue
-            print(f"| {name} | {count:,} | {good[0]:.3f} | {statistics.median(good):.3f} | "
+            print(f"| {name}{slow_by(*probes)} | {count:,} | {good[0]:.3f} | "
+                  f"{statistics.median(good):.3f} | "
                   f"{quantile(good, 0.9):.3f} | {good[-1]:.3f} | "
                   f"{statistics.median(boots):.2f} |")
     print("\nThe two `streams, acked` rows are the like-for-like pair: same guarantee, same "
@@ -960,15 +972,17 @@ def scenario_defaults(redis: Redis, tmp: Path) -> None:
     print("|---|---|---|---|")
     for name, kwargs in runtimes.items():
         framework = name.split()[0]
-        walls, peaks, done = [], [], count
+        walls, peaks, done, probes = [], [], count, []
         for _ in range(repeats):
             result = case(framework, "defaults", "io100", count, [], 300, redis, tmp, **kwargs)
+            probes.append(result.probe_ms)
             done = min(done, result.completed)
             if result.completed == count:
                 walls.append(result.work)
             peaks.append(result.peak_total)
         shown = f"{statistics.median(walls):.2f}s" if walls else "did not drain"
-        print(f"| {name} | {shown} | {max(peaks) // MB} MB | {done}/{count} |")
+        print(f"| {name}{slow_by(*probes)} | {shown} | {max(peaks) // MB} MB | "
+              f"{done}/{count} |")
 
 
 def scenario_throughput(redis: Redis, tmp: Path) -> None:

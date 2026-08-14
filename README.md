@@ -57,8 +57,8 @@ changes. From [`bench/`](bench/README.md), same configuration, different workloa
 
 | | leak 20MB/task | leak 40MB/task | payload-dependent 2–80MB |
 |---|---|---|---|
-| celery `--max-tasks-per-child=6` | **170 MB** | 290 MB | 335 MB |
-| tarsk `--max-rss=200MB` | 205 MB | **224 MB** | **247 MB** |
+| celery `--max-tasks-per-child=6` | **162 MB** | 282 MB | 327 MB |
+| tarsk `--max-rss=200MB --slots 1` | 202 MB | **222 MB** | **276 MB** |
 
 Celery wins the first column, and that is the honest result: when the leak per task is known
 and constant, dividing the budget by it works. It is the other two columns that tarsk was
@@ -69,20 +69,20 @@ trigger fires, so the slot never goes empty:
 
 | | p50 gap | p99 gap | max gap |
 |---|---|---|---|
-| celery `--max-tasks-per-child=20` | 5.7 ms | 156 ms | 162 ms |
-| tarsk `--max-tasks=20` | 6.0 ms | 10 ms | **12 ms** |
-| taskiq (no recycling at all) | 6.1 ms | 7 ms | 7 ms |
+| celery `--max-tasks-per-child=20` | 5.4 ms | 41 ms | 139 ms |
+| tarsk `--max-tasks=20` | 5.6 ms | 8 ms | **8 ms** |
+| taskiq (no recycling at all) | 5.4 ms | 6 ms | 7 ms |
 
 And the worker that runs your code is smaller, because it imports your tasks and nothing else —
-no broker driver, no scheduler: 27 MB against Celery's 49 MB and taskiq's 58 MB.
+no broker driver, no scheduler: 26 MB against Celery's 41 MB and taskiq's 44 MB.
 
 Your imports land in one process here, and the supervisor is not it:
 
 | runtime | coordinator (trivial app → heavy app) | coordinator imports your code |
 |---|---|---|
-| celery | 55 → 77 MB | **yes**, and it forks children from that |
-| taskiq | 51 → 51 MB | no |
-| tarsk | 27 → 27 MB | no |
+| celery | 50 → 69 MB | **yes**, and it forks children from that |
+| taskiq | 47 → 47 MB | no |
+| tarsk | 26 → 26 MB | no |
 
 (`python bench/run.py imports`. The heavy app imports celery + taskiq + redis.)
 
@@ -93,7 +93,7 @@ held by something that does not have the problem — which is also why Celery co
 one from a master carrying 77 MB of your dependencies.
 
 Draining 10,000 no-op tasks across four worker processes, same Redis and same at-least-once
-guarantee, startup excluded: Celery 5.1s, taskiq 1.48s, tarsk 0.95s. That gap is recent and it
+guarantee, startup excluded: Celery 7.6s, taskiq 2.7s, tarsk 1.9s. That gap is recent and it
 is not a clever optimisation — the Redis driver used to hold a mutex round its own connection,
 serialising every command from every child, and removing it is the whole difference. A no-op
 handler is also the case most favourable to whoever dispatches fastest, and nobody runs one.
@@ -109,7 +109,7 @@ selling the wrong thing.
 **Not precise and concurrent at once.** One task per child is the default, and it is what makes
 the ceiling exact — a child with nothing running cannot grow. For handlers that wait rather
 than allocate, `--slots N` runs N at a time in one child: 500 tasks each awaiting 100ms take
-0.15s on 127MB, against taskiq's 0.20s on 319MB and 12.7s for tarsk at one slot. The cost is
+0.19s on 116MB, against taskiq's 0.23s on 225MB and 12.5s for tarsk at one slot. The cost is
 the precision above — overshoot becomes the peak of whatever is in flight, not of one task. Set
 it high for work that waits, leave it at 1 for work that allocates.
 

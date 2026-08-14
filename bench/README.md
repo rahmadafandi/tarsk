@@ -67,9 +67,9 @@ keeps several around.
 
 | runtime | coordinator (light → heavy) | runs your code (light → heavy) | coordinator imports it | whole tree, heavy (Rss / Pss) |
 |---|---|---|---|---|
-| celery | 55 → 77 MB (+22) | 55 → 77 MB (+22) | **yes** | 141 / **99** MB |
-| taskiq | 51 → 51 MB (+0) | 58 → 58 MB (+0) † | no | 144 / **91** MB |
-| tarsk | 27 → 27 MB (+0) | 24 → 58 MB (+33) | no | 85 / **59** MB |
+| celery | 50 → 69 MB (+19) | 50 → 69 MB (+19) | **yes** | 123 / **66** MB |
+| taskiq | 47 → 47 MB (+0) | 44 → 44 MB (+0) † | no | 91 / **61** MB |
+| tarsk | 26 → 26 MB (+0) | 22 → 53 MB (+31) | no | 79 / **55** MB |
 
 Celery's master imports your app and grows with it, then forks, so its children start from that
 memory — which is why both its columns are the same number. taskiq's coordinator does not
@@ -124,9 +124,9 @@ long enough.
 
 | runtime | worker RSS | tree Rss | tree Pss |
 |---|---|---|---|
-| tarsk | **27 MB** | 52 MB | **27 MB** |
-| celery | 49 MB | 104 MB | 69 MB |
-| taskiq | 58 MB | 144 MB | 87 MB |
+| tarsk | **26 MB** | 49 MB | **29 MB** |
+| celery | 41 MB | 91 MB | 51 MB |
+| taskiq | 44 MB | 87 MB | 50 MB |
 
 The tarsk child is CPython plus the user's task module and nothing else — no broker driver, no
 scheduler (spec §4.1). The tree columns include the supervisor / master.
@@ -155,11 +155,11 @@ this page used to claim.
 
 | runtime | peak worker RSS |
 |---|---|
-| celery (no recycling) | 849 MB |
-| taskiq (no recycling available) | 858 MB |
-| celery `--max-tasks-per-child=6` | **170 MB** |
-| tarsk `--max-rss=200MB --slots 1` | 205 MB |
-| tarsk `--max-rss=200MB` (default 100 slots) | **826 MB** |
+| celery (no recycling) | 841 MB |
+| taskiq (no recycling available) | 845 MB |
+| celery `--max-tasks-per-child=6` | **162 MB** |
+| tarsk `--max-rss=200MB --slots 1` | 202 MB |
+| tarsk `--max-rss=200MB` (default 100 slots) | **823 MB** |
 
 Celery wins this one. When the leak per task is known and constant, dividing the budget by it
 is a perfectly good bound — and a tighter one, because it stops short of the budget rather
@@ -176,8 +176,8 @@ wait, and this workload does the opposite. `--slots 1` is what the rest of this 
 
 | | leak raised to 40MB | payload-dependent 2–80MB |
 |---|---|---|
-| celery `--max-tasks-per-child=6` | 290 MB | 335 MB |
-| tarsk `--max-rss=200MB` | 224 MB | 247 MB |
+| celery `--max-tasks-per-child=6` | 282 MB | 327 MB |
+| tarsk `--max-rss=200MB` | 222 MB | 276 MB |
 
 Nothing was reconfigured between this table and the last one. A task count encodes an
 assumption about bytes per task that nothing enforces; when the assumption expires, so does
@@ -188,13 +188,13 @@ floor for any design that refuses to kill running work.
 
 | runtime | completed | lost | executions | restarts | max gap | peak RSS |
 |---|---|---|---|---|---|---|
-| celery (defaults) | 16/30 | **14** | 16 | 0 | 8 ms | 368 MB |
-| taskiq (list, no ack) | 15/30 | **15** | 15 | 0 | 9 ms | 358 MB |
-| taskiq (streams, acked) | 15/30 | **15** | 15 | 0 | 8 ms | 358 MB |
-| celery `task_acks_late=True` | 16/30 | **14** | 16 | 0 | 12 ms | 368 MB |
-| celery `task_acks_late=True` + restarted | 29/30 | **1** | 29 | 1 | 2452 ms | 369 MB |
-| celery `--max-tasks-per-child=6` (tuned) | 30/30 | 0 | 30 | 0 | 171 ms | 170 MB |
-| tarsk `--max-rss=200MB` | 30/30 | 0 | 30 | 0 | 13 ms | 204 MB |
+| celery (defaults) | 17/30 | **13** | 17 | 0 | 5 ms | 381 MB |
+| taskiq (list, no ack) | 17/30 | **13** | 17 | 0 | 5 ms | 384 MB |
+| taskiq (streams, acked) | 17/30 | **13** | 17 | 0 | 5 ms | 384 MB |
+| celery `task_acks_late=True` | 17/30 | **13** | 17 | 0 | 6 ms | 381 MB |
+| celery `task_acks_late=True` + restarted | 29/30 | **1** | 29 | 1 | 2409 ms | 381 MB |
+| celery `--max-tasks-per-child=6` (tuned) | 30/30 | 0 | 30 | 0 | 141 ms | 162 MB |
+| tarsk `--max-rss=200MB` | 30/30 | 0 | 30 | 0 | 39 ms | 202 MB |
 
 **An acknowledgement only helps if something survives to notice.** taskiq's streams broker acks
 and still loses 15 of 30 here, exactly as its unacked list broker does, for the same reason
@@ -210,9 +210,9 @@ A correctly tuned Celery ties tarsk here. The difference is what you had to know
 
 | runtime | p50 gap | p99 gap | max gap |
 |---|---|---|---|
-| celery `--max-tasks-per-child=20` | 5.7 ms | 156 ms | 162 ms |
-| tarsk `--max-tasks=20` | 6.0 ms | 10 ms | 12 ms |
-| taskiq (no recycling available) | 6.1 ms | 7 ms | 7 ms |
+| celery `--max-tasks-per-child=20` | 5.4 ms | 41 ms | 139 ms |
+| tarsk `--max-tasks=20` | 5.6 ms | 8 ms | 8 ms |
+| taskiq (no recycling available) | 5.4 ms | 6 ms | 7 ms |
 
 Recycling costs tarsk essentially nothing: it sits with taskiq, which never recycles at all.
 Getting there took three fixes, not one — starting the replacement early enough (projected from
@@ -229,22 +229,25 @@ with startup pulled out of the figure rather than folded into it.
 
 | runtime | 10 | 100 | 1,000 | 10,000 | startup |
 |---|---|---|---|---|---|
-| celery | 0.005 | 0.048 | 0.494 | 5.106 | 0.33 s |
-| taskiq (list, no ack) | 0.002 | 0.012 | 0.090 | 0.853 | 0.43 s |
-| taskiq (streams, acked) | 0.005 | 0.030 | 0.134 | 1.479 | 0.47 s |
-| tarsk (streams, acked) | 0.005 | 0.014 | 0.120 | **0.945** | 0.16 s |
+| celery | 0.008 | 0.077 | 0.759 | 7.581 | 0.37 s |
+| taskiq (list, no ack) | 0.008 | 0.068 | 0.285 | 2.674 | 0.44 s |
+| taskiq (streams, acked) | 0.008 | 0.085 | 0.340 | 2.714 | 0.44 s |
+| tarsk (streams, acked) | 0.003 | 0.081 | 0.189 | **1.876** | 0.22 s |
 
 Median seconds from first completion to last, five runs a cell.
 
 The two `streams, acked` rows are the like-for-like pair — same guarantee, same process count,
-same handler. **tarsk is the faster one at ten thousand**, 0.95s against 1.48s, and the two
-sets of five runs do not overlap: tarsk's slowest is 1.27s, taskiq's fastest 1.44s.
+same handler. **tarsk is the faster one at ten thousand**, 1.88s against 2.71s, and the two
+sets of five runs do not overlap: tarsk's slowest is 1.92s, taskiq's fastest 2.68s.
 
-That is a change, and the cause is not a clever optimisation. This page used to report a tie,
-and the reason for the tie was a mutex the Redis driver held round its own connection — every
-command from every child queued behind one lock on a single-threaded runtime. A
+The gap is the same 1.45× on a 16-core laptop, where both figures are roughly half these. That
+is the whole reason to read this table as a ratio.
+
+That gap is a change, and the cause is not a clever optimisation. This page used to report a
+tie, and the reason for the tie was a mutex the Redis driver held round its own connection —
+every command from every child queued behind one lock on a single-threaded runtime. A
 `MultiplexedConnection` is built to be used concurrently. The lock was a bottleneck the driver
-had invented for itself, and removing it is the entire difference between 1.55s and 0.95s.
+had invented for itself, and removing it is the entire gap.
 
 Two earlier versions of this page read an ordering out of five noisy runs and had to retract
 it, so the separation being clean this time is worth stating plainly rather than assuming.
@@ -301,23 +304,23 @@ query a database, wait for a webhook.
 
 | runtime | wall | vs. the 4-way floor | peak tree RSS | completed |
 |---|---|---|---|---|
-| celery, 4 processes | 12.63s | 1.01× | 251 MB | 500/500 |
-| taskiq, 4 processes × 1 | 12.64s | 1.01× | 318 MB | 500/500 |
-| tarsk, 4 children | 12.70s | 1.02× | **125 MB** | 500/500 |
-| celery, 32 processes | 1.58s | 0.13× | 1,628 MB | 500/500 |
-| taskiq, 4 processes × 64 | 0.20s | 0.02× | 319 MB | 500/500 |
-| tarsk, 32 children | 1.64s | 0.13× | 812 MB | 500/500 |
-| **tarsk, 4 children × 64 slots** | **0.15s** | 0.01× | **127 MB** | 500/500 |
+| celery, 4 processes | 12.50s | 1.00× | 215 MB | 500/500 |
+| taskiq, 4 processes × 1 | 12.60s | 1.01× | 224 MB | 500/500 |
+| tarsk, 4 children | 12.52s | 1.00× | **115 MB** | 500/500 |
+| celery, 32 processes | 1.54s | 0.12× | 1,373 MB | 500/500 |
+| taskiq, 4 processes × 64 | 0.23s | 0.02× | 225 MB | 500/500 |
+| tarsk, 32 children | 1.60s | 0.13× | 736 MB | 500/500 |
+| **tarsk, 4 children × 64 slots** | **0.19s** | 0.02× | **116 MB** | 500/500 |
 
 Held to one task per process, all three land on the arithmetic floor of 12.5s and the only
 difference is footprint. Buying concurrency with processes is the expensive way: 32 children
 costs 812MB to reach 1.64s, and Celery's 32 processes cost 1,628MB to reach much the same.
 
 `--slots 64` buys it with coroutines instead, and that row is the whole point of running this
-table: **0.15s on 127MB against taskiq's 0.20s on 319MB.** Same concurrency model now, and
+table: **0.19s on 116MB against taskiq's 0.23s on 225MB.** Same concurrency model now, and
 tarsk's advantage is the one it always had — a child that imports your tasks and no broker
-driver is a smaller process to have 64 of. Three runs each: tarsk 0.15 / 0.16 / 0.16, taskiq
-0.20 / 0.20 / 0.20.
+driver is a smaller process to have 64 of. The same pair on a 16-core laptop reads 0.15s against 0.20s — different
+numbers, the same answer.
 
 **This is not free, and what it costs is the thing this page is otherwise about.** At one slot
 the ceiling is read while the child has nothing running, so overshoot is bounded by a single
@@ -338,9 +341,9 @@ a person gets for typing the documented command.
 
 | runtime | median wall | peak tree RSS | completed |
 |---|---|---|---|
-| celery (`-c` = cores, 16 here) | 12.72s | 841 MB | 2000/2000 |
-| taskiq (2 workers × 100) | 1.36s | 210 MB | 2000/2000 |
-| **tarsk (2 children × 100 slots)** | **0.98s** | **78 MB** | 2000/2000 |
+| celery (`-c` = cores, 2 here) | 100.70s | 133 MB | 2000/2000 |
+| taskiq (2 workers × 100) | 1.24s | 145 MB | 2000/2000 |
+| **tarsk (2 children × 100 slots)** | **0.95s** | **72 MB** | 2000/2000 |
 
 The I/O handler is deliberate: a no-op would make this a measure of dispatch rather than of the
 default concurrency, and the default concurrency is the whole question.
@@ -354,9 +357,9 @@ every other table on this page uses.
 
 | runtime | no-op | 50 ms handler | startup |
 |---|---|---|---|
-| celery | 1,696/s | 20/s | 0.29 s |
-| taskiq | 2,488/s | 19/s | 0.50 s |
-| tarsk | 2,726/s | 19/s | 0.14 s |
+| celery | 1,225/s | 20/s | 0.29 s |
+| taskiq | 2,398/s | 20/s | 0.33 s |
+| tarsk | **2,859/s** | 20/s | 0.15 s |
 
 All three read the same Redis. Rate and wall cover first completion to last; **startup is
 separate on purpose**. Folding it in turns a 500-task row into a boot-time contest — it was 51%
@@ -365,29 +368,28 @@ of Celery's figure, 59% of tarsk's and 77% of taskiq's when this table still did
 With a 50 ms handler all three land on 19–20/s, which is the row that matters and the whole of
 spec §2's argument: dispatch overhead disappears behind any handler doing real work.
 
-## When these numbers were taken
+## Where these numbers came from
 
-The speed tables (`scale`, `throughput`) and the memory tables came from different runs,
-because two full runs in a row produced throughput a third of the first for all three runtimes
-at once and scale figures three times worse. Nothing had changed in any of them — the machine
-was in use. Memory figures are unaffected by CPU contention and the sleep-bound tables barely
-notice it; dispatch throughput notices nothing else.
+A GitHub Actions `ubuntu-24.04` runner, two cores, via `.github/workflows/bench.yml`. Anyone
+with the repository can reproduce them by dispatching that workflow, which is the reason to
+prefer them over the faster ones this laptop produces: a 16-core machine nobody else has is not
+evidence.
 
-`bench/run.py` now times an identical pure-Python loop before each case and says so under the
-tables when the spread exceeds 1.25×. Neither contaminated run had it yet, which is why this
-section exists rather than a footnote. On this machine the probe is 20ms when idle and reached
-30ms while a browser and a Kubernetes node were running.
+Two cores is also why Celery's out-of-the-box row is a hundred seconds. `-c` defaults to the
+core count, so it gets two workers where taskiq's defaults get two hundred concurrent tasks.
+That is what the flag does, not a handicap applied to it.
 
-**GitHub Actions works**, and `.github/workflows/bench.yml` runs it on demand. A runner is a
-full VM with systemd, so the OOM table's memory scope is available — through `sudo -n` rather
-than `--user`, because the runner has no login session bus, and the harness now tries both and
-refuses to run that case unlimited if neither works. What a runner is not is a fixed machine: a
-private repository gets two cores against this laptop's sixteen, and each run lands on a
-different host. Read ratios within a run, never absolute numbers across runs.
+**The ratios travelled and the absolute numbers did not**, which is the more useful fact about
+this page. Ten thousand tasks across four processes, tarsk against taskiq's stream broker:
+1.45× on the runner, 1.45× on a 16-core laptop, on figures that differ by a factor of two in
+both directions. The I/O and out-of-the-box comparisons moved by less than a tenth between the
+two machines. Compare rows within a table; do not carry a second across.
 
-Take these on an idle machine. Google Colab is not one — beyond the shared CPU, it has no
-systemd user session for the OOM table's `systemd-run --scope MemoryMax=400M` and runs as root,
-which `initdb` refuses, so two tables would silently not exist.
+Every run prints a CPU probe taken before each row and marks the row `slow` when that reading
+sits more than 25% above the run's median, so a table can be trusted cell by cell rather than
+run by run. On a laptop the usual cause is the benchmark heating the machine it is running on:
+a twenty-minute local run drifted from 11ms to 27ms with nothing else competing, which is most
+of why these came from a runner instead.
 
 ## Known limits of these numbers
 

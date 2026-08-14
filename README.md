@@ -58,7 +58,7 @@ changes. From [`bench/`](bench/README.md), same configuration, different workloa
 | | leak 20MB/task | leak 40MB/task | payload-dependent 2–80MB |
 |---|---|---|---|
 | celery `--max-tasks-per-child=6` | **162 MB** | 282 MB | 327 MB |
-| tarsk `--max-rss=200MB --slots 1` | 202 MB | **222 MB** | **276 MB** |
+| tarsk `--max-rss=200MB --slots 1` | 203 MB | **223 MB** | **277 MB** |
 
 Celery wins the first column, and that is the honest result: when the leak per task is known
 and constant, dividing the budget by it works. It is the other two columns that tarsk was
@@ -69,12 +69,12 @@ trigger fires, so the slot never goes empty:
 
 | | p50 gap | p99 gap | max gap |
 |---|---|---|---|
-| celery `--max-tasks-per-child=20` | 5.4 ms | 41 ms | 139 ms |
-| tarsk `--max-tasks=20` | 5.6 ms | 8 ms | **8 ms** |
-| taskiq (no recycling at all) | 5.4 ms | 6 ms | 7 ms |
+| celery `--max-tasks-per-child=20` | 5.3 ms | 139 ms | 143 ms |
+| tarsk `--max-tasks=20` | 5.6 ms | 7 ms | **7 ms** |
+| taskiq (no recycling at all) | 5.4 ms | 6 ms | 6 ms |
 
 And the worker that runs your code is smaller, because it imports your tasks and nothing else —
-no broker driver, no scheduler: 26 MB against Celery's 41 MB and taskiq's 44 MB.
+no broker driver, no scheduler: 27 MB against Celery's 41 MB and taskiq's 44 MB.
 
 Your imports land in one process here, and the supervisor is not it:
 
@@ -82,7 +82,7 @@ Your imports land in one process here, and the supervisor is not it:
 |---|---|---|
 | celery | 50 → 69 MB | **yes**, and it forks children from that |
 | taskiq | 47 → 47 MB | no |
-| tarsk | 26 → 26 MB | no |
+| tarsk | 27 → 27 MB | no |
 
 (`python bench/run.py imports`. The heavy app imports celery + taskiq + redis.)
 
@@ -93,28 +93,28 @@ held by something that does not have the problem — which is also why Celery co
 one from a master carrying 77 MB of your dependencies.
 
 Draining 10,000 no-op tasks across four worker processes, same Redis and same at-least-once
-guarantee, startup excluded: Celery 7.6s, taskiq 2.7s, tarsk 1.9s. That gap is recent and it
-is not a clever optimisation — the Redis driver used to hold a mutex round its own connection,
-serialising every command from every child, and removing it is the whole difference. A no-op
-handler is also the case most favourable to whoever dispatches fastest, and nobody runs one.
-Full tables in [`bench/`](bench/README.md), measured on a GitHub Actions runner so anyone can
-reproduce them. On a 16-core laptop the same pair is 1.1×, which is a tie — this file used to
-claim the 1.45× held on both machines, and re-measuring three commits found it does not hold
-on either the current code or the code that first reported it.
+guarantee, startup excluded: Celery 7.8s, taskiq 1.8s, tarsk 1.7s. tarsk is ahead in every run
+and by 6%, which this project's own benchmark rules call a tie. It is not faster than taskiq;
+it starts in half the time and runs in half the memory.
+
+This file claimed a 1.45× lead until the numbers were checked on more than one machine. That
+figure came from a two-core runner; the same workflow on today's four-core runners reads 1.06×
+and a 16-core laptop reads 1.1×. Full tables and the full retraction in
+[`bench/`](bench/README.md), measured on a GitHub Actions runner so anyone can reproduce them.
 
 ## What it does not claim
 
 **Not faster.** Dispatch costs microseconds; real handlers run for 50ms to minutes. With a 50ms
 handler tarsk, Celery and taskiq all reach 19–20 tasks/s — identical, as they should be. tarsk
-drains a no-op queue faster than both, and anyone selling a task queue on that number is
-selling the wrong thing.
+draws with taskiq on a no-op queue and starts in half the time, and anyone selling a task
+queue on either number is selling the wrong thing.
 
-**Not precise and concurrent at once.** One task per child is the default, and it is what makes
-the ceiling exact — a child with nothing running cannot grow. For handlers that wait rather
-than allocate, `--slots N` runs N at a time in one child: 500 tasks each awaiting 100ms take
-0.19s on 116MB, against taskiq's 0.23s on 225MB and 12.5s for tarsk at one slot. The cost is
-the precision above — overshoot becomes the peak of whatever is in flight, not of one task. Set
-it high for work that waits, leave it at 1 for work that allocates.
+**Not precise and concurrent at once.** `--slots 1` is what makes the ceiling exact — a child
+with nothing running cannot grow — and it is not the default. The default is 100, because most
+task queue work waits rather than allocates: 500 tasks each awaiting 100ms take 0.13s on
+120MB, against taskiq's 0.21s on 226MB and 12.5s for tarsk at one slot. The cost is the
+precision above — overshoot becomes the peak of whatever is in flight, not of one task. Set it
+to 1 for work that allocates.
 
 **Not a hard ceiling regardless of task size.** The ceiling is read while a child is idle, so a
 child never *starts* a task it cannot afford — but a handler that allocates 300MB will allocate
@@ -148,9 +148,9 @@ overshoot is bounded by a single task's peak. At 64 it is bounded by whatever 64
 holding, and a hard kill takes all 64 down together.
 
 **The default is 100 slots**, whatever else is set — taskiq's number, and tarsk is tuned out
-of the box for handlers that wait. 2,000 awaiting tasks with no flags at all drain in 0.98s on
-78MB, against taskiq's 1.36s on 210MB. The same default lets 40 tasks leaking 20MB each reach
-826MB under a `--max-rss=200MB` ceiling, where `--slots 1` holds them to 205MB: a hundred slots
+of the box for handlers that wait. 2,000 awaiting tasks with no flags at all drain in 0.94s on
+74MB, against taskiq's 1.23s on 145MB. The same default lets 40 tasks leaking 20MB each reach
+824MB under a `--max-rss=200MB` ceiling, where `--slots 1` holds them to 203MB: a hundred slots
 hands a child a hundred tasks before any of them has allocated anything, so the ceiling is
 first read long after the damage. **If your handlers allocate, set `--slots 1`.** One flag quietly changing another flag's default is worse
 than either number being wrong, so `--max-rss` does not move this one. What the worker does

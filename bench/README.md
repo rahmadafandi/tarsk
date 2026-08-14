@@ -47,9 +47,13 @@ and `footprint` are here to show the cost and the baseline, not to win.
 
 ## Results
 
-Linux 7.0.0, i7-13620H ×16, Python 3.14.3, Celery 5.6.3, taskiq 0.12.4, Redis 8.10.0.
-One worker process, concurrency 1 throughout. Single run per row — these are not medians,
-and anything inside ~10% of another number should be read as a tie.
+A GitHub Actions `ubuntu-24.04` runner: AMD EPYC 9V74, four cores, Python 3.12, Celery 5.6.3,
+taskiq 0.12.4, Redis 8.10.0. One worker process, concurrency 1 throughout. Single run per row —
+these are not medians, and anything inside ~10% of another number should be read as a tie.
+
+**These runners had two cores until recently and now have four.** Every absolute number below
+moved when that happened, and one conclusion moved with it; see the drain section. A figure on
+this page is a reading from a specific machine, and the machine is not a constant either.
 
 Peak worker RSS is the larger of two lower bounds: the worker's own `ru_maxrss` high-water
 mark, and `/proc` sampled every 50ms. Neither alone is trustworthy — `ru_maxrss` stops at the
@@ -68,8 +72,8 @@ keeps several around.
 | runtime | coordinator (light → heavy) | runs your code (light → heavy) | coordinator imports it | whole tree, heavy (Rss / Pss) |
 |---|---|---|---|---|
 | celery | 50 → 69 MB (+19) | 50 → 69 MB (+19) | **yes** | 123 / **66** MB |
-| taskiq | 47 → 47 MB (+0) | 44 → 44 MB (+0) † | no | 91 / **61** MB |
-| tarsk | 26 → 26 MB (+0) | 22 → 53 MB (+31) | no | 79 / **55** MB |
+| taskiq | 47 → 47 MB (-0) | 44 → 44 MB (+0) † | no | 91 / **61** MB |
+| tarsk | 27 → 27 MB (+0) | 23 → 53 MB (+30) | no | 80 / **56** MB |
 
 Celery's master imports your app and grows with it, then forks, so its children start from that
 memory — which is why both its columns are the same number. taskiq's coordinator does not
@@ -88,10 +92,10 @@ imports, forking children from them.
 
 *Summed Rss over a process tree double-counts.* Every page shared between processes is counted
 in full for each of them, and forking shares almost everything. Pss divides each shared page
-among its mappers, which is why the tree columns above show both. Celery's tree is 141MB by Rss
-and 99MB by Pss — 42MB of double counting — against tarsk's 85 and 59. The gap between the two
-runtimes is real but roughly 40% smaller than summed Rss suggests, and the *tree RSS* column in
-the footprint table below overstates in exactly this way.
+among its mappers, which is why the tree columns above show both. Celery's tree is 123MB by Rss
+and 66MB by Pss — 57MB of double counting — against tarsk's 80 and 56. The gap between the two
+runtimes is real but far smaller than summed Rss suggests, and the *tree RSS* column in the
+footprint table below overstates in exactly this way.
 
 *The cost of an import depends on what is already loaded.* Instrumenting the taskiq worker
 directly showed the heavy module costing it +7MB, not +47: it already had 514 modules, so most
@@ -99,6 +103,14 @@ of celery's dependency tree was a re-import. The same code costs a fresh tarsk c
 because a fresh tarsk child has almost nothing in it. Neither number is wrong; they answer
 different questions, and "how much does my dependency tree cost" only has an answer relative to
 a starting point.
+
+**The footprint advantage is largest when your app is small.** Read the heavy column as a
+ranking and tarsk loses it — 53MB against taskiq's 44MB. Read the footnote below and it does
+not, because taskiq's 44MB is an under-read that settles near 58MB. Either way the honest shape
+is this: at a trivial app tarsk's process is 27MB against taskiq's 44MB, and by the time your
+dependency tree is 47MB the two are 53 and 58. What tarsk saves is the broker driver and the
+scheduler, which is a fixed amount. It does not save you from your own imports, and those are
+usually the larger number.
 
 † The taskiq worker cell does not move because steady-state RSS does not isolate the import
 for it: measured *at import*, the heavy module costs that process +7MB (52.3 → 59.4MB, 514 →
@@ -124,22 +136,24 @@ long enough.
 
 | runtime | worker RSS | tree Rss | tree Pss |
 |---|---|---|---|
-| tarsk | **26 MB** | 49 MB | **29 MB** |
-| celery | 41 MB | 91 MB | 51 MB |
-| taskiq | 44 MB | 87 MB | 50 MB |
+| tarsk | **27 MB** | 47 MB | **28 MB** |
+| celery | 41 MB | 91 MB | 52 MB |
+| taskiq | 44 MB | 92 MB | 56 MB |
 
 The tarsk child is CPython plus the user's task module and nothing else — no broker driver, no
 scheduler (spec §4.1). The tree columns include the supervisor / master.
 
 **Read the Pss column.** Summed Rss counts a shared page once per process mapping it, so a
 supervisor and its child double-count libpython, libc and the extension module. Pss divides
-each page by its sharers. The correction favours tarsk — worth saying, because nothing else on
-this page has needed correcting in that direction. Its processes are small, so shared libraries
-are the largest fraction of them: summed Rss inflates tarsk 1.93×, against Celery's 1.51× and
-taskiq's 1.66×.
+each page by its sharers. On the four-core runner the correction is much the same for all three
+— summed Rss inflates tarsk 1.68×, Celery 1.75× and taskiq 1.64×. An earlier version of this
+paragraph said the correction favoured tarsk, from a run where those figures read 1.93×, 1.51×
+and 1.66×. It does not favour anyone; it is an artefact of counting, and the ordering between
+the three runtimes is the same in both columns.
 
-Rss is also the column that will not hold still — 50, 52, 52 MB across three runs where Pss
-gave 26, 27, 27. An earlier version of this table said 44 MB and I could not account for it.
+Rss is also the column that will not hold still — 47, 49, 50, 52, 52 MB across five runs where
+Pss gave 28, 29, 26, 27, 27. An earlier version of this table said 44 MB and I could not
+account for it.
 Checking out the commit that produced it, rebuilding and measuring again gave the same 51 MB as
 today, so nothing in tarsk had changed between them; how much of libpython happened to be
 resident had. A number that moves with the page cache should not have been the headline.
@@ -148,7 +162,7 @@ resident had. A number that moves with the page cache should not have been the h
 trivial task lives about a second, and the sampler took the largest of a handful of 50ms reads
 — often missing the peak entirely. The figure now comes from the worker's own `ru_maxrss`,
 which cannot. A bare CPython 3.14 is 12.6 MB here and `tarsk` plus msgpack adds 11.8, so 27 was
-always the honest number; 16 was never reachable. The ratio against Celery is 1.8×, not the 3×
+always the honest number; 16 was never reachable. The ratio against Celery is 1.5×, not the 3×
 this page used to claim.
 
 ### Bounded memory, 40 tasks each retaining 20MB
@@ -158,15 +172,15 @@ this page used to claim.
 | celery (no recycling) | 841 MB |
 | taskiq (no recycling available) | 845 MB |
 | celery `--max-tasks-per-child=6` | **162 MB** |
-| tarsk `--max-rss=200MB --slots 1` | 202 MB |
-| tarsk `--max-rss=200MB` (default 100 slots) | **823 MB** |
+| tarsk `--max-rss=200MB --slots 1` | 203 MB |
+| tarsk `--max-rss=200MB` (default 100 slots) | **824 MB** |
 
 Celery wins this one. When the leak per task is known and constant, dividing the budget by it
 is a perfectly good bound — and a tighter one, because it stops short of the budget rather
 than at it.
 
 **The two tarsk rows are the same ceiling at one slot and at the default hundred**, and the
-second one is not a looser bound — it is barely a bound at all. 826MB against 849MB for no
+second one is not a looser bound — it is barely a bound at all. 824MB against 841MB for no
 recycling whatsoever. With a hundred slots the child is handed a hundred tasks before any of
 them has allocated anything, so the ceiling is first read long after the damage. A slot is a
 task that can be allocating when the ceiling is read; the default is chosen for handlers that
@@ -177,7 +191,7 @@ wait, and this workload does the opposite. `--slots 1` is what the rest of this 
 | | leak raised to 40MB | payload-dependent 2–80MB |
 |---|---|---|
 | celery `--max-tasks-per-child=6` | 282 MB | 327 MB |
-| tarsk `--max-rss=200MB` | 222 MB | 276 MB |
+| tarsk `--max-rss=200MB` | 223 MB | 277 MB |
 
 Nothing was reconfigured between this table and the last one. A task count encodes an
 assumption about bytes per task that nothing enforces; when the assumption expires, so does
@@ -188,21 +202,21 @@ floor for any design that refuses to kill running work.
 
 | runtime | completed | lost | executions | restarts | max gap | peak RSS |
 |---|---|---|---|---|---|---|
-| celery (defaults) | 17/30 | **13** | 17 | 0 | 5 ms | 381 MB |
-| taskiq (list, no ack) | 17/30 | **13** | 17 | 0 | 5 ms | 384 MB |
-| taskiq (streams, acked) | 17/30 | **13** | 17 | 0 | 5 ms | 384 MB |
-| celery `task_acks_late=True` | 17/30 | **13** | 17 | 0 | 6 ms | 381 MB |
-| celery `task_acks_late=True` + restarted | 29/30 | **1** | 29 | 1 | 2409 ms | 381 MB |
-| celery `--max-tasks-per-child=6` (tuned) | 30/30 | 0 | 30 | 0 | 141 ms | 162 MB |
-| tarsk `--max-rss=200MB` | 30/30 | 0 | 30 | 0 | 39 ms | 202 MB |
+| celery (defaults) | 17/30 | **13** | 17 | 0 | 4 ms | 381 MB |
+| taskiq (list, no ack) | 17/30 | **13** | 17 | 0 | 3 ms | 388 MB |
+| taskiq (streams, acked) | 17/30 | **13** | 17 | 0 | 4 ms | 384 MB |
+| celery `task_acks_late=True` | 17/30 | **13** | 17 | 0 | 4 ms | 381 MB |
+| celery `task_acks_late=True` + restarted | 29/30 | **1** | 29 | 1 | 2466 ms | 381 MB |
+| celery `--max-tasks-per-child=6` (tuned) | 30/30 | 0 | 30 | 0 | 139 ms | 162 MB |
+| tarsk `--max-rss=200MB` | 30/30 | 0 | 30 | 0 | 44 ms | 203 MB |
 
 **An acknowledgement only helps if something survives to notice.** taskiq's streams broker acks
-and still loses 15 of 30 here, exactly as its unacked list broker does, for the same reason
+and still loses 13 of 30 here, exactly as its unacked list broker does, for the same reason
 Celery's `task_acks_late` changes nothing: the OOM killer takes the whole cgroup, coordinator
 included, so there is nobody left to redeliver to. With an orchestrator restarting the worker it very
 nearly recovers — the one task still missing was in flight when the kill landed, and the Redis
 transport's default visibility timeout (1 hour) puts its redelivery outside the run. The price
-is 2.8 seconds of dead air.
+is 2.5 seconds of dead air.
 
 A correctly tuned Celery ties tarsk here. The difference is what you had to know in advance.
 
@@ -210,9 +224,9 @@ A correctly tuned Celery ties tarsk here. The difference is what you had to know
 
 | runtime | p50 gap | p99 gap | max gap |
 |---|---|---|---|
-| celery `--max-tasks-per-child=20` | 5.4 ms | 41 ms | 139 ms |
-| tarsk `--max-tasks=20` | 5.6 ms | 8 ms | 8 ms |
-| taskiq (no recycling available) | 5.4 ms | 6 ms | 7 ms |
+| celery `--max-tasks-per-child=20` | 5.3 ms | 139 ms | 143 ms |
+| tarsk `--max-tasks=20` | 5.6 ms | 7 ms | **7 ms** |
+| taskiq (no recycling available) | 5.4 ms | 6 ms | 6 ms |
 
 Recycling costs tarsk essentially nothing: it sits with taskiq, which never recycles at all.
 Getting there took three fixes, not one — starting the replacement early enough (projected from
@@ -229,52 +243,57 @@ with startup pulled out of the figure rather than folded into it.
 
 | runtime | 10 | 100 | 1,000 | 10,000 | startup |
 |---|---|---|---|---|---|
-| celery | 0.008 | 0.077 | 0.759 | 7.581 | 0.37 s |
-| taskiq (list, no ack) | 0.008 | 0.068 | 0.285 | 2.674 | 0.44 s |
-| taskiq (streams, acked) | 0.008 | 0.085 | 0.340 | 2.714 | 0.44 s |
-| tarsk (streams, acked) | 0.003 | 0.081 | 0.189 | **1.876** | 0.22 s |
+| celery | 0.007 | 0.079 | 0.753 | 7.758 | 0.44 s |
+| taskiq (list, no ack) | 0.004 | 0.021 | 0.159 | 1.652 | 0.43 s |
+| taskiq (streams, acked) | 0.005 | 0.044 | 0.193 | 1.782 | 0.45 s |
+| tarsk (streams, acked) | 0.002 | 0.019 | 0.167 | **1.681** | 0.20 s |
 
 Median seconds from first completion to last, five runs a cell.
 
 The two `streams, acked` rows are the like-for-like pair — same guarantee, same process count,
-same handler. **tarsk is the faster one at ten thousand**, 1.88s against 2.71s, and the two
-sets of five runs do not overlap: tarsk's slowest is 1.92s, taskiq's fastest 2.68s.
+same handler. tarsk is the faster one at ten thousand, 1.68s against 1.78s, and the two sets of
+five runs do not overlap: tarsk's slowest is 1.689s, taskiq's fastest 1.767s. Consistent, and
+**6%** — inside the ~10% tie rule at the top of this page. Faster in every run, by an amount
+this page's own standard says not to call a win.
 
-This gap did not travel, and an earlier version of this page said it did. On a 16-core laptop
-the same pair reads 1.42s against 1.30s — 1.1×, across four runs where tarsk ranged 1.21s to
-1.38s and the ratio 1.03× to 1.18×. By the ~10% rule at the top of this page that is a tie: on
-sixteen cores these two brokers drain a no-op queue at the same speed, and only the two-core
-runner separates them.
+**This page claimed 1.45× here, and that is retracted.** The claim came from a two-core runner;
+these runners now have four cores, and the same workflow on the same commit reads 1.06×. On a
+16-core laptop it reads 1.1×, across four runs ranging 1.03× to 1.18×. Three machines, one
+answer everywhere except the one that no longer exists: at four cores and above these two
+brokers drain a no-op queue at the same speed.
 
-The 0.95s this page used to report for tarsk on that laptop does not reproduce, and the reason
-is not a regression. Three commits were rebuilt in worktrees and re-run on the same machine
+That has a plausible shape — on two cores taskiq's dispatch loop is CPU-bound and a Rust
+supervisor pulls ahead; give both machines enough cores and they queue behind Redis instead —
+but it is a story fitted to three points after the fact, and the two-core measurement can no
+longer be re-run to test it. It is offered as a guess and not as a finding.
+
+The 0.95s this page used to report for tarsk on the laptop does not reproduce either, and that
+one is not a regression. Three commits were rebuilt in worktrees and re-run on the same machine
 within minutes of each other — the one that first published 0.95s, the one 27 later that
 restated it, and HEAD — and they measure 1.32s, 1.22s and 1.31s. Whatever produced 0.95s, it
-was not code that has since been lost. The honest part is what stays unexplained: taskiq's
-figure from the same old run, 1.48s, reproduces exactly, so a machine that was simply faster
-that day does not fit either. That run was taken before this harness had a CPU probe at all,
-which is the only thing about it that can still be checked, and it fails that check by not
-having one. Read the ratio within this table; it is not a constant across machines.
+was not code that has since been lost. What stays unexplained is worth recording: taskiq's
+figure from that same old run, 1.48s, reproduces exactly, so a machine that was simply faster
+that day does not fit. The run predates this harness having a CPU probe, which is the only
+thing about it that can still be checked, and it fails that check by not having one.
 
-That gap is a change, and the cause is not a clever optimisation. This page used to report a
-tie, and the reason for the tie was a mutex the Redis driver held round its own connection —
-every command from every child queued behind one lock on a single-threaded runtime. A
-`MultiplexedConnection` is built to be used concurrently. The lock was a bottleneck the driver
-had invented for itself, and removing it is the entire gap.
+The mutex story this section used to end on still stands as history and no longer as an
+explanation of a gap. The Redis driver did hold a lock round its own connection, every command
+from every child did queue behind it on a single-threaded runtime, and removing it did move
+these rows. What it bought is no longer visible as a lead over taskiq at four cores; it is
+visible in the 10 and 100 columns, and in the startup column, where tarsk is still half.
 
-Two earlier versions of this page read an ordering out of five noisy runs and had to retract
-it, so the separation being clean this time is worth stating plainly rather than assuming.
-What has not changed: a no-op handler is the case most favourable to whoever dispatches
-fastest, and nobody runs one.
+Three versions of this page have now read an ordering out of five runs and had to retract it.
+The pattern is not noise in the runs — the separations were clean each time — it is reading a
+ratio as a property of the software when it is a property of the software *and the machine*.
 
-**Acking cost almost nothing here, and that is a change.** taskiq's own list broker against
-its own stream broker is the cleanest measure of it: 2.67s against 2.71s at ten thousand, a
-1.5% difference. On a 16-core laptop the same pair reads 1.21s against 1.42s — 17%. An earlier
-version of this page put that at 73%, from a laptop run that does not reproduce either. Two
-cores is enough to bury the acknowledgement under the dispatch and sixteen is not, but by far
-less than that number claimed. What tarsk pays on top
-of either is a Unix socket round trip per task, about 63µs, because the handler runs in a child
-the supervisor can meter and replace.
+**What acking costs.** taskiq's own list broker against its own stream broker is the cleanest
+measure of it: 1.65s against 1.78s at ten thousand, an 8% difference. On a 16-core laptop the
+same pair reads 1.21s against 1.42s — 17%. Two earlier figures for this are withdrawn: 73%,
+from a laptop run that does not reproduce, and 1.5%, from the two-core runner that no longer
+exists. The cost is real and somewhere under a fifth; the three numbers this page has printed
+for it span fifty-fold, which says more about single runs than about acking. What tarsk pays on
+top of either is a Unix socket round trip per task, about 63µs, because the handler runs in a
+child the supervisor can meter and replace.
 
 taskiq's default `ListQueueBroker` is `BRPOP` with no acknowledgement — at-most-once, and a
 killed worker loses what it held. Comparing it against an acked broker compares different
@@ -320,29 +339,31 @@ query a database, wait for a webhook.
 
 | runtime | wall | vs. the 4-way floor | peak tree RSS | completed |
 |---|---|---|---|---|
-| celery, 4 processes | 12.50s | 1.00× | 215 MB | 500/500 |
-| taskiq, 4 processes × 1 | 12.60s | 1.01× | 224 MB | 500/500 |
-| tarsk, 4 children | 12.52s | 1.00× | **115 MB** | 500/500 |
-| celery, 32 processes | 1.54s | 0.12× | 1,373 MB | 500/500 |
-| taskiq, 4 processes × 64 | 0.23s | 0.02× | 225 MB | 500/500 |
-| tarsk, 32 children | 1.60s | 0.13× | 736 MB | 500/500 |
-| **tarsk, 4 children × 64 slots** | **0.19s** | 0.02× | **116 MB** | 500/500 |
+| celery, 4 processes | 12.51s | 1.00× | 214 MB | 500/500 |
+| taskiq, 4 processes × 1 | 12.54s | 1.00× | 224 MB | 500/500 |
+| tarsk, 4 children | 12.52s | 1.00× | **118 MB** | 500/500 |
+| celery, 32 processes | 1.54s | 0.12× | 1,379 MB | 500/500 |
+| taskiq, 4 processes × 64 | 0.21s | 0.02× | 226 MB | 500/500 |
+| tarsk, 32 children | 1.65s | 0.13× | 757 MB | 500/500 |
+| **tarsk, 4 children × 64 slots** | **0.13s** | 0.01× | **120 MB** | 500/500 |
 
 Held to one task per process, all three land on the arithmetic floor of 12.5s and the only
 difference is footprint. Buying concurrency with processes is the expensive way: 32 children
-costs 812MB to reach 1.64s, and Celery's 32 processes cost 1,628MB to reach much the same.
+cost 757MB to reach 1.65s, and Celery's 32 processes cost 1,379MB to reach much the same.
 
 `--slots 64` buys it with coroutines instead, and that row is the whole point of running this
-table: **0.19s on 116MB against taskiq's 0.23s on 225MB.** Same concurrency model now, and
+table: **0.13s on 120MB against taskiq's 0.21s on 226MB.** Same concurrency model now, and
 tarsk's advantage is the one it always had — a child that imports your tasks and no broker
-driver is a smaller process to have 64 of. The same pair on a 16-core laptop reads 0.15s against 0.20s — different
-numbers, the same answer.
+driver is a smaller process to have 64 of. The same pair on a 16-core laptop reads 0.13s
+against 0.20s. This is the one comparison on the page that has read the same on every machine
+it has been run on, which is worth more than the size of it.
 
 **This is not free, and what it costs is the thing this page is otherwise about.** At one slot
 the ceiling is read while the child has nothing running, so overshoot is bounded by a single
 task's peak. At 64 it is bounded by whatever 64 tasks are holding, and `--hard-max-rss` takes
-all 64 down together rather than one. That is why the default is 1: handlers that wait should
-raise it, handlers that allocate are exactly the case the precision exists for.
+all 64 down together rather than one. The default is 100, tuned for handlers that wait, which
+is what most task queue work is; a handler that allocates wants `--slots 1`, and that is the
+configuration every memory table on this page uses.
 
 An earlier version of this section reported this row as a loss tarsk could not fix, and called
 one task per child "the design, not a tuning gap". The measurement was right and the conclusion
@@ -357,15 +378,15 @@ a person gets for typing the documented command.
 
 | runtime | median wall | peak tree RSS | completed |
 |---|---|---|---|
-| celery (`-c` = cores, 2 here) | 100.70s | 133 MB | 2000/2000 |
-| taskiq (2 workers × 100) | 1.24s | 145 MB | 2000/2000 |
-| **tarsk (2 children × 100 slots)** | **0.95s** | **72 MB** | 2000/2000 |
+| celery (`-c` = cores, 4 here) | 50.33s | 216 MB | 2000/2000 |
+| taskiq (2 workers × 100) | 1.23s | 145 MB | 2000/2000 |
+| **tarsk (2 children × 100 slots)** | **0.94s** | **74 MB** | 2000/2000 |
 
 The I/O handler is deliberate: a no-op would make this a measure of dispatch rather than of the
 default concurrency, and the default concurrency is the whole question.
 
 Read this against the two tarsk rows in the memory table above. The same default that wins here
-is the one that lets a leaky workload reach 826MB under a 200MB ceiling. tarsk ships tuned for
+is the one that lets a leaky workload reach 824MB under a 200MB ceiling. tarsk ships tuned for
 handlers that wait, and a handler that allocates needs `--slots 1` — which is the configuration
 every other table on this page uses.
 
@@ -373,43 +394,57 @@ every other table on this page uses.
 
 | runtime | no-op | 50 ms handler | startup |
 |---|---|---|---|
-| celery | 1,225/s | 20/s | 0.29 s |
-| taskiq | 2,398/s | 20/s | 0.33 s |
-| tarsk | **2,859/s** | 20/s | 0.15 s |
+| celery | 1,305/s | 20/s | 0.36 s |
+| taskiq | 2,611/s | 20/s | 0.42 s |
+| tarsk | 2,688/s | 20/s | **0.20 s** |
 
 All three read the same Redis. Rate and wall cover first completion to last; **startup is
 separate on purpose**. Folding it in turns a 500-task row into a boot-time contest — it was 51%
 of Celery's figure, 59% of tarsk's and 77% of taskiq's when this table still did that.
+
+tarsk and taskiq are 3% apart on the no-op row, which is a tie; the column where they are not
+is startup, where tarsk is half. On two cores this row read 2,859/s against 2,398/s and was
+printed here in bold, which was the same mistake as the drain table — a two-core ordering read
+as a property of the software.
 
 With a 50 ms handler all three land on 19–20/s, which is the row that matters and the whole of
 spec §2's argument: dispatch overhead disappears behind any handler doing real work.
 
 ## Where these numbers came from
 
-A GitHub Actions `ubuntu-24.04` runner, two cores, via `.github/workflows/bench.yml`. Anyone
-with the repository can reproduce them by dispatching that workflow, which is the reason to
-prefer them over the faster ones this laptop produces: a 16-core machine nobody else has is not
-evidence.
+A GitHub Actions `ubuntu-24.04` runner, four cores, AMD EPYC 9V74, via
+`.github/workflows/bench.yml`. Anyone with the repository can reproduce them by dispatching
+that workflow, which is the reason to prefer them over the ones this laptop produces: a 16-core
+machine nobody else has is not evidence.
 
-Two cores is also why Celery's out-of-the-box row is a hundred seconds. `-c` defaults to the
-core count, so it gets two workers where taskiq's defaults get two hundred concurrent tasks.
-That is what the flag does, not a handicap applied to it.
+The core count is why Celery's out-of-the-box row is fifty seconds. `-c` defaults to it, so
+Celery gets four workers where taskiq's defaults get two hundred concurrent tasks. That is what
+the flag does, not a handicap applied to it — and on the two-core runner this row read a
+hundred seconds, so it is a measure of the runner as much as of the default.
 
-**Some ratios travelled and some did not**, and telling them apart took re-measuring. Ten
-thousand tasks across four processes, tarsk against taskiq's stream broker, is 1.45× on the
-runner and 1.1× on a 16-core laptop; an earlier version of this page reported 1.45× on both,
-and the laptop half of that pair turned out to be unreproducible even from the commit that
-produced it. The I/O and out-of-the-box comparisons did move by less than a tenth between the
-two machines. Compare rows within a table; do not carry a second across, and do not take a
-ratio for a constant because it held twice.
+**Almost nothing here travelled.** Ten thousand tasks across four processes, tarsk against
+taskiq's stream broker: 1.45× on a two-core runner, 1.06× on the four-core one that replaced
+it, 1.1× on a 16-core laptop. Single-worker no-op throughput: 1.19× then 1.03×. Acking cost:
+1.5%, then 8%, and 17% on the laptop. Three separate conclusions on this page rested on the
+two-core runner and none of them survived it being replaced.
+
+What did travel is the I/O row — 0.13s against 0.21s here, 0.13s against 0.20s on the laptop —
+and every memory figure on the page. That is the shape of it: the footprint claims are
+properties of the software, and the speed claims were properties of a machine. Compare rows
+within a table, do not carry a ratio across, and treat any ordering here as provisional until
+it has held on a machine that was not the one it was found on.
 
 Every run prints a CPU probe taken before each row and marks the row `slow` when that reading
 sits more than 25% above the run's fastest, so a table can be trusted cell by cell rather than
 run by run. It compared against the median until a run warned that it had drifted 1.7× and then
 marked nothing — the warning measures fastest against slowest and the mark measured against the
-middle, so the two could disagree about the same run and the guard said nothing useful. On a laptop the usual cause is the benchmark heating the machine it is running on:
-a twenty-minute local run drifted from 11ms to 27ms with nothing else competing, which is most
-of why these came from a runner instead.
+middle, so the two could disagree about the same run and the guard said nothing useful. On a
+laptop the usual cause is the benchmark heating the machine it is running on: a twenty-minute
+local run drifted from 11ms to 27ms with nothing else competing, which is most of why these
+came from a runner instead. The run above drifted 19ms to 25ms and marked no rows.
+
+The probe catches a machine that changes during a run. It does not catch a machine that is
+simply a different machine than last time, which is what actually invalidated the numbers here.
 
 ## Known limits of these numbers
 

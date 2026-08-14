@@ -488,8 +488,9 @@ checked rather than believed.
 - No strict priority. A worker reads `--queues high,low` in that order within one claim, which
   prefers the first without being a priority queue
 - No soft timeout — a task is stopped at its deadline rather than warned before it
-- Linux and macOS; Windows needs a decision about the IPC transport. Both platforms run the
-  full test suite in CI, on 3.11 through 3.14 including free-threaded
+- Linux and macOS run the full suite in CI, on 3.11 through 3.14 including free-threaded.
+  Windows runs the two suites that need no broker, since neither Redis nor Postgres ships for
+  it — the channel there is a named pipe rather than a Unix socket
 
 ## Running the tests
 

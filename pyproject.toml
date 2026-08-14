@@ -18,9 +18,11 @@ classifiers = [
     "Programming Language :: Rust",
     "Topic :: System :: Distributed Computing",
     "Typing :: Typed",
-    # The IPC is a Unix socket, so this is a fact about the code, not caution.
+    # Each of these runs the test suite in CI. Windows runs the two suites that
+    # do not need a broker, because neither Redis nor Postgres ships for it.
     "Operating System :: POSIX :: Linux",
     "Operating System :: MacOS :: MacOS X",
+    "Operating System :: Microsoft :: Windows",
 ]
 
 [project.urls]

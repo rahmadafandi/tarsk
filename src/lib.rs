@@ -11,6 +11,7 @@
 mod broker;
 mod cron;
 mod metrics;
+mod transport;
 
 use broker::{Broker, Delivery, NewJob, Receipt};
 use metrics::Metrics;
@@ -27,8 +28,6 @@ use pyo3::types::PyBytes;
 use rmpv::Value;
 use sysinfo::{Pid, ProcessesToUpdate, System};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::UnixListener;
 use tokio::sync::{mpsc, oneshot, Notify};
 
 const MAX_FRAME: usize = 32 * 1024 * 1024;
@@ -37,7 +36,7 @@ const EXIT_STARTUP_FAILED: i32 = 78;
 
 // ---------------------------------------------------------------- framing
 
-async fn read_frame(reader: &mut OwnedReadHalf) -> io::Result<Option<Vec<u8>>> {
+async fn read_frame(reader: &mut transport::Reader) -> io::Result<Option<Vec<u8>>> {
     let mut header = [0u8; 4];
     match reader.read_exact(&mut header).await {
         Ok(_) => {}
@@ -56,7 +55,7 @@ async fn read_frame(reader: &mut OwnedReadHalf) -> io::Result<Option<Vec<u8>>> {
     Ok(Some(body))
 }
 
-async fn write_frame(writer: &mut OwnedWriteHalf, value: &Value) -> io::Result<()> {
+async fn write_frame(writer: &mut transport::Writer, value: &Value) -> io::Result<()> {
     let mut body = Vec::new();
     rmpv::encode::write_value(&mut body, value)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -196,7 +195,7 @@ struct Counters {
 
 /// Hands an accepted, registered connection to the slot that spawned it.
 /// None means the child was rejected and the slot should stop waiting.
-type Handoff = oneshot::Sender<Option<(OwnedReadHalf, OwnedWriteHalf)>>;
+type Handoff = oneshot::Sender<Option<(transport::Reader, transport::Writer)>>;
 
 struct Shared {
     broker: Broker,
@@ -547,7 +546,7 @@ struct ChildHandle {
     pid: u32,
     proc: tokio::process::Child,
     frames: mpsc::Receiver<Vec<u8>>,
-    writer: OwnedWriteHalf,
+    writer: transport::Writer,
     started: Instant,
     tasks_done: u64,
     inflight: HashMap<u64, Job>,
@@ -626,6 +625,35 @@ fn prepend_result(payload: &[u8], result: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Ask a child to stop, politely, where the platform has a way to.
+///
+/// The polite step is SIGTERM, and Windows has no equivalent — it can only
+/// terminate. That is less of a loss than it sounds: the supervisor has already
+/// sent a Drain frame and waited, so this is the second escalation rather than
+/// the first, and the third is the same on both.
+fn ask_to_stop(pid: u32) {
+    #[cfg(unix)]
+    if pid != 0 {
+        unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+    }
+    #[cfg(windows)]
+    let _ = pid;
+}
+
+/// End a child immediately, for the hard ceiling.
+fn stop_now(child: &mut ChildHandle) {
+    #[cfg(unix)]
+    if child.pid != 0 {
+        unsafe { libc::kill(child.pid as i32, libc::SIGKILL) };
+    }
+    #[cfg(windows)]
+    {
+        // start_kill rather than kill().await: this is called from a path that
+        // reaps immediately afterwards and will collect the status there.
+        let _ = child.proc.start_kill();
+    }
+}
+
 fn no_arguments() -> Vec<u8> {
     let mut out = Vec::new();
     let empty = Value::Array(vec![Value::Array(Vec::new()), Value::Map(Vec::new())]);
@@ -666,14 +694,14 @@ enum Exit {
     Died,
 }
 
-async fn accept_loop(listener: UnixListener, shared: Arc<Shared>) {
+async fn accept_loop(listener: transport::Listener, shared: Arc<Shared>) {
     loop {
-        let Ok((stream, _)) = listener.accept().await else {
+        let Ok((reader, writer)) = listener.accept().await else {
             return;
         };
         let shared = shared.clone();
         tokio::spawn(async move {
-            let (mut reader, writer) = stream.into_split();
+            let mut reader = reader;
             let Ok(Some(body)) = read_frame(&mut reader).await else {
                 return;
             };
@@ -1317,9 +1345,7 @@ async fn reap(shared: &Arc<Shared>, mut child: ChildHandle, cfg: &Cfg) {
     }
     // SIGTERM, grace, SIGKILL.
     shared.counters.kills.fetch_add(1, Ordering::Relaxed);
-    if child.pid != 0 {
-        unsafe { libc::kill(child.pid as i32, libc::SIGTERM) };
-    }
+    ask_to_stop(child.pid);
     if tokio::time::timeout(cfg.term_grace, child.proc.wait())
         .await
         .is_err()
@@ -1366,9 +1392,7 @@ async fn slot(shared: Arc<Shared>, cfg: Arc<Cfg>) {
                     .unwrap()
                     .entry("hard_max_rss")
                     .or_insert(0) += 1;
-                if current.pid != 0 {
-                    unsafe { libc::kill(current.pid as i32, libc::SIGKILL) };
-                }
+                stop_now(&mut current);
                 reap(&shared, current, &cfg).await;
                 for (_, job) in killed {
                     let message = format!(
@@ -1482,14 +1506,9 @@ async fn supervise(
         return Ok((Vec::new(), HashMap::new(), Vec::new(), None));
     }
 
-    let listener = UnixListener::bind(&cfg.socket)?;
-    // Belt and braces behind the 0700 directory: Linux enforces socket
-    // permissions, and the platforms that do not are covered by the directory.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&cfg.socket, std::fs::Permissions::from_mode(0o600));
-    }
+    // Both platforms' details live in transport: a 0600 socket inside a 0700
+    // directory here, an ACL'd named pipe there.
+    let listener = transport::Listener::bind(&cfg.socket)?;
     let cfg = Arc::new(cfg);
     let acceptor = tokio::spawn(accept_loop(listener, shared.clone()));
 
@@ -1499,14 +1518,24 @@ async fn supervise(
     let signals = (!batch).then(|| {
         let shared = shared.clone();
         tokio::spawn(async move {
-            let mut term =
-                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-                    Ok(term) => term,
-                    Err(_) => return,
-                };
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                _ = term.recv() => {}
+            // Ctrl-C on both; SIGTERM as well where it exists, because that is
+            // what an orchestrator sends when it stops a pod.
+            #[cfg(unix)]
+            {
+                let mut term =
+                    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    {
+                        Ok(term) => term,
+                        Err(_) => return,
+                    };
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            #[cfg(windows)]
+            {
+                let _ = tokio::signal::ctrl_c().await;
             }
             shared.done.store(true, Ordering::SeqCst);
             shared.work.notify_waiters();
@@ -1822,7 +1851,7 @@ fn run(
     let cfg = build_cfg(
         app_spec,
         python,
-        dir.join("sock").to_string_lossy().into_owned(),
+        transport::connect_path(&dir),
         children,
         max_rss,
         max_tasks,
@@ -1895,7 +1924,7 @@ fn work(
     let cfg = build_cfg(
         app_spec,
         python,
-        dir.join("sock").to_string_lossy().into_owned(),
+        transport::connect_path(&dir),
         children,
         max_rss,
         max_tasks,

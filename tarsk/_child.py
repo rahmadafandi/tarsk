@@ -1,4 +1,4 @@
-"""Child worker: `python -m tarsk._child <socket-path> <module:app> <child-id>`
+"""Child worker: `python -m tarsk._child <address> <module:app> <child-id> [slots]`
 
 Imports the user's task modules and nothing from tarsk beyond the protocol
 codec (spec §4.1). Child RSS is therefore CPython + user code.
@@ -93,6 +93,26 @@ async def _layer(middleware, ctx: Context, nxt):
     return await asyncio.to_thread(middleware.execute, ctx, blocking_call)
 
 
+async def _connect(address: str):
+    """Open the channel the supervisor is listening on.
+
+    A Unix socket where there is one, a named pipe on Windows. Not TCP on
+    either: a loopback port is reachable by every process on the machine, and
+    what crosses here is task payloads and the word that a job finished.
+
+    asyncio gives Unix sockets a stream helper and named pipes only a transport,
+    so the Windows branch assembles the same pair by hand.
+    """
+    if not address.startswith(r"\\"):
+        return await asyncio.open_unix_connection(address)
+
+    loop = asyncio.get_running_loop()
+    reader = asyncio.StreamReader()
+    protocol = asyncio.StreamReaderProtocol(reader)
+    transport, _ = await loop.create_pipe_connection(lambda: protocol, address)
+    return reader, asyncio.StreamWriter(transport, protocol, reader, loop)
+
+
 async def _die(writer: asyncio.StreamWriter, code: int) -> None:
     """Flush what we owe the supervisor, then leave."""
     writer.close()
@@ -185,7 +205,7 @@ async def main(socket_path: str, app_spec: str, child_id: int, slots: int = 1) -
     except Exception:
         traceback.print_exc()
         sys.exit(EXIT_STARTUP_FAILED)
-    reader, raw_writer = await asyncio.open_unix_connection(socket_path)
+    reader, raw_writer = await _connect(socket_path)
     wire = Wire(raw_writer)
     writer = raw_writer  # kept for the shutdown path, which owns the socket
     # child_id is assigned by the supervisor before spawn, so it can match this

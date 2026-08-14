@@ -81,6 +81,26 @@ jobs:
           .venv/bin/python tests/test_recycle.py
           .venv/bin/python tests/test_brokers.py
 
+  test-windows:
+    # No Redis and no Postgres: neither ships for Windows, so this runs the two
+    # suites that use the in-process memory broker. That still exercises the
+    # part that is actually different — spawning a child, the named pipe, the
+    # protocol, RSS accounting and the recycling ceiling.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build and test
+        run: |
+          python -m venv .venv
+          .venv\Scripts\pip install -q maturin msgpack
+          .venv\Scripts\maturin develop --release
+          .venv\Scripts\python tests/test_ipc.py
+          .venv\Scripts\python tests/test_recycle.py
+
   wheels:
     # Proves the matrix builds; publishing is a separate, deliberate step.
     runs-on: ${{ matrix.os }}
@@ -96,6 +116,7 @@ jobs:
           # building this wheel on an x86_64 host before it was written here.
           - { os: ubuntu-24.04, target: aarch64, zig: true }
           - { os: macos-14, target: universal2-apple-darwin }
+          - { os: windows-latest, target: x64 }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

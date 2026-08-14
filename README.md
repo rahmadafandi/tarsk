@@ -576,6 +576,26 @@ And because it is a web page that can destroy work:
   anything, so an escaping bug is a rendering bug rather than an execution one. Plus
   `frame-ancestors 'none'` and `X-Frame-Options: DENY`, because a page with a purge button on
   it should not be frameable, and `Cache-Control: no-store`, because the page shows payloads.
+- **A quarter-second pause on a wrong token**, and at most 32 connections at once. Constant-time
+  comparison stops a timing attack and does nothing about volume; the pause turns millions of
+  guesses a second into four. The connection cap is there because these tasks live in the
+  supervisor, and an unbounded accept loop lets a stranger spend its memory from outside.
+- **Every destructive action is logged** to the worker's stderr with the queue, the id and the
+  address it came from. Basic auth gives one account, so the address is as close to *who* as
+  this gets — but a purge with no record at all is the thing noticed a week later.
+
+**Two things this cannot fix for you.**
+
+The token crosses the network in Basic auth, which is base64, which is readable. Requiring a
+token off loopback stops the accident of an open console; it does not make the link private.
+Either keep it on `127.0.0.1` and reach it through an SSH tunnel, or put it behind something
+that terminates TLS.
+
+And a dead letter's traceback is shown in full, because that is what makes it worth keeping. If
+your handlers put credentials in exception messages, the console will display them.
+
+**Keep the broker password out of `ps`.** `--broker postgres://user:pass@host` is visible to
+every process on the machine. `TARSK_BROKER` in the environment is not.
 
 ```
 tarsk web --broker redis://… --addr 127.0.0.1:9099

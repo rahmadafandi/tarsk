@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 
 use crate::Shared;
 
@@ -32,6 +33,21 @@ const MAX_REQUEST: usize = 16 * 1024;
 /// How many rows any one table shows. A console that renders ten thousand jobs
 /// is a console nobody can read and a supervisor doing work for nobody.
 const PAGE: usize = 100;
+
+/// Console connections served at once.
+///
+/// Each one holds a task with a ten-second read window, and they live in the
+/// supervisor — the process whose steadiness everything else here depends on.
+/// An unbounded accept loop lets a stranger spend its memory and its file
+/// descriptors from outside.
+const MAX_CONNECTIONS: usize = 32;
+
+/// Paid on every failed credential.
+///
+/// A constant-time comparison defeats a timing attack and does nothing about
+/// volume: without this, tokens can be tried as fast as the network allows.
+/// A quarter of a second turns millions of guesses per second into four.
+const WRONG_TOKEN_PAUSE: Duration = Duration::from_millis(250);
 
 struct Request {
     method: String,
@@ -184,8 +200,14 @@ where
             "read only"
         },
     );
+    let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     loop {
-        let Ok((stream, _)) = listener.accept().await else {
+        // Taken before accepting, so a flood waits in the kernel's backlog
+        // rather than as tasks this process is paying for.
+        let Ok(permit) = slots.clone().acquire_owned().await else {
+            return;
+        };
+        let Ok((stream, peer)) = listener.accept().await else {
             return;
         };
         let body = snapshot();
@@ -196,7 +218,8 @@ where
         // person looking at a queue, and neither may touch the supervision loop.
         tokio::spawn(async move {
             let guard = Guard { expect, actions };
-            let _ = handle(stream, &shared, &guard, body).await;
+            let _ = handle(stream, &shared, &guard, body, peer.to_string()).await;
+            drop(permit);
         });
     }
 }
@@ -206,6 +229,7 @@ async fn handle(
     shared: &Arc<Shared>,
     guard: &Guard,
     metrics_body: String,
+    peer: String,
 ) -> std::io::Result<()> {
     let Some(request) = read_request(&mut stream).await else {
         return respond(&mut stream, 400, "text/plain", "bad request").await;
@@ -219,6 +243,7 @@ async fn handle(
     }
 
     if !guard.allows(&request) {
+        tokio::time::sleep(WRONG_TOKEN_PAUSE).await;
         let mut head = String::from("HTTP/1.1 401 Unauthorized\r\n");
         head.push_str("WWW-Authenticate: Basic realm=\"tarsk\"\r\n");
         head.push_str(SAFETY);
@@ -249,28 +274,35 @@ async fn handle(
             } else {
                 queue
             };
-            match path {
-                "/cancel" => {
-                    let _ = shared.broker.revoke(&queue, &id, 86_400_000).await;
-                }
-                "/replay" => {
-                    let ids = if id.is_empty() {
-                        Vec::new()
-                    } else {
-                        vec![id.clone()]
-                    };
-                    let _ = shared.broker.dead_replay(&queue, &ids).await;
-                }
-                "/purge" => {
-                    let ids = if id.is_empty() {
-                        Vec::new()
-                    } else {
-                        vec![id.clone()]
-                    };
-                    let _ = shared.broker.dead_purge(&queue, &ids).await;
-                }
+            let ids = if id.is_empty() {
+                Vec::new()
+            } else {
+                vec![id.clone()]
+            };
+            let outcome = match path {
+                "/cancel" => shared
+                    .broker
+                    .revoke(&queue, &id, 86_400_000)
+                    .await
+                    .map(|_| 1usize),
+                "/replay" => shared.broker.dead_replay(&queue, &ids).await,
+                "/purge" => shared.broker.dead_purge(&queue, &ids).await,
                 _ => return respond(&mut stream, 404, "text/plain", "no such action").await,
-            }
+            };
+            // Destroying work with no record of it is the part of a console
+            // that gets noticed a week later. Basic auth gives one account, so
+            // the peer address is as close to "who" as this can get.
+            eprintln!(
+                "tarsk: console {} queue={} id={} from={} -> {}",
+                path.trim_start_matches('/'),
+                queue,
+                if id.is_empty() { "(all)" } else { &id },
+                peer,
+                match &outcome {
+                    Ok(n) => format!("{n} affected"),
+                    Err(e) => format!("failed: {e}"),
+                }
+            );
             // See-other rather than a rendered page, so a refresh does not
             // replay the action the reader already took.
             let head = format!(

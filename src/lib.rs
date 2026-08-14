@@ -1986,8 +1986,10 @@ impl Producer {
                     // Reserve before pushing. The other order would let two
                     // callers both queue and only then discover one of them
                     // should not have.
-                    if let Some(held) =
-                        self.broker.claim_dedup(&dedup_key, &id, dedup_ttl_ms).await?
+                    if let Some(held) = self
+                        .broker
+                        .claim_dedup(&dedup_key, &id, dedup_ttl_ms)
+                        .await?
                     {
                         return Ok(Some(held));
                     }
@@ -1996,9 +1998,7 @@ impl Producer {
                 Ok(None)
             })
         })
-        .map_err(|e: Box<dyn std::error::Error + Send + Sync>| {
-            PyValueError::new_err(e.to_string())
-        })
+        .map_err(|e: Box<dyn std::error::Error + Send + Sync>| PyValueError::new_err(e.to_string()))
     }
 
     /// The stored envelope for `id`, or None while it is unfinished, was never

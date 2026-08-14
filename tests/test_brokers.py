@@ -724,6 +724,26 @@ def test_postgres():
         check_broker(pg.url, "postgres")
 
 
+def test_postgres_tls_is_compiled_in():
+    """A Postgres URL asking for TLS must not be refused for lack of support.
+
+    The connector is always supplied, so sslmode decides. Before it was, this
+    failed with "error performing TLS handshake" against every managed Postgres
+    there is — loudly rather than silently, but no less unusable.
+    """
+    from tarsk._core import Producer
+
+    for mode in ("require", "verify-full"):
+        try:
+            Producer(broker_url=f"postgres://u:p@127.0.0.1:1/db?sslmode={mode}")
+        except ValueError as exc:
+            text = str(exc)
+            assert "invalid connection string" not in text, f"{mode} rejected outright: {text}"
+            assert "TLS handshake" not in text, f"{mode} has no TLS support: {text}"
+        else:
+            raise AssertionError("connecting to a dead port should not succeed")
+
+
 def test_tls_is_compiled_in():
     """rediss:// must fail like a connection, not like a missing feature.
 
@@ -746,6 +766,7 @@ def test_tls_is_compiled_in():
 
 
 if __name__ == "__main__":
-    for check in (test_redis, test_postgres, test_tls_is_compiled_in):
+    for check in (test_redis, test_postgres, test_tls_is_compiled_in,
+                  test_postgres_tls_is_compiled_in):
         check()
         print("ok", check.__name__)

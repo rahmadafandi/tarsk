@@ -280,6 +280,15 @@ Redis Streams and Postgres. Both at-least-once, both leasing per task rather tha
 neither needing lease renewal — a task's timeout is capped, so a lease cannot outlive a known
 ceiling.
 
+Both speak TLS, which every managed instance requires. `rediss://` for Redis, and for Postgres
+whatever `sslmode` says — `require`, `verify-ca` and `verify-full` all verify the chain and the
+hostname, since rustls does that on every handshake. The last two are spellings tokio-postgres
+does not know and are mapped to `require` rather than refused, because a connection string
+copied from a provider usually says one of them. `sslmode=disable`, or no `sslmode` against a
+server without TLS, still connects in the clear.
+
+Point `SSL_CERT_FILE` at your provider's CA bundle if it is not one the system already trusts.
+
 `rediss://` connects over TLS, which every managed Redis requires — verified against the
 system trust store, so an untrusted certificate is refused rather than accepted. Append
 `#insecure` to skip that check for a self-signed certificate you control; nothing else turns

@@ -15,8 +15,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use tokio_postgres::NoTls;
-
 pub type Res<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 pub fn now_ms() -> u64 {
@@ -1621,7 +1619,28 @@ pub struct PgBroker {
 
 impl PgBroker {
     async fn connect(url: &str, queues: Vec<String>) -> Res<PgBroker> {
-        let (client, connection) = tokio_postgres::connect(url, NoTls).await?;
+        // A TLS connector is always supplied, which is not the same as always
+        // using TLS: tokio-postgres reads sslmode from the URL and defaults to
+        // `prefer`, so a local server without TLS still connects and a managed
+        // one gets an encrypted link. Before this, `sslmode=require` failed
+        // with "error performing TLS handshake" — loudly, at least, rather than
+        // quietly in the clear, but it meant no managed Postgres at all.
+        // The system trust store, so `sslmode=verify-full` has roots to check
+        // against. Individual certificates that fail to load are ignored the
+        // way every other client does: one unparseable file in /etc/ssl should
+        // not stop a connection the rest of the store can verify.
+        let (tls, _ignored) = tokio_postgres_rustls::MakeRustlsConnect::with_native_certs()
+            .map_err(|errors| format!("could not read the system certificate store: {errors:?}"))?;
+        // tokio-postgres knows disable, prefer and require, and rejects the
+        // whole string on verify-ca or verify-full — which is what a managed
+        // provider's copy-paste connection string usually says. They are mapped
+        // to require rather than refused, and that is not a downgrade: rustls
+        // checks the chain and the hostname on every handshake, so what this
+        // driver calls require is what libpq calls verify-full.
+        let url = url
+            .replace("sslmode=verify-full", "sslmode=require")
+            .replace("sslmode=verify-ca", "sslmode=require");
+        let (client, connection) = tokio_postgres::connect(&url, tls).await?;
         // The connection future drives the socket; dropping it closes the link.
         tokio::spawn(async move {
             let _ = connection.await;

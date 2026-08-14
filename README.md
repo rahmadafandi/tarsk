@@ -97,7 +97,8 @@ guarantee, startup excluded: Celery 7.6s, taskiq 2.7s, tarsk 1.9s. That gap is r
 is not a clever optimisation — the Redis driver used to hold a mutex round its own connection,
 serialising every command from every child, and removing it is the whole difference. A no-op
 handler is also the case most favourable to whoever dispatches fastest, and nobody runs one.
-Full tables in [`bench/`](bench/README.md).
+Full tables in [`bench/`](bench/README.md), measured on a GitHub Actions runner so anyone can
+reproduce them — the same 1.45× holds on a 16-core laptop where both figures are half these.
 
 ## What it does not claim
 

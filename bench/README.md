@@ -254,11 +254,13 @@ it, so the separation being clean this time is worth stating plainly rather than
 What has not changed: a no-op handler is the case most favourable to whoever dispatches
 fastest, and nobody runs one.
 
-**Acking is not free for either.** taskiq's own list broker against its own stream broker is
-the cleanest measure — 0.85s against 1.48s at ten thousand — and tarsk pays that cost too,
-plus a Unix socket round trip per task, about 63µs, because the handler runs in a child the
-supervisor can meter and replace. That cost did not go away. It stopped being buried under a
-larger one.
+**Acking cost almost nothing here, and that is a change.** taskiq's own list broker against
+its own stream broker is the cleanest measure of it: 2.67s against 2.71s at ten thousand, a
+1.5% difference. On a 16-core laptop the same pair reads 0.85s against 1.48s — 73%. Two cores
+is enough to bury the acknowledgement under the dispatch, so the earlier claim that acking is
+what separates these brokers holds on one machine and not on the other. What tarsk pays on top
+of either is a Unix socket round trip per task, about 63µs, because the handler runs in a child
+the supervisor can meter and replace.
 
 taskiq's default `ListQueueBroker` is `BRPOP` with no acknowledgement — at-most-once, and a
 killed worker loses what it held. Comparing it against an acked broker compares different

@@ -86,9 +86,10 @@ def build_parser() -> argparse.ArgumentParser:
     worker.add_argument("--hard-max-rss", type=parse_size, default=0,
                         help="kill a child that reaches this, mid-task, instead of letting it "
                              "grow. Off by default: it trades one task to protect the box")
-    worker.add_argument("--max-dead", type=int, default=10_000, metavar="N",
+    worker.add_argument("--max-dead", type=int, default=1_000, metavar="N",
                         help="dead letters kept per queue; the oldest are dropped past this. "
-                             "0 keeps every failure, and lets the store grow without limit")
+                             "A failure costs about 2KB plus its payload, so raise it knowing "
+                             "what yours weigh. 0 keeps every failure and lets the store grow")
     worker.add_argument("--max-tasks", type=int, default=0)
     worker.add_argument("--max-lifetime", type=float, default=0.0, metavar="SECONDS")
     worker.add_argument("--metrics", metavar="HOST:PORT", default=os.environ.get("TARSK_METRICS"),

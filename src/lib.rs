@@ -1980,7 +1980,7 @@ fn console_only(
 #[pyfunction]
 #[pyo3(signature = (app_spec, broker_url, queues, python, children=2, slots=1, max_rss=0, max_tasks=0,
                     max_lifetime=0.0, lease_grace=30.0, metrics_addr=None, hard_max_rss=0,
-                    max_dead=10_000))]
+                    max_dead=1_000))]
 #[allow(clippy::too_many_arguments)]
 fn work(
     py: Python<'_>,

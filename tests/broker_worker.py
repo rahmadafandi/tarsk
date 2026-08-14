@@ -12,7 +12,7 @@ Supervisor(
     "tests.broker_app:app",
     children=int(os.environ.get("TARSK_CHILDREN", "1")),
     slots=int(os.environ.get("TARSK_SLOTS", "1")),
-    max_dead=int(os.environ.get("TARSK_MAX_DEAD", "10000")),
+    max_dead=int(os.environ.get("TARSK_MAX_DEAD", "1000")),
 ).work(
     os.environ["TARSK_BROKER"],
     ["default"],

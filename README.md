@@ -302,11 +302,23 @@ with the error and traceback.
 **Nothing here grows without a bound.** Results and progress carry the TTL the task asked for
 and expire on their own; the live stream loses an entry when it is acked; reservations, buckets
 and cancellations run on their own clocks. Dead letters were the exception — one payload and
-one full traceback per row, kept forever — so `--max-dead` caps them at 10,000 a queue and
-drops the oldest past that. `--max-dead 0` keeps every failure and lets the store grow, which
-is the right choice only if something else is emptying it. On Redis the trim is approximate,
-because Redis drops whole nodes and charges almost nothing for it; the cap is a bound, not an
-exact count.
+one full traceback per row, kept forever — so `--max-dead` caps them at 1,000 a queue and
+drops the oldest past that.
+
+That is a count, and a count is the proxy the tables above spend their time arguing against: it
+bounds bytes only if you know what a row weighs. Redis Streams offer `MAXLEN` and `MINID` and
+nothing by size, so a count is what the datastore gives. Measured, a failure costs about **2 KB
+plus its payload** — mostly traceback — so a thousand is a couple of megabytes a queue with
+small payloads, and ten thousand of a one-megabyte payload would be ten gigabytes. Raise it
+knowing what yours weigh.
+
+The default is small because of which way it fails. Too small loses old failures, which is
+visible and documented. Too large runs the broker out of memory and takes the healthy work down
+with it, which is the failure this whole project exists to prevent. `--max-dead 0` keeps every
+failure, and is right only if something else is emptying them.
+
+On Redis the trim is approximate — it drops whole nodes and charges almost nothing for it — so
+the cap is a bound rather than an exact count.
 
 ## Enqueueing from async code
 

@@ -369,7 +369,15 @@ impl Broker {
 
     /// Retries are exhausted: park the job somewhere a human can find it.
     /// `keep` is how many failures a queue's dead letters may hold; zero keeps
-    /// everything. Every other store here expires on its own — results and
+    /// everything.
+    ///
+    /// A count, which is the proxy this project spends a benchmark suite
+    /// arguing against — it bounds bytes only if you know what a row weighs.
+    /// Redis Streams offer MAXLEN and MINID and nothing by size, so a count is
+    /// what the datastore gives. Measured at about 2KB a row with a small
+    /// payload, most of it traceback, so the default of a thousand is a couple
+    /// of megabytes a queue and someone shipping megabyte payloads should say
+    /// so with the flag. Every other store here expires on its own — results and
     /// progress by TTL, the live stream by acking, the buckets and reservations
     /// by their own clocks — and this one grew forever, carrying a payload and
     /// a full traceback per row. For a queue whose whole claim is bounded

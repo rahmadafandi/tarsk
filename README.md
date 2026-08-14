@@ -563,6 +563,20 @@ destroy work. Three defaults follow from that:
 `/metrics` itself stays unauthenticated. It was before this existed, it carries no payloads,
 and breaking every scrape config to add a console would be a poor trade.
 
+And because it is a web page that can destroy work:
+
+- **Cross-site posts are refused.** Basic credentials are attached by the browser to any
+  request to an origin it holds them for, including a form on someone else's page — so without
+  this, a page you visit while logged in here could press purge. Cookies have `SameSite`; Basic
+  auth has nothing, so `Sec-Fetch-Site` and `Origin` stand in. A request with neither header is
+  not a browser and is allowed: it supplied the token itself.
+- **Everything rendered is escaped** — task names, ids, tracebacks, queue and worker names all
+  come from outside this process.
+- **A strict `Content-Security-Policy`** on every response: no scripts, no images, no external
+  anything, so an escaping bug is a rendering bug rather than an execution one. Plus
+  `frame-ancestors 'none'` and `X-Frame-Options: DENY`, because a page with a purge button on
+  it should not be frameable, and `Cache-Control: no-store`, because the page shows payloads.
+
 ```
 tarsk web --broker redis://… --addr 127.0.0.1:9099
 ```

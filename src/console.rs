@@ -37,7 +37,41 @@ struct Request {
     method: String,
     path: String,
     authorization: String,
+    /// The three headers a cross-site request cannot forge, kept for the CSRF
+    /// check. A browser sets Sec-Fetch-Site itself and a page cannot override
+    /// it; Origin is set on every cross-origin POST.
+    fetch_site: String,
+    origin: String,
+    host: String,
     body: String,
+}
+
+impl Request {
+    /// Was this posted from the console's own page?
+    ///
+    /// Basic credentials are attached by the browser to any request to an
+    /// origin it has them for, including a form on someone else's page. So a
+    /// page you visit while logged in here could press purge. Cookies would be
+    /// covered by SameSite; Basic auth has no such thing, and this is the
+    /// replacement.
+    ///
+    /// A request with none of these headers is not a browser — curl, a script —
+    /// and is allowed: it had to supply the token itself, and nobody tricked it
+    /// into doing so.
+    fn same_origin(&self) -> bool {
+        if !self.fetch_site.is_empty() {
+            return self.fetch_site == "same-origin" || self.fetch_site == "none";
+        }
+        if !self.origin.is_empty() {
+            let host = self
+                .origin
+                .rsplit_once("//")
+                .map(|(_, h)| h)
+                .unwrap_or(&self.origin);
+            return host == self.host;
+        }
+        true
+    }
 }
 
 /// What the environment permits. Read once at startup so a request never pays
@@ -187,6 +221,7 @@ async fn handle(
     if !guard.allows(&request) {
         let mut head = String::from("HTTP/1.1 401 Unauthorized\r\n");
         head.push_str("WWW-Authenticate: Basic realm=\"tarsk\"\r\n");
+        head.push_str(SAFETY);
         head.push_str("Content-Length: 0\r\nConnection: close\r\n\r\n");
         stream.write_all(head.as_bytes()).await?;
         return stream.shutdown().await;
@@ -196,6 +231,15 @@ async fn handle(
         ("GET", "/") => {
             let page = dashboard(shared, guard).await;
             respond(&mut stream, 200, "text/html; charset=utf-8", &page).await
+        }
+        ("POST", _) if !request.same_origin() => {
+            respond(
+                &mut stream,
+                403,
+                "text/plain",
+                "cross-site post refused: this action must come from the console's own page",
+            )
+            .await
         }
         ("POST", path) if guard.actions => {
             let id = form_value(&request.body, "id");
@@ -229,8 +273,10 @@ async fn handle(
             }
             // See-other rather than a rendered page, so a refresh does not
             // replay the action the reader already took.
-            let head = "HTTP/1.1 303 See Other\r\nLocation: /\r\n\
-                        Content-Length: 0\r\nConnection: close\r\n\r\n";
+            let head = format!(
+                "HTTP/1.1 303 See Other\r\nLocation: /\r\n{SAFETY}\
+                 Content-Length: 0\r\nConnection: close\r\n\r\n"
+            );
             stream.write_all(head.as_bytes()).await?;
             stream.shutdown().await
         }
@@ -275,16 +321,28 @@ async fn read_request(stream: &mut TcpStream) -> Option<Request> {
     // body, and a parameter nobody reads is a parameter someone will assume
     // is honoured.
     let path = target.split('?').next().unwrap_or(&target).to_string();
-    let authorization = lines
-        .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
-        .and_then(|l| l.split_once(':'))
-        .map(|(_, v)| v.trim().to_string())
-        .unwrap_or_default();
+    let header = |name: &str| {
+        head.lines()
+            .find(|l| {
+                l.to_ascii_lowercase()
+                    .starts_with(&format!("{}:", name.to_ascii_lowercase()))
+            })
+            .and_then(|l| l.split_once(':'))
+            .map(|(_, v)| v.trim().to_string())
+            .unwrap_or_default()
+    };
+    let authorization = header("authorization");
+    let fetch_site = header("sec-fetch-site").to_ascii_lowercase();
+    let origin = header("origin");
+    let host = header("host");
     // Bodies here are one short form; anything already read is all of it.
     Some(Request {
         method,
         path,
         authorization,
+        fetch_site,
+        origin,
+        host,
         body: rest.to_string(),
     })
 }
@@ -478,6 +536,20 @@ button{font:inherit;padding:.1rem .5rem;cursor:pointer}\
 form{display:inline}\
 </style><body>";
 
+/// Sent with every response, including the redirects and the 401.
+///
+/// The console has no scripts, no images and no external files, so its policy
+/// can be almost entirely `none` — which means an escaping bug becomes a
+/// rendering bug rather than an execution one. `frame-ancestors` is here
+/// because the buttons on this page cancel and purge work, and a page that can
+/// be framed can have its buttons clicked by the page framing it.
+const SAFETY: &str = "Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; \
+form-action 'self'; frame-ancestors 'none'; base-uri 'none'\r\n\
+X-Frame-Options: DENY\r\n\
+X-Content-Type-Options: nosniff\r\n\
+Referrer-Policy: no-referrer\r\n\
+Cache-Control: no-store\r\n";
+
 async fn respond(
     stream: &mut TcpStream,
     status: u16,
@@ -492,7 +564,7 @@ async fn respond(
         _ => "Error",
     };
     let head = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\n\
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\n{SAFETY}\
          Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
@@ -528,6 +600,34 @@ mod tests {
         assert_eq!(form_value("id=abc%3A1&queue=q", "id"), "abc:1");
         assert_eq!(form_value("id=abc&queue=two+words", "queue"), "two words");
         assert_eq!(form_value("id=abc", "missing"), "");
+    }
+
+    fn posted(fetch_site: &str, origin: &str) -> Request {
+        Request {
+            method: "POST".into(),
+            path: "/cancel".into(),
+            authorization: String::new(),
+            fetch_site: fetch_site.into(),
+            origin: origin.into(),
+            host: "127.0.0.1:9090".into(),
+            body: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_post_from_someone_elses_page_is_refused() {
+        // Basic credentials ride along on a cross-site form post, so without
+        // this a page you visit while logged in here can press purge.
+        assert!(!posted("cross-site", "").same_origin());
+        assert!(!posted("same-site", "").same_origin());
+        assert!(!posted("", "http://evil.example").same_origin());
+
+        assert!(posted("same-origin", "").same_origin());
+        assert!(posted("none", "").same_origin());
+        assert!(posted("", "http://127.0.0.1:9090").same_origin());
+        // Neither header at all is not a browser, and nothing tricked it into
+        // supplying the token it must already have.
+        assert!(posted("", "").same_origin());
     }
 
     #[test]

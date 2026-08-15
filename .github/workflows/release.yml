@@ -1,0 +1,114 @@
+name: release
+
+# Started from `maturin generate-ci github --platform all`, then cut down. What
+# changed from the generated file, and why, is in the comments below — the
+# generator does not know what this project links against or what it needs at
+# runtime, and two of its defaults would have shipped wheels that cannot work.
+#
+# Tags only. `ci.yml` already builds a four-target smoke matrix on every push;
+# this one is the full set and the publish, and both are wasted on a branch.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04, target: x86_64, manylinux: auto }
+          # aarch64 cross-compiles through zig rather than the manylinux
+          # container's toolchain. rustls pulls in ring, whose ARM assembly the
+          # container's assembler rejects with `#error "ARM assembler must
+          # define __ARM_ARCH"`. The generated workflow uses the container for
+          # this target and would fail the same way.
+          - { os: ubuntu-24.04, target: aarch64, manylinux: auto, zig: true }
+          - { os: ubuntu-24.04, target: x86_64, manylinux: musllinux_1_2, musl: true }
+          - { os: macos-14, target: universal2-apple-darwin }
+          - { os: windows-latest, target: x64 }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Provide zig
+        if: matrix.zig
+        # maturin looks for a `zig` binary on PATH; the pip package is a Python
+        # module, so it needs a shim.
+        run: |
+          python -m pip install --quiet ziglang
+          mkdir -p "$HOME/.local/bin"
+          printf '#!/bin/sh\nexec %s -m ziglang "$@"\n' "$(which python)" > "$HOME/.local/bin/zig"
+          chmod +x "$HOME/.local/bin/zig"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist ${{ matrix.zig && '--zig' || '' }}
+          # zig cross-compiles on the host and tags the wheel manylinux itself,
+          # so the container would only get in the way of finding it.
+          container: ${{ matrix.zig && 'off' || 'auto' }}
+          manylinux: ${{ matrix.manylinux }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheels-${{ matrix.os }}-${{ matrix.target }}${{ matrix.musl && '-musl' || '' }}
+          path: dist
+
+  sdist:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheels-sdist
+          path: dist
+
+  publish:
+    needs: [build, sdist]
+    runs-on: ubuntu-24.04
+    environment:
+      name: pypi
+      url: https://pypi.org/p/tarsk
+    permissions:
+      # Trusted publishing, so there is no API token in this repository to
+      # rotate or leak. PyPI has to know about this workflow first: add a
+      # pending publisher for `tarsk` naming this repository, `release.yml`
+      # and the `pypi` environment. Renaming this file breaks that link.
+      id-token: write
+      # For the artifact attestation and the GitHub release.
+      attestations: write
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: "dist/*"
+      - uses: astral-sh/setup-uv@v10
+      - name: Publish to PyPI
+        # Only a tag publishes. A manual run builds every wheel and attests
+        # them, which is the rehearsal worth having before the first release.
+        if: startsWith(github.ref, 'refs/tags/')
+        # `always` rather than the `automatic` default: automatic falls back
+        # to looking for a token and would fail with a credentials error
+        # instead of saying the publisher is not configured.
+        run: uv publish --trusted-publishing always dist/*
+      - uses: softprops/action-gh-release@v3
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: dist/*
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, 'a') || contains(github.ref_name, 'b') || contains(github.ref_name, 'rc') }}

@@ -26,8 +26,13 @@ jobs:
           # aarch64 cross-compiles through zig rather than the manylinux
           # container's toolchain. rustls pulls in ring, whose ARM assembly the
           # container's assembler rejects with `#error "ARM assembler must
-          # define __ARM_ARCH"`. The generated workflow uses the container for
-          # this target and would fail the same way.
+          # define __ARM_ARCH"`.
+          #
+          # `maturin generate-ci --zig` does exist and adds the flag, but it
+          # leaves the container on; only `container: off` is the form this
+          # repository has actually built an aarch64 wheel with. Whether the
+          # generated combination also works here is untested, which is the
+          # only reason it is not used.
           - { os: ubuntu-24.04, target: aarch64, manylinux: auto, zig: true }
           - { os: ubuntu-24.04, target: x86_64, manylinux: musllinux_1_2, musl: true }
           - { os: macos-14, target: universal2-apple-darwin }
@@ -55,6 +60,19 @@ jobs:
           # so the container would only get in the way of finding it.
           container: ${{ matrix.zig && 'off' || 'auto' }}
           manylinux: ${{ matrix.manylinux }}
+          sccache: true
+      - name: Build the free-threaded wheel
+        # abi3 stops at the GIL: a free-threaded build cannot use the stable
+        # ABI, so 3.14t needs a wheel of its own or its users compile from the
+        # sdist. CI has tested 3.14t since the first commit, and shipping
+        # without this would have been a supported version with no wheel.
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist -i python3.14t ${{ matrix.zig && '--zig' || '' }}
+          container: ${{ matrix.zig && 'off' || 'auto' }}
+          manylinux: ${{ matrix.manylinux }}
+          sccache: true
       - uses: actions/upload-artifact@v7
         with:
           name: wheels-${{ matrix.os }}-${{ matrix.target }}${{ matrix.musl && '-musl' || '' }}
@@ -97,7 +115,9 @@ jobs:
       - uses: actions/attest-build-provenance@v4
         with:
           subject-path: "dist/*"
-      - uses: astral-sh/setup-uv@v10
+      # Pinned to the full version: setup-uv stopped publishing a moving
+      # major tag after v7, so @v10 does not resolve.
+      - uses: astral-sh/setup-uv@v10.0.1
       - name: Publish to PyPI
         # Only a tag publishes. A manual run builds every wheel and attests
         # them, which is the rehearsal worth having before the first release.

@@ -10,7 +10,7 @@ A Python task queue whose workers hold a memory ceiling you set — without losi
 child supervision are Rust; the only Python in the hot path is your handler.
 
 ```bash
-pip install tarsk        # not yet: see the status note in the README
+pip install tarsk
 ```
 
 ```python

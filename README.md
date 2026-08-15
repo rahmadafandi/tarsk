@@ -5,8 +5,17 @@ A Python task queue whose workers hold a memory ceiling you set — without losi
 `task` with `rust` through the middle. The scheduler, retry state machine, lease tracking and
 child supervision are Rust; the only Python in the hot path is your handler.
 
-> **Status: 0.1.0, not yet on PyPI.** The core works and is tested; the wheel builds and
-> installs. See [What is missing](#what-is-missing).
+[![PyPI](https://img.shields.io/pypi/v/tarsk)](https://pypi.org/project/tarsk/)
+[![Python](https://img.shields.io/pypi/pyversions/tarsk)](https://pypi.org/project/tarsk/)
+[![License](https://img.shields.io/pypi/l/tarsk)](LICENSE)
+
+```bash
+pip install tarsk
+```
+
+> **Status: 0.1.0, the first release.** Wheels for Linux (glibc and musl, x86_64 and
+> aarch64), macOS universal2 and Windows x64, on Python 3.11 through 3.14 including the
+> free-threaded build. See [What is missing](#what-is-missing).
 
 **📖 [Documentation](https://rahmadafandi.github.io/tarsk/)** — everything below the fold lives
 there: [how it works](https://rahmadafandi.github.io/tarsk/how-it-works),
@@ -86,7 +95,6 @@ it. Overshoot is bounded by one task's peak, not by zero.
 
 ## What is missing
 
-- Not on PyPI yet — the wheel builds and installs, it just has not been uploaded
 - No chord. `chain` and `group` are here; fanning back in to a callback is not
 - Windows runs the suites that need no broker, since neither Redis nor Postgres ships for it.
   Everything else — the channel, recycling, the memory ceiling — is tested there

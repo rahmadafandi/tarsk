@@ -71,8 +71,9 @@ a Prometheus endpoint that reports
 queue depth and the supervisor's own RSS so both constants can be checked rather
 than believed.
 
-Pre-release: no published wheel yet. Linux, macOS and Windows, all three tested
-in CI on 3.11 through 3.14 including the free-threaded build.
+pip install tarsk. Wheels for Linux (glibc and musl, x86_64 and aarch64), macOS
+universal2 and Windows x64, on 3.11 through 3.14 including the free-threaded
+build, which needs its own wheel because abi3 stops at the GIL.
 ```
 
 ---
@@ -233,7 +234,6 @@ gets the byte budget without the handover, which is the 139 ms column.
 
 ## Not done yet
 
-- Not on PyPI yet — the wheel builds and installs, it just has not been uploaded
 - No chord; chains and groups are there, fanning back in is not
 
 ---

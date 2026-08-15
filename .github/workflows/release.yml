@@ -154,5 +154,20 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         with:
           files: dist/*
+          # GitHub's Packages panel only ever lists GitHub's own registries, so
+          # a PyPI release is invisible on the repository page unless something
+          # says so. The generated changelog is appended under this.
+          body: |
+            ```bash
+            pip install tarsk==${{ github.ref_name }}
+            ```
+
+            [PyPI](https://pypi.org/project/tarsk/${{ github.ref_name }}/) ·
+            [Documentation](https://rahmadafandi.github.io/tarsk/) ·
+            [Benchmarks](https://rahmadafandi.github.io/tarsk/benchmarks)
+
+            Wheels below are built and attested by this workflow: Linux glibc and
+            musl on x86_64 and aarch64, macOS universal2, Windows x64, for Python
+            3.11 through 3.14 plus a separate free-threaded 3.14t wheel.
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, 'a') || contains(github.ref_name, 'b') || contains(github.ref_name, 'rc') }}

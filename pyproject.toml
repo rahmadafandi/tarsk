@@ -10,7 +10,7 @@ authors = [{ name = "Rahmad Afandi", email = "rahmadafandiii@gmail.com" }]
 keywords = [
     "task-queue", "queue", "tasks", "jobs", "background-jobs", "worker",
     "distributed", "async", "scheduler", "cron",
-    "memory-limit", "oom", "rss", "redis", "postgres", "rust",
+    "rss", "redis", "postgres", "rust",
 ]
 dependencies = ["msgpack>=1.0"]
 

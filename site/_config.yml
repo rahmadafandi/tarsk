@@ -1,0 +1,6 @@
+title: tarsk
+description: A Python task queue whose workers hold a memory ceiling you set
+theme: jekyll-theme-primer
+# Relative, so every link works both on the deployed site and from a local
+# `jekyll serve` without a second config.
+baseurl: "/tarsk"

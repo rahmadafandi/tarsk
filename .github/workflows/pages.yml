@@ -1,0 +1,50 @@
+name: pages
+
+# The docs are the README's long half, moved out so the README can be read in
+# under a minute. Built from `site/` rather than `docs/`, which this repository
+# keeps out of git.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "site/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deploy at a time, and let a newer push win rather than queueing behind an
+# older one that is about to be replaced anyway.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      # Pages has never been switched on for this repository, and this
+      # turns it on rather than failing the first run with a setting
+      # somebody has to find in the web UI.
+      - uses: actions/configure-pages@v6
+        with:
+          enablement: true
+      - uses: actions/jekyll-build-pages@v1
+        with:
+          source: ./site
+          destination: ./_site
+      - uses: actions/upload-pages-artifact@v5
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v5

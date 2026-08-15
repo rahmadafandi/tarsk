@@ -177,7 +177,7 @@ struct Cfg {
     /// nothing running cannot grow, so RSS read at a dispatch decision bounds
     /// overshoot to a single task's peak. Raising this trades that precision
     /// for concurrency, and is worth it only when handlers wait rather than
-    /// allocate — see the io table in bench/README.md.
+    /// allocate — see the io table in the published benchmarks.
     slots: usize,
 }
 

@@ -1,7 +1,7 @@
 """A worker that leaks on purpose, the way real ones leak by accident.
 
 Memory follows the payload — the shape no task-count recycling proxy can see
-(bench/README.md) — and every task appends to a list nothing ever clears.
+(the benchmarks) — and every task appends to a list nothing ever clears.
 """
 
 import os

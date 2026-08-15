@@ -1,0 +1,31 @@
+# Toolchain for this repository, so a clone builds against what CI built.
+#
+#     mise install     # fetches the toolchains
+#     mise exec -- true  # or just cd in with the shell hook: creates .venv
+#     .venv/bin/pip install maturin msgpack
+#     .venv/bin/maturin develop --release
+#
+# Pinned to exact patches rather than "latest". The extension is a compiled
+# artifact and the tests measure memory and timing, so "it worked on mine" is a
+# claim about a toolchain as much as about the code.
+
+[tools]
+# What this repository is developed and measured against. The wheel is
+# abi3-py311, so anything from 3.11 up runs it; CI checks 3.11, 3.13, 3.14 and
+# the free-threaded 3.14t, and a version outside that range is untested rather
+# than unsupported.
+python = "3.14.3"
+
+# CI builds on `stable` on purpose — a Rust release that breaks this should
+# show up in a CI run rather than in a contributor's first build. This pin is
+# the other half of that trade: locally you get the version the numbers on the
+# documentation site were produced with, and CI tells you when stable moves
+# past it.
+rust = "1.94.0"
+
+[env]
+# Created and activated when the directory is entered — on the shell hook, or
+# on any `mise exec`, not on `mise install`. So the `.venv/bin/...` in every
+# command in the README is there without a step that is easy to skip.
+# Gitignored, as it should be.
+_.python.venv = { path = ".venv", create = true }

@@ -93,6 +93,11 @@ it. Overshoot is bounded by one task's peak, not by zero.
 
 ## Running the tests
 
+The toolchain is pinned in [`mise.toml`](mise.toml) — Rust 1.94.0 and Python 3.14.3, the
+versions the published numbers were produced with. With [mise](https://mise.jdx.dev) installed,
+`mise install` fetches both and entering the directory creates `.venv` from the pinned Python.
+Without it, any Python 3.11+ and a recent stable Rust will build: the wheel is abi3-py311.
+
 ```bash
 python -m venv .venv && .venv/bin/pip install maturin msgpack
 .venv/bin/maturin develop --release

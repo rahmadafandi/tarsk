@@ -34,12 +34,14 @@ One hour, 72,001 tasks, a handler that frees nothing: 66 recycles, peak 400 MB
 against a 400 MB ceiling, zero tasks lost, nothing killed. The trough held at 27.9 MB
 over the first half hour and 28.1 MB over the second, so nothing survives a recycle.
 
-That run used --slots 1, which is not the default and should be whenever your
-handlers allocate. The default is 100 tasks in flight per child: right for handlers
-that wait on other services, ruinous for ones that allocate. The same 40 leaky tasks
-peak at 203 MB under a 200 MB ceiling at one slot, and at 824 MB at a hundred. The
-ceiling is exact when one task is running while it is read, and that is something
-you configure rather than something you get.
+That run used --slots 1. The default is 100 tasks in flight per child, and it used
+to be a trap: the same 40 leaky tasks peaked at 824 MB under a 200 MB ceiling,
+because a child is handed every slot before any of them has allocated anything. The
+supervisor now learns what a task costs in bytes and will not fill a slot the ceiling
+cannot afford, so those tasks peak at 123 MB at a hundred slots and 183 MB at one.
+Lower at a hundred, because a child holding several climbs faster between two
+readings and meets the ceiling's projection sooner. What more slots still cost is
+precision: overshoot is the peak of whatever is in flight, not of one task.
 
 What it does not claim: speed. An earlier draft of this claimed 1.45x over taskiq
 on a no-op queue. That was measured on a two-core runner; those runners now have
@@ -106,43 +108,43 @@ workload changes between columns.
 | celery, no recycling | 841 MB | — | — |
 | taskiq, none available | 845 MB | — | — |
 | celery `--max-tasks-per-child=6` | **162 MB** | 282 MB | 327 MB |
-| tarsk `--max-rss=200MB --slots 1` | 203 MB | **223 MB** | **277 MB** |
-| tarsk `--max-rss=200MB`, default slots | 824 MB | — | — |
+| tarsk `--max-rss=200MB --slots 1` | 183 MB | **183 MB** | **187 MB** |
+| tarsk `--max-rss=200MB`, default slots | **123 MB** | — | — |
 
 **Gap between consecutive completions**, recycling every 20 tasks — the cost of recycling at all.
 
 | runtime | p50 | p99 | max |
 |---|---|---|---|
-| celery `--max-tasks-per-child=20` | 5.3 ms | 139 ms | 143 ms |
-| tarsk `--max-tasks=20` | 5.6 ms | 7 ms | **7 ms** |
+| celery `--max-tasks-per-child=20` | 5.4 ms | 139 ms | 140 ms |
+| tarsk `--max-tasks=20` | 5.7 ms | 7 ms | **7 ms** |
 | taskiq, never recycles | 5.4 ms | 6 ms | 6 ms |
 
 **30 leaky tasks under a hard 400 MB cgroup limit** — what Kubernetes does to a worker that grows.
 
 | runtime | completed | lost | restarts | longest stall |
 |---|---|---|---|---|
-| celery, defaults | 17/30 | **13** | 0 | 4 ms |
-| taskiq (list, no ack) | 17/30 | **13** | 0 | 3 ms |
+| celery, defaults | 17/30 | **13** | 0 | 3 ms |
+| taskiq (list, no ack) | 17/30 | **13** | 0 | 4 ms |
 | taskiq (streams, acked) | 17/30 | **13** | 0 | 4 ms |
-| celery `task_acks_late` | 17/30 | **13** | 0 | 4 ms |
-| celery `task_acks_late` + restarted | 29/30 | **1** | 1 | 2,466 ms |
+| celery `task_acks_late` | 17/30 | **13** | 0 | 9 ms |
+| celery `task_acks_late` + restarted | 29/30 | **1** | 1 | 2,530 ms |
 | celery `--max-tasks-per-child=6`, tuned | **30/30** | 0 | 0 | 139 ms |
-| tarsk `--max-rss=200MB` | **30/30** | 0 | 0 | 44 ms |
+| tarsk `--max-rss=200MB` | **30/30** | 0 | 0 | 63 ms |
 
 **Throughput**, single worker, concurrency 1. Reported to be honest about it, not as a claim.
 
 | runtime | no-op handler | 50 ms handler | startup |
 |---|---|---|---|
-| celery | 1,305/s | 20/s | 0.36s |
-| taskiq | 2,611/s | 20/s | 0.42s |
-| tarsk | 2,688/s | 20/s | **0.20s** |
+| celery | 965/s | 20/s | 0.45s |
+| taskiq | 1,784/s | 20/s | 0.51s |
+| tarsk | 2,007/s | 20/s | **0.21s** |
 
-Draining a 10,000-task queue across four processes, same guarantee for both: taskiq 1.78s,
-tarsk 1.68s. Celery takes 7.8s. tarsk is ahead in all five runs and by 6% — a tie by the rule
+Draining a 10,000-task queue across four processes, same guarantee for both: taskiq 2.27s,
+tarsk 2.18s. Celery takes 10.0s. tarsk is ahead in all five runs and by 4% — a tie by the rule
 at the bottom of this page.
 
 Both numbers in that pair are retractions. This draft claimed 1.45× from a two-core runner;
-those runners have four cores now and the same commit reads 1.06×. It also claimed the ratio
+those runners have four cores now and two runs on them read 1.06× and 1.04×. It also claimed the ratio
 held on a sixteen-core laptop, from a tarsk figure of 0.95s that does not reproduce — three
 commits were rebuilt and re-run, including the one that first published it, and all three
 measure 1.2–1.3s. That is not a regression, and it is not a faster machine either, because
@@ -151,7 +153,7 @@ taken before the harness had a CPU probe, which is the part worth generalising: 
 number nobody tried to break is not evidence, and three of the ones on this page broke.
 
 **Out of the box**, no concurrency flags at all, 2,000 tasks that each await 100 ms: tarsk
-0.94s on 74 MB, taskiq 1.23s on 145 MB, Celery 50.3s on 216 MB. Celery's `-c` defaults to the
+0.96s on 74 MB, taskiq 1.31s on 145 MB, Celery 50.3s on 215 MB. Celery's `-c` defaults to the
 core count, and the runner has four.
 
 The 50 ms row is the one that matters, and all three are the same number.
@@ -161,17 +163,20 @@ The 50 ms row is the one that matters, and all three are the same number.
 ## Objections to expect
 
 **Your own default breaks your headline.**
-It does, and the table above says so rather than waiting to be asked: 824 MB under a 200 MB
-ceiling at the default hundred slots, 203 MB at one. The default is tuned for handlers that
-wait, because that is most task queue work, and because tarsk with no flags beats taskiq with
-no flags on exactly that workload. A ceiling is a request for the other thing, and the worker
-prints a line saying so when both are set. The other default would have made the common case
-slow instead of making this case loose; no single number is right for both, which is why it is
-a flag.
+It did, and this draft said so for weeks before it was fixed: 824 MB under a 200 MB ceiling at
+the default hundred slots, against 841 MB for no recycling at all. A child is handed every slot
+at once, so a hundred tasks were dispatched while its RSS still read baseline and the ceiling
+was next consulted long after all hundred had allocated. The answer was not a smaller default.
+The supervisor now learns what a task costs in bytes — the same way it already learned what a
+spawn costs in milliseconds — and refuses to fill a slot the ceiling cannot afford. That row is
+123 MB now, and the flag it used to require you to know about is gone from this page.
+
+Worth stating plainly because the objection was real and the table carried it: a benchmark page
+that reports the case where your own defaults lose is how you find out they lose.
 
 **Just use `--max-tasks-per-child`.**
 Correct, when you know the bytes per task and they stay put — it bounds tighter than tarsk does
-in that case, 162 MB against 203. The second and third columns above are the same flag,
+in that case, 162 MB against 183. The second and third columns above are the same flag,
 unchanged, against a workload that moved.
 
 **Celery doesn't lose tasks, you configured it wrong.**
@@ -183,7 +188,7 @@ the same reason: an acknowledgement only helps if something survives to redelive
 
 **This is useless for I/O-bound work.**
 It was, when one slot per child was the only option. `--slots N` runs N tasks in one child, and
-500 tasks each awaiting 100 ms take 0.13s on 120 MB against taskiq's 0.21s on 226 MB — the same
+500 tasks each awaiting 100 ms take 0.14s on 119 MB against taskiq's 0.23s on 225 MB — the same
 concurrency model, in a smaller process, because the child still imports no broker driver. What
 it costs is the precision above.
 

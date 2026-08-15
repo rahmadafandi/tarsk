@@ -58,19 +58,20 @@ changes. From [`bench/`](bench/README.md), same configuration, different workloa
 | | leak 20MB/task | leak 40MB/task | payload-dependent 2–80MB |
 |---|---|---|---|
 | celery `--max-tasks-per-child=6` | **162 MB** | 282 MB | 327 MB |
-| tarsk `--max-rss=200MB --slots 1` | 203 MB | **223 MB** | **277 MB** |
+| tarsk `--max-rss=200MB --slots 1` | 183 MB | **183 MB** | **187 MB** |
 
 Celery wins the first column, and that is the honest result: when the leak per task is known
-and constant, dividing the budget by it works. It is the other two columns that tarsk was
-built for — nothing was reconfigured between them.
+and constant, dividing the budget by it works — someone divided 200 by 20 and typed 6. It is
+the other two columns that tarsk was built for: nothing was reconfigured between them, the
+workload moved, and the guess encoded in that 6 went with it.
 
 Recycling is also free, which it usually is not. A replacement child is started before the
 trigger fires, so the slot never goes empty:
 
 | | p50 gap | p99 gap | max gap |
 |---|---|---|---|
-| celery `--max-tasks-per-child=20` | 5.3 ms | 139 ms | 143 ms |
-| tarsk `--max-tasks=20` | 5.6 ms | 7 ms | **7 ms** |
+| celery `--max-tasks-per-child=20` | 5.4 ms | 139 ms | 140 ms |
+| tarsk `--max-tasks=20` | 5.7 ms | 7 ms | **7 ms** |
 | taskiq (no recycling at all) | 5.4 ms | 6 ms | 6 ms |
 
 And the worker that runs your code is smaller, because it imports your tasks and nothing else —
@@ -93,12 +94,12 @@ held by something that does not have the problem — which is also why Celery co
 one from a master carrying 77 MB of your dependencies.
 
 Draining 10,000 no-op tasks across four worker processes, same Redis and same at-least-once
-guarantee, startup excluded: Celery 7.8s, taskiq 1.8s, tarsk 1.7s. tarsk is ahead in every run
-and by 6%, which this project's own benchmark rules call a tie. It is not faster than taskiq;
+guarantee, startup excluded: Celery 10.0s, taskiq 2.3s, tarsk 2.2s. tarsk is ahead in every run
+and by 4%, which this project's own benchmark rules call a tie. It is not faster than taskiq;
 it starts in half the time and runs in half the memory.
 
 This file claimed a 1.45× lead until the numbers were checked on more than one machine. That
-figure came from a two-core runner; the same workflow on today's four-core runners reads 1.06×
+figure came from a two-core runner; two runs on today's four-core runners read 1.06× and 1.04×,
 and a 16-core laptop reads 1.1×. Full tables and the full retraction in
 [`bench/`](bench/README.md), measured on a GitHub Actions runner so anyone can reproduce them.
 
@@ -109,12 +110,13 @@ handler tarsk, Celery and taskiq all reach 19–20 tasks/s — identical, as the
 draws with taskiq on a no-op queue and starts in half the time, and anyone selling a task
 queue on either number is selling the wrong thing.
 
-**Not precise and concurrent at once.** `--slots 1` is what makes the ceiling exact — a child
-with nothing running cannot grow — and it is not the default. The default is 100, because most
-task queue work waits rather than allocates: 500 tasks each awaiting 100ms take 0.13s on
-120MB, against taskiq's 0.21s on 226MB and 12.5s for tarsk at one slot. The cost is the
-precision above — overshoot becomes the peak of whatever is in flight, not of one task. Set it
-to 1 for work that allocates.
+**Not precise and concurrent at once.** `--slots 1` is what makes the ceiling exact: a child
+with nothing running cannot grow, so overshoot is one task's peak. The default is 100, because
+most task queue work waits rather than allocates — 500 tasks each awaiting 100ms take 0.14s on
+119MB, against taskiq's 0.23s on 225MB and 12.5s for tarsk at one slot. Above one slot the
+overshoot is the peak of whatever is in flight rather than of one task, which is a real loss of
+precision. It is no longer a loss of the bound: the supervisor budgets slots against what a
+task costs, so the ceiling holds at any slot count.
 
 **Not a hard ceiling regardless of task size.** The ceiling is read while a child is idle, so a
 child never *starts* a task it cannot afford — but a handler that allocates 300MB will allocate
@@ -148,15 +150,19 @@ overshoot is bounded by a single task's peak. At 64 it is bounded by whatever 64
 holding, and a hard kill takes all 64 down together.
 
 **The default is 100 slots**, whatever else is set — taskiq's number, and tarsk is tuned out
-of the box for handlers that wait. 2,000 awaiting tasks with no flags at all drain in 0.94s on
-74MB, against taskiq's 1.23s on 145MB. The same default lets 40 tasks leaking 20MB each reach
-824MB under a `--max-rss=200MB` ceiling, where `--slots 1` holds them to 203MB: a hundred slots
-hands a child a hundred tasks before any of them has allocated anything, so the ceiling is
-first read long after the damage. **If your handlers allocate, set `--slots 1`.** One flag quietly changing another flag's default is worse
-than either number being wrong, so `--max-rss` does not move this one. What the worker does
-print, when a ceiling and several slots are both in play, is what that combination means: the
-ceiling still fires, but several tasks are running when it does, so overshoot is their peak
-rather than one task's.
+of the box for handlers that wait. 2,000 awaiting tasks with no flags at all drain in 0.96s on
+74MB, against taskiq's 1.31s on 145MB. The same default holds 40 tasks leaking 20MB each to
+123MB under a `--max-rss=200MB` ceiling, where `--slots 1` gives 183MB — lower at a hundred
+slots than at one, because a child holding several tasks climbs faster between two RSS readings
+and so meets the ceiling's projection sooner.
+
+**This used to be the flag you had to know about.** A hundred slots handed a child a hundred
+tasks before any of them had allocated anything, the ceiling was next read long after the
+damage, and that row said 824MB. The supervisor now learns what a task costs in bytes and
+refuses to fill a slot the ceiling cannot afford, so the same default fits both workloads
+without being told which one it is running. `--max-rss` still does not move `--slots`: one flag
+quietly changing another's default is worse than either number being wrong. It budgets against
+it instead.
 
 Raise it for handlers that *wait* and allocate little; set it to 1 for handlers that allocate,
 which is the case the ceiling exists for. For a mix, run one worker per queue rather than

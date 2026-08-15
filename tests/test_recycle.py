@@ -219,6 +219,63 @@ def test_middleware_wraps_and_dependencies_inject():
         os.environ.pop("TARSK_TRACE_LOG", None)
 
 
+def test_soft_timeout_asks_before_it_takes():
+    """Three handlers, three answers, one deadline pair.
+
+    The value is in the gap between being asked and being stopped, so all three
+    rows come from one run: what a handler does with the ask is the only thing
+    that differs.
+    """
+    sup = Supervisor("tests.soft_app:app", children=1)
+    results = sup.run([
+        ("tidies_up", (), {}),
+        ("stops_when_asked", (), {}),
+        ("ignores_the_ask", (), {}),
+    ])
+
+    # Cleaned up and returned in time: an ack, not a failure. The handler was
+    # asked and answered, which is the whole point of asking.
+    assert results[0] == ("ack", ["asked", "partial work kept"]), results[0]
+
+    # Let the cancellation through: reported as its own kind, not as the hard
+    # timeout, because "asked and stopped" is not "never asked".
+    assert results[1][0] == "nack", results[1]
+    assert results[1][1][0] == "SoftTimeout", results[1]
+
+    # Swallowed the ask: the hard timeout still takes it, and it is reported as
+    # a timeout rather than relabelled. A soft deadline is a request; the hard
+    # one is not, and a handler cannot talk its way out of the second.
+    assert results[2][0] == "nack", results[2]
+    assert results[2][1][0] == "TimeoutError", results[2]
+
+
+def test_soft_timeout_is_refused_where_it_cannot_work():
+    """Rejected at decoration rather than accepted and quietly ignored."""
+    from tarsk import App
+
+    probe = App(default_timeout=5, max_timeout=5)
+
+    # A thread cannot be interrupted, so there is nowhere to deliver the ask.
+    try:
+        @probe.task(name="sync_soft", timeout=4, soft_timeout=1)
+        def sync_soft():
+            pass
+    except ValueError as exc:
+        assert "async handler" in str(exc), exc
+    else:
+        raise AssertionError("a sync handler accepted a soft_timeout")
+
+    # A soft deadline at or past the hard one never fires.
+    try:
+        @probe.task(name="never_fires", timeout=4, soft_timeout=4)
+        async def never_fires():
+            pass
+    except ValueError as exc:
+        assert "never fire" in str(exc), exc
+    else:
+        raise AssertionError("soft_timeout >= timeout was accepted")
+
+
 if __name__ == "__main__":
     for check in (test_leaky_handler_is_bounded, test_recycling_is_overlapped,
                   test_baseline_above_ceiling_is_refused,
@@ -226,6 +283,8 @@ if __name__ == "__main__":
                   test_hard_ceiling_must_exceed_the_soft_one,
                   test_hooks_bracket_every_worker,
                   test_middleware_wraps_and_dependencies_inject,
-                  test_before_send_can_attach_to_the_payload):
+                  test_before_send_can_attach_to_the_payload,
+                  test_soft_timeout_asks_before_it_takes,
+                  test_soft_timeout_is_refused_where_it_cannot_work):
         check()
         print("ok", check.__name__)

@@ -234,6 +234,42 @@ blocks it until the inner layers finish, so a plain `with` block wraps the task 
 looks like it should. That costs a thread for the length of the task — the same trade sync
 handlers already make.
 
+## Being asked before being stopped
+
+```python
+@app.task(timeout=30, soft_timeout=25)
+async def render(doc_id: str, ctx=Depends(Context)):
+    try:
+        return await slow_work(doc_id)
+    except asyncio.CancelledError:
+        if ctx.soft_expired:
+            save_partial(doc_id)      # five seconds to get this out
+        raise
+```
+
+`timeout` stops a task. `soft_timeout` asks it to stop first, leaving the gap between the two
+to save partial work, release something, or raise `Retry` to hand the job back. Ignore the ask
+and `timeout` takes it anyway — the soft one is a request, not a second enforcer.
+
+**The handler catches `asyncio.CancelledError`, not a tarsk exception.** Asking is cancellation,
+and asyncio gives no way to raise a type of your choosing into a running coroutine; anything
+else here would be describing a different runtime. `ctx.soft_expired` is what separates a passed
+deadline from a worker shutting down, which is the distinction worth acting on. The job is
+reported as `SoftTimeout` so a dead letter says it ran long rather than that it was stopped
+cold.
+
+Two limits, stated because both are real:
+
+- **Async handlers only.** A sync handler runs in a thread that cannot be interrupted, so there
+  is nowhere to deliver the ask. `soft_timeout` on one is a startup error rather than a flag
+  that silently does nothing.
+- **A sync middleware swallows the ask.** It runs in a thread holding a blocking call into the
+  loop, so the cancellation lands on the middleware and the handler never sees it. The job is
+  still reported as `SoftTimeout`; the handler just never got its chance.
+
+`soft_timeout` must be less than `timeout`, checked at startup, because one at or past it would
+never fire.
+
 Everything else takes either kind too. Handlers, `on_start`, `on_stop` and `Depends` providers
 may be sync or async, but only sync *handlers* and sync *middleware* are moved to a thread. A
 sync hook or provider runs on the worker's event loop, which is harmless while a worker runs
@@ -664,7 +700,6 @@ checked rather than believed.
 - No chord. `chain` and `group` are here; fanning back in to a callback is not
 - No strict priority. A worker reads `--queues high,low` in that order within one claim, which
   prefers the first without being a priority queue
-- No soft timeout — a task is stopped at its deadline rather than warned before it
 - Windows runs the suites that need no broker, since neither Redis nor Postgres ships for it.
   Everything else — the channel, recycling, the memory ceiling — is tested there
 

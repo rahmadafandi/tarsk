@@ -65,9 +65,10 @@ Redis Streams and Postgres brokers, per-task leases, retries with backoff, a
 dead-letter store you can read and replay from the CLI, opt-in results with a
 required TTL, UTC cron elected through the broker, chains and groups, rate limits
 and concurrency caps held in the broker rather than per worker, cancellation,
-expiry, send deduplication, an async producer, and a Prometheus endpoint that
-reports queue depth and the supervisor's own RSS so both constants can be checked
-rather than believed.
+expiry, send deduplication, soft timeouts that ask a handler to stop before the
+hard one takes it, an async producer, and a Prometheus endpoint that reports
+queue depth and the supervisor's own RSS so both constants can be checked rather
+than believed.
 
 Pre-release: no published wheel yet. Linux, macOS and Windows, all three tested
 in CI on 3.11 through 3.14 including the free-threaded build.
@@ -233,7 +234,6 @@ gets the byte budget without the handover, which is the 139 ms column.
 
 - Not on PyPI yet — the wheel builds and installs, it just has not been uploaded
 - No chord; chains and groups are there, fanning back in is not
-- No soft timeout — a task is stopped at its deadline rather than warned before it
 - No strict priority. `--queues high,low` prefers the first within a read, which is not a
   priority queue
 

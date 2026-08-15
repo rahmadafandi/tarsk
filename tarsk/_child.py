@@ -14,7 +14,7 @@ import os
 import sys
 import traceback
 
-from . import Context, Reject, Retry, Task, load_app
+from . import Context, Reject, Retry, SoftTimeout, Task, load_app
 from . import _proto
 
 # Distinct exit code so the supervisor can tell "recycled after a sync timeout"
@@ -70,7 +70,73 @@ async def _call(app, task: Task, ctx: Context, args: list, kwargs: dict):
     for middleware in reversed(app.middlewares):
         if hasattr(middleware, "execute"):
             chain = functools.partial(_layer, middleware, ctx, chain)
-    return await asyncio.wait_for(chain(), task.spec.timeout_ms / 1000)
+    hard = task.spec.timeout_ms / 1000
+    soft = task.spec.soft_timeout_ms / 1000
+    if not soft:
+        return await asyncio.wait_for(chain(), hard)
+    return await _both_deadlines(chain, ctx, soft, hard)
+
+
+async def _both_deadlines(chain, ctx: Context, soft: float, hard: float):
+    """Run the work under two deadlines, and report which one stopped it.
+
+    Cancellation is the only lever asyncio gives for interrupting a coroutine,
+    so the handler sees `CancelledError` and not a type of our choosing. What
+    this adds is the reason: `ctx.soft_expired` is set before the cancel lands,
+    so a handler cleaning up can tell a passed deadline from a worker shutting
+    down, and the exception raised afterwards names which deadline it was.
+
+    Both timers rather than wrapping this in `wait_for`. Nested, the hard
+    timeout cancels *this* coroutine while `asked` is already true, so a job
+    stopped without warning would be reported as one that had been asked — and
+    converting that cancellation into an exception swallows the cancellation
+    `wait_for` is relying on. One task, two timers, one place that cancels it.
+
+    The hard deadline still applies to a handler that swallows the ask: the
+    soft one is a request, not a second enforcer. Two handlers neither deadline
+    reaches, both for the same reason and neither new here. One that swallows
+    *every* cancellation, looping on `except CancelledError: pass`, outlives
+    both timers — asyncio has no lever past cancellation, and `wait_for` waits
+    on the task it cancelled, so that handler hung the same way before there
+    was a soft deadline. And a sync middleware anywhere in the chain runs in a
+    thread holding a blocking call into the loop, so the cancellation lands on
+    the middleware: the job is reported as a soft timeout without the handler
+    ever getting the chance the name promises.
+    """
+    running = asyncio.ensure_future(chain())
+    fired = ""
+
+    def ask() -> None:
+        nonlocal fired
+        fired = "soft"
+        # Context is frozen so handlers cannot rewrite their own call. This is
+        # the worker writing to it, which is the one exception, and it happens
+        # before the cancel so the flag is already true when the handler wakes
+        # up inside its except block.
+        object.__setattr__(ctx, "soft_expired", True)
+        running.cancel()
+
+    def take() -> None:
+        nonlocal fired
+        fired = "hard"
+        running.cancel()
+
+    loop = asyncio.get_running_loop()
+    timers = (loop.call_later(soft, ask), loop.call_later(hard, take))
+    try:
+        # A handler that catches the cancellation and returns anyway lands
+        # here with a value: it was asked, it tidied up, it finished in time.
+        # That is the whole point of asking, so it is not an error.
+        return await running
+    except asyncio.CancelledError:
+        if fired == "hard":
+            raise TimeoutError(f"exceeded timeout of {hard}s") from None
+        if fired == "soft":
+            raise SoftTimeout(f"exceeded soft_timeout of {soft}s") from None
+        raise  # the worker is going down, not a deadline
+    finally:
+        for timer in timers:
+            timer.cancel()
 
 
 async def _layer(middleware, ctx: Context, nxt):
@@ -165,6 +231,11 @@ async def _one(app, wire: Wire, app_spec: str, task_id: int, name: str, payload,
             _emit=emit,
         )
         result = await _call(app, task, ctx, call_args, call_kwargs)
+    except SoftTimeout as exc:
+        # Its own outcome rather than folded into TimeoutError: the two say
+        # different things about the handler. This one was asked and stopped
+        # anyway; the other was never asked.
+        await wire.send("Nack", task_id, "SoftTimeout", f"{type(exc).__name__}: {exc}", "", 0)
     except Reject as exc:
         # The handler knows this will never work. Skip the remaining attempts
         # rather than spending them to reach the same answer.

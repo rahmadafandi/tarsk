@@ -20,8 +20,8 @@ from dataclasses import dataclass, field
 
 __all__ = [
     "App", "AsyncResult", "Chain", "Context", "Depends", "Group", "Signature",
-    "Task", "TaskFailed", "TaskSpec", "Reject", "Retry", "chain", "group",
-    "load_app",
+    "Task", "TaskFailed", "TaskSpec", "Reject", "Retry", "SoftTimeout",
+    "chain", "group", "load_app",
 ]
 
 DEFAULT_TIMEOUT = 300.0  # seconds — spec §9, doubles as the hard cap
@@ -53,8 +53,13 @@ class TaskSpec:
     max_concurrency: int = 0
     # Milliseconds during which an identical send is dropped. Zero is off.
     unique_ms: int = 0
-    # Milliseconds during which an identical send is dropped. Zero is off.
-    unique_ms: int = 0
+    # Milliseconds after which the handler is asked to stop, before `timeout_ms`
+    # takes the choice away. Zero is off. The supervisor ignores this one — it
+    # is enforced entirely in the child, which has the spec because it imported
+    # your app — but it still crosses in `as_row`, because that row is also the
+    # registry's identity and a child running a different soft timeout is a
+    # child running different code.
+    soft_timeout_ms: int = 0
 
     def as_row(self) -> list:
         """Positional form that crosses the wire (spec §4.2)."""
@@ -70,6 +75,7 @@ class TaskSpec:
             self.rate_burst,
             self.expires_ms,
             self.max_concurrency,
+            self.soft_timeout_ms,
         ]
 
 
@@ -89,6 +95,11 @@ class Context:
     #: Carried beside the arguments rather than inside them, so a listing can
     #: read it without unpacking a call it does not understand.
     meta: dict = field(default_factory=dict)
+    #: True once `soft_timeout` has fired for this call. Readable from a
+    #: handler's `except asyncio.CancelledError` or `finally`, where it is the
+    #: difference between "my deadline passed" and "the worker is shutting
+    #: down" — two cancellations that want different cleanup.
+    soft_expired: bool = False
     #: Set by the worker. Sends progress to the supervisor, which is the only
     #: process here holding a broker connection (spec §4.1).
     _emit: object = None
@@ -330,6 +341,7 @@ class App:
         expires: float = 0.0,
         max_concurrency: int = 0,
         unique: float = 0.0,
+        soft_timeout: float = 0.0,
     ):
         def decorate(fn):
             t = self.default_timeout if timeout is None else timeout
@@ -362,10 +374,31 @@ class App:
             per_sec, burst = parse_rate(rate_limit) if rate_limit else (0.0, 0)
             if expires < 0:
                 raise ValueError(f"{fn.__qualname__}: expires must not be negative")
+            if soft_timeout < 0:
+                raise ValueError(f"{fn.__qualname__}: soft_timeout must not be negative")
+            # A soft timeout at or past the hard one never fires, which would be
+            # a flag that reads as configured and does nothing. Caught here so
+            # the author sees it rather than a handler that is never asked to
+            # stop before it is stopped.
+            if soft_timeout and soft_timeout >= t:
+                raise ValueError(
+                    f"{fn.__qualname__}: soft_timeout={soft_timeout}s must be less than "
+                    f"timeout={t}s, or it would never fire"
+                )
+            if soft_timeout and not inspect.iscoroutinefunction(fn):
+                # A Python thread cannot be interrupted (spec §4.5), so there is
+                # nowhere to raise this. Refusing beats accepting a flag that
+                # silently does nothing for the handler that asked for it.
+                raise ValueError(
+                    f"{fn.__qualname__}: soft_timeout needs an async handler. A sync "
+                    f"handler runs in a thread that cannot be interrupted, so nothing "
+                    f"can ask it to stop early."
+                )
             spec = TaskSpec(
                 task_name, int(t * 1000), retries, backoff, queue,
                 int(result_ttl * 1000), cron, per_sec, burst, int(expires * 1000),
                 max(0, max_concurrency), int(max(0.0, unique) * 1000),
+                int(soft_timeout * 1000),
             )
             task = Task(fn, spec, self)
             self.registry[task_name] = task
@@ -630,6 +663,22 @@ def load_app(spec: str) -> App:
     if not isinstance(app, App):
         raise TypeError(f"{spec} is {type(app).__name__}, not an App")
     return app
+
+
+class SoftTimeout(Exception):
+    """How a job that ran past its `soft_timeout` is reported.
+
+    **A handler does not catch this.** The mechanism is cancellation, so what
+    arrives inside the handler is `asyncio.CancelledError` — asyncio offers no
+    way to raise a chosen type into a running coroutine, and a docstring
+    promising otherwise would be describing a different runtime. Clean up in
+    `except asyncio.CancelledError` or `finally`, and read `ctx.soft_expired`
+    there to tell a passed deadline from a worker shutting down.
+
+    This type is what the supervisor and the dead-letter store see, so a job
+    that ran too long is distinguishable from one stopped at `timeout` without
+    ever being asked.
+    """
 
 
 class Reject(Exception):

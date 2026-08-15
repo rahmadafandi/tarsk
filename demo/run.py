@@ -1,11 +1,17 @@
 """The demo spec §6 calls the definition of done.
 
 A leaky handler runs for as long as you ask, against a real broker, under a
-configured RSS ceiling. It ends by answering three questions: did the worker
-stay under the ceiling, did the sawtooth look like a sawtooth, and did anything
-get lost. The trace comes from the supervisor's own /metrics endpoint, so the
-picture is what tarsk claims about itself rather than an outside measurement
-that agrees with it.
+configured RSS ceiling. It ends by answering four questions: did the worker stay
+under the ceiling, did the sawtooth look like a sawtooth, did anything get lost,
+and did the supervisor itself stay put. The trace comes from the supervisor's own
+/metrics endpoint, so the picture is what tarsk claims about itself rather than an
+outside measurement that agrees with it.
+
+The fourth question is the one this project had left unproven the longest. A
+memory ceiling has to be held from outside the process that might grow, and the
+whole design rests on the holder not having the same problem — but the trace only
+ever recorded the children. It records both now, and the run fails if the
+supervisor drifts.
 
     python demo/run.py --minutes 60 --ceiling 400MB --rate 20
 """
@@ -18,6 +24,7 @@ import random
 import shutil
 import signal
 import socket
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -31,6 +38,12 @@ os.chdir(ROOT)
 from tarsk._cli import parse_size  # noqa: E402
 
 MB = 1024 * 1024
+
+# How much the supervisor may drift across a run before it counts as growth.
+# Generous on purpose: RSS moves with allocator behaviour and page-cache luck,
+# and a gate that fails on noise gets switched off. A real leak proportional to
+# tasks clears this many times over — an hour at 20 tasks/s is 72,000 of them.
+SUPERVISOR_DRIFT = 1.25
 
 
 def free_port() -> int:
@@ -62,14 +75,19 @@ def scrape(port: int) -> dict[str, float]:
     return out
 
 
-def svg(samples: list[tuple[float, float]], ceiling: float, path: Path) -> None:
-    """Hand-drawn because a plotting dependency for one polyline is not a trade."""
+def svg(samples: list[tuple[float, float, float]], ceiling: float, path: Path) -> None:
+    """Hand-drawn because a plotting dependency for two polylines is not a trade."""
     width, height, pad = 1000, 320, 40
     span = max(samples[-1][0], 1.0)
-    top = max(ceiling, max(rss for _, rss in samples)) * 1.1
+    top = max(ceiling, max(rss for _, rss, _ in samples)) * 1.1
     x = lambda t: pad + (width - 2 * pad) * t / span
     y = lambda v: height - pad - (height - 2 * pad) * v / top
-    points = " ".join(f"{x(t):.1f},{y(v):.1f}" for t, v in samples)
+    child = " ".join(f"{x(t):.1f},{y(v):.1f}" for t, v, _ in samples)
+    # Drawn on the same axis as the children rather than given its own scale.
+    # A second scale would make a flat 10MB line look like the sawtooth beside
+    # it, which is the one impression this trace exists to rule out.
+    boss = " ".join(f"{x(t):.1f},{y(v):.1f}" for t, _, v in samples)
+    boss_now = samples[-1][2]
     ceil_y = y(ceiling)
     ticks = "".join(
         f'<text x="{x(span * i / 5):.0f}" y="{height - pad + 16}" font-size="11" '
@@ -83,21 +101,42 @@ def svg(samples: list[tuple[float, float]], ceiling: float, path: Path) -> None:
         f'stroke="#c00" stroke-width="1.5" stroke-dasharray="6 4"/>'
         f'<text x="{width - pad}" y="{ceil_y - 6:.1f}" font-size="12" text-anchor="end" '
         f'fill="#c00">ceiling {ceiling / MB:.0f} MB</text>'
-        f'<polyline fill="none" stroke="#0a6" stroke-width="1.5" points="{points}"/>'
+        f'<polyline fill="none" stroke="#0a6" stroke-width="1.5" points="{child}"/>'
+        f'<polyline fill="none" stroke="#06c" stroke-width="1.5" points="{boss}"/>'
+        f'<text x="{width - pad}" y="{y(boss_now) - 6:.1f}" font-size="12" '
+        f'text-anchor="end" fill="#06c">supervisor {boss_now / MB:.1f} MB</text>'
         f'<line x1="{pad}" y1="{height - pad}" x2="{width - pad}" y2="{height - pad}" '
         f'stroke="#999"/>{ticks}'
         f'<text x="{pad}" y="{pad - 14}" font-size="13" fill="#333">'
-        f'child RSS under a leaky handler</text></svg>'
+        f'child RSS under a leaky handler, and the supervisor holding it</text></svg>'
     )
 
 
-def sparkline(samples: list[tuple[float, float]], ceiling: float) -> str:
+def sparkline(samples: list[tuple[float, float, float]], ceiling: float) -> str:
     blocks = "▁▂▃▄▅▆▇█"
     if not samples:
         return ""
     step = max(1, len(samples) // 100)
     picked = samples[::step]
-    return "".join(blocks[min(7, int(v / ceiling * 7))] for _, v in picked)
+    return "".join(blocks[min(7, int(v / ceiling * 7))] for _, v, _ in picked)
+
+
+def drift(values: list[float]) -> tuple[float, float]:
+    """Median of the first half against the second, warm-up discarded.
+
+    Halves rather than endpoints because RSS is noisy and one unlucky sample at
+    either end would decide the answer. The first fifth is dropped: children are
+    still being spawned and broker connections opened, and a supervisor that has
+    not finished starting is not yet the thing being measured.
+
+    Returns (0, 0) when there is too little to judge, which the caller reports
+    rather than passing.
+    """
+    warm = values[len(values) // 5:]
+    if len(warm) < 8:
+        return (0.0, 0.0)
+    half = len(warm) // 2
+    return statistics.median(warm[:half]), statistics.median(warm[half:])
 
 
 def main() -> int:
@@ -149,7 +188,7 @@ def main() -> int:
     ingest = app.registry["ingest"]
 
     rng = random.Random(20260813)
-    samples: list[tuple[float, float]] = []
+    samples: list[tuple[float, float, float]] = []
     started = time.time()
     deadline = started + args.minutes * 60
     sent = 0
@@ -166,7 +205,11 @@ def main() -> int:
             if now >= next_sample:
                 metrics = scrape(metrics_port)
                 if metrics:
-                    samples.append((now - started, metrics.get("tarsk_child_rss_bytes_max", 0)))
+                    samples.append((
+                        now - started,
+                        metrics.get("tarsk_child_rss_bytes_max", 0),
+                        metrics.get("tarsk_supervisor_rss_bytes", 0),
+                    ))
                 next_sample += 1.0
             time.sleep(max(0.0, min(next_send, next_sample) - time.time()))
 
@@ -177,7 +220,11 @@ def main() -> int:
                 break
             metrics = scrape(metrics_port)
             if metrics:
-                samples.append((time.time() - started, metrics.get("tarsk_child_rss_bytes_max", 0)))
+                samples.append((
+                    time.time() - started,
+                    metrics.get("tarsk_child_rss_bytes_max", 0),
+                    metrics.get("tarsk_supervisor_rss_bytes", 0),
+                ))
             time.sleep(1.0)
         final = scrape(metrics_port)
     finally:
@@ -190,9 +237,12 @@ def main() -> int:
         redis.wait()
 
     done = {line for line in log.read_text().splitlines() if line}
-    peak = max((rss for _, rss in samples), default=0)
+    peak = max((rss for _, rss, _ in samples), default=0)
+    boss = [rss for _, _, rss in samples]
+    boss_first, boss_last = drift(boss)
     (args.out / "trace.csv").write_text(
-        "seconds,child_rss_bytes\n" + "".join(f"{t:.1f},{int(v)}\n" for t, v in samples)
+        "seconds,child_rss_bytes,supervisor_rss_bytes\n"
+        + "".join(f"{t:.1f},{int(c)},{int(b)}\n" for t, c, b in samples)
     )
     if samples:
         svg(samples, args.ceiling, args.out / "trace.svg")
@@ -206,6 +256,13 @@ def main() -> int:
     print(f"  leak per task      {args.leak_min_kb}-{args.leak_max_kb} KB")
     print(f"  ceiling            {args.ceiling / MB:.0f} MB")
     print(f"  peak child RSS     {peak / MB:.0f} MB")
+    if boss_first:
+        print(f"  supervisor RSS     {min(boss) / MB:.1f}-{max(boss) / MB:.1f} MB, "
+              f"drift {boss_first / MB:.1f} -> {boss_last / MB:.1f} MB "
+              f"({(boss_last / boss_first - 1) * 100:+.1f}%)")
+    else:
+        print(f"  supervisor RSS     {max(boss, default=0) / MB:.1f} MB, "
+              f"too few samples to judge drift")
     print(f"  recycles           {recycles} ({prewarmed} handed over pre-warmed)")
     print(f"  killed             {int(final.get('tarsk_children_killed_total', 0))}")
     print(f"  crashed            {int(final.get('tarsk_children_crashed_total', 0))}")
@@ -214,8 +271,20 @@ def main() -> int:
     print(f"  tasks completed    {len(done)}")
     print(f"  lost               {sent - len(done)}")
     print(f"  trace              {args.out}/trace.csv, {args.out}/trace.svg")
+
+    # The ceiling is held from outside the process that grows, so the holder not
+    # growing is half the design and was the half never checked. A ratio rather
+    # than a byte count because this runs on a laptop and on a two-core runner
+    # and the absolute number differs between them; the shape does not.
+    crept = bool(boss_first) and boss_last > boss_first * SUPERVISOR_DRIFT
+    if crept:
+        print()
+        print(f"  FAILED: the supervisor grew {(boss_last / boss_first - 1) * 100:.1f}% "
+              f"over the run, past the {(SUPERVISOR_DRIFT - 1) * 100:.0f}% this allows. "
+              f"A ceiling held by something that leaks defers the problem rather than "
+              f"solving it.")
     shutil.rmtree(workdir, ignore_errors=True)
-    return 0 if len(done) == sent else 1
+    return 0 if len(done) == sent and not crept else 1
 
 
 if __name__ == "__main__":

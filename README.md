@@ -40,11 +40,18 @@ tarsk worker --app myapp:app --broker redis://localhost:6379/0 \
 **Handlers must be idempotent.** Delivery is at-least-once. This is a contract, not a footnote:
 a worker killed mid-task will run that task again.
 
-![child RSS over one hour under a leaky handler](demo/one-hour.svg)
+![child RSS over one hour under a leaky handler, and the supervisor holding it](demo/one-hour.svg)
 
 One hour, 72,001 tasks, a handler that never frees anything. 66 recycles, peak 400 MB against a
-400 MB ceiling, nothing killed, nothing lost. Reproduce with `python demo/run.py`; the full
-write-up, including the columns where tarsk loses, is in [demo/show-hn.md](demo/show-hn.md).
+400 MB ceiling, no sample over it, nothing killed, nothing lost.
+
+Both constants are on that chart. The sawtooth is the children being held under the ceiling;
+the flat line beneath it, on the same axis, is the supervisor doing the holding — 28.32 to
+28.40 MB across the hour, a drift of 82 KB. A ceiling enforced from inside a process with the
+same problem would only defer it, so the enforcer staying put is half the design and it used to
+be the untraced half. `python demo/run.py` reproduces both and now exits non-zero if the
+supervisor drifts; the full write-up, including the columns where tarsk loses, is in
+[demo/show-hn.md](demo/show-hn.md).
 
 ## What it does that others do not
 

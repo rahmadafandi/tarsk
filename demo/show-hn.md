@@ -31,8 +31,11 @@ the slot never goes empty. Children import your task modules and nothing else --
 broker driver, no scheduler -- so a worker is 27 MB against Celery's 41 MB.
 
 One hour, 72,001 tasks, a handler that frees nothing: 66 recycles, peak 400 MB
-against a 400 MB ceiling, zero tasks lost, nothing killed. The trough held at 27.9 MB
-over the first half hour and 28.1 MB over the second, so nothing survives a recycle.
+against a 400 MB ceiling, zero samples over it, zero tasks lost, nothing killed.
+The trough held at 28.5 MB over the first half hour and 28.6 MB over the second, so
+nothing survives a recycle. The supervisor enforcing all of that moved 82 KB across
+the hour -- 28.32 to 28.40 MB -- which matters because a ceiling held from inside a
+process with the same problem would only defer it.
 
 That run used --slots 1. The default is 100 tasks in flight per child, and it used
 to be a trap: the same 40 leaky tasks peaked at 824 MB under a 200 MB ceiling,
@@ -45,9 +48,9 @@ precision: overshoot is the peak of whatever is in flight, not of one task.
 
 What it does not claim: speed. An earlier draft of this claimed 1.45x over taskiq
 on a no-op queue. That was measured on a two-core runner; those runners now have
-four cores and the same workflow on the same commit reads 1.06x, and a sixteen-core
-laptop reads 1.1x. tarsk is ahead in every run and by 6%, which is a tie by the
-rule at the bottom of this page. With a 50 ms handler all three reach 20 tasks/s,
+four cores and two runs on them read 1.06x and 1.04x, and a sixteen-core laptop
+reads 1.1x. tarsk is ahead in every run and by 4%, which is a tie by the rule at
+the bottom of this page. With a 50 ms handler all three reach 20 tasks/s,
 identical, as they should be. What is not a tie is startup, 0.20s against 0.42s,
 and footprint, everywhere on this page. Nor is the ceiling absolute: it is read between
 tasks, so a child never starts one it cannot afford, but a handler that allocates
@@ -74,10 +77,12 @@ in CI on 3.11 through 3.14 including the free-threaded build.
 
 ## The trace
 
-![child RSS over one hour under a leaky handler](one-hour.svg)
+![child RSS over one hour under a leaky handler, and the supervisor holding it](one-hour.svg)
 
 One hour at 20 tasks/s, leak 100–600 KB per task, `--slots 1`, sampled once a second from the
-supervisor's own `/metrics`.
+supervisor's own `/metrics`. Two lines on one axis: the children sawtoothing under the ceiling,
+and the process enforcing it. The second line is flat against the same scale, which is the
+point of drawing them together rather than giving the small one a scale that flatters it.
 
 | | |
 |---|---|
@@ -86,11 +91,19 @@ supervisor's own `/metrics`.
 | peak child RSS | 400 MB against a 400 MB ceiling |
 | recycles | 66, all handed over pre-warmed |
 | killed / crashed | 0 / 0 |
-| trough drift | 27.9 MB → 28.1 MB |
-| samples above the ceiling | 1 of 3,599 |
+| trough drift | 28.5 MB → 28.6 MB |
+| samples above the ceiling | **0** of 3,599 |
+| supervisor RSS | 28.32 – 28.40 MB, drift **+0.1%** |
 
 The flat trough is the part that needed an hour. A baseline creeping from 28 MB toward 50 would
 mean something survives each recycle and the ceiling is only deferring the leak.
+
+**The supervisor line is the half that went unchecked the longest.** A ceiling has to be held
+from outside the process that grows, so the whole design rests on the holder not having the
+problem — and the trace recorded only the children, which is to say it measured the claim and
+not the assumption underneath it. Over 72,001 tasks the enforcing process moved 82 KB, between
+28.32 and 28.40 MB. `demo/run.py` now exits non-zero if it drifts more than 25%, so CI checks
+this on every push rather than once when someone thinks to look.
 
 ---
 
@@ -221,8 +234,6 @@ gets the byte budget without the handover, which is the 139 ms column.
 - Not on PyPI yet — the wheel builds and installs, it just has not been uploaded
 - No chord; chains and groups are there, fanning back in is not
 - No soft timeout — a task is stopped at its deadline rather than warned before it
-- The hour-long trace records child RSS but not the supervisor's own gauge — the other constant
-  this project claims, still unproven at that length
 - No strict priority. `--queues high,low` prefers the first within a read, which is not a
   priority queue
 

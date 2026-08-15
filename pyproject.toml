@@ -32,6 +32,7 @@ classifiers = [
 [project.urls]
 Homepage = "https://github.com/rahmadafandi/tarsk"
 Source = "https://github.com/rahmadafandi/tarsk"
+Documentation = "https://rahmadafandi.github.io/tarsk/"
 Issues = "https://github.com/rahmadafandi/tarsk/issues"
 
 [project.scripts]

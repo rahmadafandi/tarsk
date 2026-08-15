@@ -47,6 +47,12 @@ pub struct NewJob {
     /// from a listing. Never parsed here: the supervisor has no business
     /// knowing what a trace id looks like.
     pub meta: Vec<u8>,
+    /// Milliseconds this job may wait after becoming runnable before it is
+    /// dropped instead of run. Zero defers to the task's registered `expires`,
+    /// which is itself zero by default. Per job rather than per task because
+    /// staleness is a property of the request: the nightly rebuild can wait an
+    /// hour, the same task fired from a page load cannot.
+    pub expires_ms: u64,
     /// msgpack list of the steps still to run after this one, each
     /// `[id, name, payload, timeout_ms, queue, feed]`. Empty for a lone job.
     ///
@@ -95,6 +101,9 @@ pub struct Delivery {
     /// enters the stream when the sweep promotes it. Zero means unknown, which
     /// no expiry check treats as expired.
     pub ready_at_ms: u64,
+    /// What this particular send asked for. See `NewJob::expires_ms`. Zero
+    /// means the sender did not say, and the task's registration decides.
+    pub expires_ms: u64,
 }
 
 /// How much work is sitting in one queue, as an operator needs to see it.
@@ -556,6 +565,7 @@ impl MemoryBroker {
             receipt: Receipt::Memory { id },
             id: job.id.clone(),
             ready_at_ms: 0,
+            expires_ms: job.expires_ms,
             chain: job.chain.clone(),
             meta: job.meta.clone(),
         })
@@ -691,6 +701,12 @@ fn entry_fields(entry: &redis::streams::StreamId) -> (String, Vec<u8>, u64) {
     )
 }
 
+/// Absent on jobs written before this field existed, which reads as zero and
+/// means the registration decides — the behaviour those jobs were queued with.
+fn entry_expires(entry: &redis::streams::StreamId) -> u64 {
+    entry.get("x").unwrap_or(0)
+}
+
 fn entry_id(entry: &redis::streams::StreamId) -> String {
     entry.get("i").unwrap_or_default()
 }
@@ -773,6 +789,8 @@ impl RedisBroker {
                 .arg(&job.chain)
                 .arg("m")
                 .arg(&job.meta)
+                .arg("x")
+                .arg(job.expires_ms)
                 .query_async(&mut conn)
                 .await?;
             return Ok(());
@@ -799,6 +817,12 @@ impl RedisBroker {
             .arg(job.timeout_ms)
             .arg("i")
             .arg(&job.id)
+            .arg("c")
+            .arg(&job.chain)
+            .arg("m")
+            .arg(&job.meta)
+            .arg("x")
+            .arg(job.expires_ms)
             .cmd("ZADD")
             .arg(&key)
             .arg(due)
@@ -926,6 +950,7 @@ impl RedisBroker {
                     payload,
                     attempt: entry.delivered_count.unwrap_or(1) as u32,
                     ready_at_ms: stream_id_ms(&entry.id),
+                    expires_ms: entry_expires(&entry),
                     chain: entry.get("c").unwrap_or_default(),
                     meta: entry.get("m").unwrap_or_default(),
                     receipt: Receipt::Redis {
@@ -1522,6 +1547,7 @@ impl RedisBroker {
                         payload,
                         attempt: candidate.times_delivered as u32 + 1,
                         ready_at_ms: stream_id_ms(&candidate.id),
+                        expires_ms: entry_expires(entry),
                         chain: entry.get("c").unwrap_or_default(),
                         meta: entry.get("m").unwrap_or_default(),
                         receipt: Receipt::Redis {
@@ -1616,6 +1642,7 @@ create index if not exists tarsk_revoked_expiry on tarsk_revoked (expires_at);
 alter table tarsk_jobs add column if not exists chain      bytea;
 alter table tarsk_jobs add column if not exists claimed_by text;
 alter table tarsk_jobs add column if not exists meta       bytea;
+alter table tarsk_jobs add column if not exists expires_ms bigint not null default 0;
 alter table tarsk_dead add column if not exists job_id     text;
 alter table tarsk_dead add column if not exists timeout_ms integer not null default 0;
 ";
@@ -1643,7 +1670,7 @@ update tarsk_jobs set
 from picked
 where tarsk_jobs.id = picked.id
 returning tarsk_jobs.id, name, payload, attempt, run_lease, job_id, picked.ready_at,
-          chain, meta
+          chain, meta, expires_ms
 ";
 
 pub struct PgBroker {
@@ -1699,10 +1726,11 @@ impl PgBroker {
         self.client
             .execute(
                 "insert into tarsk_jobs
-                     (job_id, queue, name, payload, timeout_ms, lease_until, chain, meta)
+                     (job_id, queue, name, payload, timeout_ms, lease_until, chain, meta,
+                      expires_ms)
                  values ($6, $1, $2, $3, $4, case when $5::double precision > 0
                      then now() + make_interval(secs => $5::double precision) else null end,
-                     $7, $8)",
+                     $7, $8, $9)",
                 &[
                     &job.queue,
                     &job.name,
@@ -1712,6 +1740,7 @@ impl PgBroker {
                     &job.id,
                     &job.chain,
                     &job.meta,
+                    &(job.expires_ms as i64),
                 ],
             )
             .await?;
@@ -1746,6 +1775,7 @@ impl PgBroker {
                         .unwrap_or(0),
                     chain: row.get::<_, Option<Vec<u8>>>(7).unwrap_or_default(),
                     meta: row.get::<_, Option<Vec<u8>>>(8).unwrap_or_default(),
+                    expires_ms: row.get::<_, i64>(9).max(0) as u64,
                     receipt: Receipt::Postgres {
                         row: row.get(0),
                         run_lease,

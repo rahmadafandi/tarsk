@@ -65,8 +65,9 @@ Redis Streams and Postgres brokers, per-task leases, retries with backoff, a
 dead-letter store you can read and replay from the CLI, opt-in results with a
 required TTL, UTC cron elected through the broker, chains and groups, rate limits
 and concurrency caps held in the broker rather than per worker, cancellation,
-expiry, send deduplication, soft timeouts that ask a handler to stop before the
-hard one takes it, an async producer, and a Prometheus endpoint that reports
+expiry per task or per send, deduplication, soft timeouts that ask a handler to
+stop before the hard one takes it, an async producer, and a Prometheus endpoint
+that reports
 queue depth and the supervisor's own RSS so both constants can be checked rather
 than believed.
 

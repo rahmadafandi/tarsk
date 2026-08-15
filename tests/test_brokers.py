@@ -620,6 +620,51 @@ def check_broker(url: str, label: str) -> None:
         assert "fresh" in ran, f"{label}: the fresh job did not run: {ran}"
         assert "stale" not in ran, f"{label}: a job three seconds past expires=2 still ran"
 
+        # --- expires per send, not only per registration ------------------
+        #
+        # `durable` registers none, so anything dropped here was dropped by
+        # what the caller asked for. Three sends, one worker start: the only
+        # difference between them is the deadline each one carried.
+        log.write_text("")
+        app.registry["durable"].options(expires=1).send("asked-and-stale")
+        app.registry["durable"].send("no-deadline")
+        app.registry["durable"].options(expires=60).send("asked-and-fresh")
+        time.sleep(2.5)                      # past the 1s, nowhere near the 60s
+        worker = start_worker(env, TARSK_LEASE_GRACE=1)
+        try:
+            deadline = time.time() + 30
+            while time.time() < deadline and "asked-and-fresh" not in tags_in(log):
+                time.sleep(0.2)
+            time.sleep(1.0)                  # give the dropped one every chance
+        finally:
+            stop_worker(worker)
+        ran = tags_in(log)
+        assert "asked-and-fresh" in ran, f"{label}: expires=60 did not survive 2.5s: {ran}"
+        # A task with no registered expiry still runs when nobody asked for one.
+        assert "no-deadline" in ran, f"{label}: a job with no deadline was dropped: {ran}"
+        assert "asked-and-stale" not in ran, (
+            f"{label}: expires=1 on the send did not drop a job 2.5s old: {ran}"
+        )
+
+        # --- a delayed send keeps what was attached to it -----------------
+        #
+        # Delayed jobs wait in a hash beside the stream rather than in it, and
+        # every field has to be written there by hand. `meta` was not, so it
+        # arrived empty after the sweep promoted the job — the kind of gap that
+        # only shows up when something reads it on the far side.
+        log.write_text("")
+        app.registry["carries_meta"].options(delay=1, meta={"trace": "kept"}).send()
+        worker = start_worker(env, TARSK_LEASE_GRACE=1)
+        try:
+            deadline = time.time() + 30
+            while time.time() < deadline and not tags_in(log):
+                time.sleep(0.2)
+        finally:
+            stop_worker(worker)
+        assert "meta-kept" in tags_in(log), (
+            f"{label}: a delayed send lost its meta: {tags_in(log)}"
+        )
+
         # --- a rate limit holds across workers, not per worker ------------
         #
         # Four children with eight slots each is thirty-two things that could

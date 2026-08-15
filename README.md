@@ -426,6 +426,9 @@ if you want it.
 ```python
 @app.task(expires=300)
 def refresh_dashboard(user_id): ...
+
+refresh_dashboard.options(expires=30).send(uid)     # this one, sooner
+send_report.options(expires=3600).send(month)       # no registered deadline; ask for one
 ```
 
 Work that waited too long is dropped at the moment a worker would have started it, rather than
@@ -441,6 +444,15 @@ entered, and a delayed job only enters when the sweep promotes it.
 Checked at every dispatch, so a retry after the deadline is dropped too — stale work is still
 stale on the second attempt. A job already running is not interrupted. Drops are counted as
 `tarsk_tasks_expired_total` rather than passing for success.
+
+**A send can set its own.** Staleness usually belongs to the request rather than the task: the
+nightly rebuild can wait an hour and the same task fired from a page load cannot, and the
+registration cannot know which one it is looking at. `options(expires=…)` decides for one send
+and wins over the registration.
+
+Omitting it means "the sender did not say", which leaves the registration in charge — so a send
+can shorten a deadline or supply one, and cannot remove one the task registered. A request
+should not be able to overrule a policy by leaving a field out.
 
 There is no default and no app-wide setting. How long a task stays worth doing is domain
 knowledge, and the asymmetry is one-sided: without expiry, work runs late and you can see it;

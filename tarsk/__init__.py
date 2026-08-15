@@ -212,6 +212,7 @@ class Task:
         dedup_key: str = "",
         dedup_ttl: float | None = None,
         meta: dict | None = None,
+        expires: float | None = None,
     ) -> "Enqueue":
         """Override what this one send does, without touching the registration.
 
@@ -220,7 +221,7 @@ class Task:
         """
         return Enqueue(self, queue=queue, timeout=timeout, delay=delay, when=when,
                        dedup_key=dedup_key, dedup_ttl=dedup_ttl, meta=meta,
-                       task_id=task_id)
+                       task_id=task_id, expires=expires)
 
     def __repr__(self) -> str:
         return f"<Task {self.spec.name}>"
@@ -231,7 +232,7 @@ class Enqueue:
 
     def __init__(self, task: Task, *, queue=None, timeout=None, delay=0.0, when=None,
                  chain: bytes = b"", dedup_key: str = "", dedup_ttl: float | None = None,
-                 meta: dict | None = None, task_id=None):
+                 meta: dict | None = None, task_id=None, expires: float | None = None):
         if delay and when is not None:
             raise ValueError("give a delay or a time, not both")
         if when is not None:
@@ -244,9 +245,16 @@ class Enqueue:
             raise ValueError(
                 f"timeout={timeout}s exceeds max_timeout={task.app.max_timeout}s"
             )
+        if expires is not None and expires < 0:
+            raise ValueError("expires must not be negative")
         self.task = task
         self.queue = queue or task.spec.queue
         self.timeout_ms = task.spec.timeout_ms if timeout is None else int(timeout * 1000)
+        # Zero means "the sender did not say", and the registration decides. So
+        # this send can shorten or supply a deadline, and cannot remove one the
+        # task registered — staleness belongs to the request, but a request
+        # should not be able to overrule a policy by leaving a field out.
+        self.expires_ms = 0 if expires is None else int(expires * 1000)
         self.delay = delay
         # A caller-supplied id files both sends' results under one key. It is
         # NOT deduplication — the queue takes both jobs and runs them both,
@@ -283,7 +291,7 @@ class Enqueue:
             self.task_id, self.queue, self.task.spec.name, payload,
             self.timeout_ms, self.delay, self.chain,
             _proto.pack_result(self.meta) if self.meta else b"",
-            key, ttl_ms,
+            key, ttl_ms, self.expires_ms,
         )
         # A deduplicated send hands back the id of the job already covering it,
         # so the caller waits on the same answer instead of on a job that was

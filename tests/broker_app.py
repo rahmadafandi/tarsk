@@ -117,6 +117,20 @@ def perishable(tag):
     return tag
 
 
+@app.task(name="durable")
+def durable(tag):
+    """No registered expiry, so only what a send asks for can drop it."""
+    _log(tag)
+    return tag
+
+
+@app.task(name="carries_meta")
+def carries_meta(ctx=Depends(Context)):
+    """Reports what the sender attached, which a delayed send used to lose."""
+    _log(f"meta-{ctx.meta.get('trace', 'MISSING')}")
+    return ctx.meta
+
+
 @app.task(name="metered", rate_limit="5/s")
 def metered(tag):
     """Nothing slow: whatever paces this is the limiter, not the handler."""

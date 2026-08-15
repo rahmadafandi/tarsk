@@ -93,6 +93,8 @@ struct Job {
     chain: Vec<u8>,
     /// Whatever the caller attached, handed to the child untouched.
     meta: Vec<u8>,
+    /// What this send asked for, zero when it did not. See `NewJob::expires_ms`.
+    expires_ms: u64,
 }
 
 /// What the handler asked for, on top of having failed.
@@ -438,8 +440,12 @@ impl Shared {
             timeout_ms,
             chain: tail,
             // A chain's steps inherit nothing: the meta belonged to the send,
-            // and a later step is a different job with a different id.
+            // and a later step is a different job with a different id. The
+            // same goes for the expiry — a step becomes runnable when the one
+            // before it finishes, so a deadline measured from the original
+            // send would drop steps for the crime of being later in the chain.
             meta: Vec::new(),
+            expires_ms: 0,
         };
         if self.broker.push(next_job, Duration::ZERO).await.is_err() {
             self.counters.broker_errors.fetch_add(1, Ordering::Relaxed);
@@ -600,6 +606,7 @@ impl Shared {
             ready_at_ms: delivery.ready_at_ms,
             chain: delivery.chain,
             meta: delivery.meta,
+            expires_ms: delivery.expires_ms,
         }
     }
 }
@@ -1197,13 +1204,23 @@ async fn serve(shared: &Arc<Shared>, child: &mut ChildHandle, cfg: &Arc<Cfg>) ->
                 // waited, and that is only answerable at the moment something
                 // would have started it — including on a retry, since stale
                 // work is still stale the second time.
-                let expires_ms = shared
-                    .specs
-                    .lock()
-                    .unwrap()
-                    .get(&job.name)
-                    .map(|s| s.expires_ms)
-                    .unwrap_or(0);
+                // What this send asked for wins over what the task registered.
+                // Zero means the sender did not say, which is the default and
+                // leaves the registration in charge. There is no way to ask for
+                // "never" against a task that registered an expiry, and that is
+                // deliberate: the flag exists because staleness belongs to the
+                // request, and a request cannot overrule a policy by omission.
+                let expires_ms = if job.expires_ms > 0 {
+                    job.expires_ms
+                } else {
+                    shared
+                        .specs
+                        .lock()
+                        .unwrap()
+                        .get(&job.name)
+                        .map(|s| s.expires_ms)
+                        .unwrap_or(0)
+                };
                 if expires_ms > 0 && job.ready_at_ms > 0 {
                     let waited = broker::now_ms().saturating_sub(job.ready_at_ms);
                     if waited > expires_ms {
@@ -1816,6 +1833,9 @@ async fn supervise(
                             timeout_ms: spec.timeout_ms as u32,
                             chain: Vec::new(),
                             meta: Vec::new(),
+                            // The registration decides. A cron tick has no
+                            // caller to have asked for anything else.
+                            expires_ms: 0,
                         };
                         if shared.broker.push(job, Duration::ZERO).await.is_err() {
                             shared
@@ -2072,6 +2092,7 @@ fn run(
                                     timeout_ms: 0,
                                     chain: Vec::new(),
                                     meta: Vec::new(),
+                                    expires_ms: 0,
                                 },
                                 Duration::ZERO,
                             )
@@ -2212,7 +2233,8 @@ impl Producer {
 
     /// `delay` in seconds; zero enqueues immediately.
     #[pyo3(signature = (id, queue, name, payload, timeout_ms, delay=0.0, chain=Vec::new(),
-                        meta=Vec::new(), dedup_key=String::new(), dedup_ttl_ms=0))]
+                        meta=Vec::new(), dedup_key=String::new(), dedup_ttl_ms=0,
+                        expires_ms=0))]
     #[allow(clippy::too_many_arguments)] // a pyo3 entry point, not a call site
     fn send(
         &self,
@@ -2227,6 +2249,7 @@ impl Producer {
         meta: Vec<u8>,
         dedup_key: String,
         dedup_ttl_ms: u64,
+        expires_ms: u64,
     ) -> PyResult<Option<String>> {
         let job = NewJob {
             id: id.clone(),
@@ -2236,6 +2259,7 @@ impl Producer {
             timeout_ms,
             chain,
             meta,
+            expires_ms,
         };
         let delay = Duration::from_secs_f64(delay.max(0.0));
         py.detach(|| {

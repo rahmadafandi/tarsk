@@ -646,6 +646,44 @@ def check_broker(url: str, label: str) -> None:
             f"{label}: expires=1 on the send did not drop a job 2.5s old: {ran}"
         )
 
+        # --- --queues high,low is a priority, not a preference ------------
+        #
+        # Twenty low jobs are queued first and given a head start, then five
+        # high ones. A worker that merely prefers the first queue within one
+        # read drains the low batch it already fetched; a strict one runs
+        # every high job before any low job it has not yet claimed.
+        #
+        # The assertion is on the *last* high job's position, not the first:
+        # one high job jumping the queue proves nothing if the other four
+        # trail behind the backlog.
+        log.write_text("")
+        for n in range(20):
+            app.registry["whenever"].send(f"low{n:02d}")
+        time.sleep(0.5)                      # let them settle in the stream
+        for n in range(5):
+            app.registry["urgent"].send(f"high{n}")
+        worker = start_worker(env, TARSK_LEASE_GRACE=1, TARSK_QUEUES="high,low")
+        try:
+            deadline = time.time() + 60
+            while time.time() < deadline and len(tags_in(log)) < 25:
+                time.sleep(0.2)
+        finally:
+            stop_worker(worker)
+        ran = tags_in(log)
+        assert len(ran) == 25, f"{label}: only {len(ran)} of 25 ran: {ran}"
+        order = [t for t in log.read_text().splitlines() if t]
+        highs = [i for i, t in enumerate(order) if t.startswith("high")]
+        lows = [i for i, t in enumerate(order) if t.startswith("low")]
+        assert len(highs) == 5, f"{label}: {len(highs)} high jobs: {order}"
+        # Every high job before every low one. Both queues had work when the
+        # worker started, so nothing was claimed before the priority applied
+        # and there is no batch of slack to allow for. A worker that merely
+        # prefers within one read interleaves them instead.
+        assert max(highs) < min(lows), (
+            f"{label}: high jobs did not all precede low ones, last high at "
+            f"{max(highs)} with lows from {min(lows)}: {order}"
+        )
+
         # --- a delayed send keeps what was attached to it -----------------
         #
         # Delayed jobs wait in a hash beside the stream rather than in it, and

@@ -887,6 +887,79 @@ impl RedisBroker {
         Ok(moved)
     }
 
+    /// One `XREADGROUP`, over the streams given.
+    ///
+    /// `block` picks the connection as well as the command: a blocking read
+    /// holds up everything multiplexed onto its socket, so it gets the one
+    /// reserved for it and a probe shares the ordinary one.
+    async fn read_streams(
+        &self,
+        queues: &[String],
+        batch: u64,
+        block: Option<Duration>,
+    ) -> Res<Option<redis::streams::StreamReadReply>> {
+        let mut cmd = redis::cmd("XREADGROUP");
+        cmd.arg("GROUP")
+            .arg(REDIS_GROUP)
+            .arg(&self.consumer)
+            .arg("COUNT")
+            .arg(batch);
+        if let Some(wait) = block {
+            cmd.arg("BLOCK").arg(wait.as_millis().max(1) as u64);
+        }
+        cmd.arg("STREAMS");
+        for queue in queues {
+            cmd.arg(stream_key(queue));
+        }
+        for _ in queues {
+            cmd.arg(">"); // never-delivered only; our own backlog is in `claimed`
+        }
+        let mut conn = if block.is_some() {
+            self.blocking.clone()
+        } else {
+            self.conn.clone()
+        };
+        Ok(cmd.query_async(&mut conn).await?)
+    }
+
+    /// Read a batch, highest-priority queue first.
+    ///
+    /// `--queues high,low` used to be one read across both streams, and Redis
+    /// answers that with up to `COUNT` from *each*. The batch then held low
+    /// work that ran before high work that arrived while it drained, which is
+    /// a preference and not a priority.
+    ///
+    /// So: probe each queue in turn without blocking and take the first that
+    /// has anything. Only when they are all empty is there something to wait
+    /// on, and that wait covers every queue at once so any of them wakes us.
+    ///
+    /// The cost is one extra round trip per claim while a high queue is empty
+    /// and a low one is not — paid on a connection that is not the blocking
+    /// one, and only by workers that asked for more than one queue.
+    ///
+    /// Strict at the moment of reading, which is the only moment it can be.
+    /// A batch already claimed is already leased to this worker and is still
+    /// run; priority decides what is read next, not what is already held.
+    async fn read_in_order(
+        &self,
+        batch: u64,
+        block: Duration,
+    ) -> Res<Option<redis::streams::StreamReadReply>> {
+        if self.queues.len() > 1 {
+            for queue in &self.queues {
+                let reply = self
+                    .read_streams(std::slice::from_ref(queue), batch, None)
+                    .await?;
+                if let Some(reply) = reply {
+                    if reply.keys.iter().any(|k| !k.ids.is_empty()) {
+                        return Ok(Some(reply));
+                    }
+                }
+            }
+        }
+        self.read_streams(&self.queues, batch, Some(block)).await
+    }
+
     async fn claim(&self, block: Duration) -> Res<Option<Delivery>> {
         // Anything already owned goes out first — but only while its lease has
         // time left. Past that the sweep may have handed it to someone else,
@@ -909,24 +982,9 @@ impl RedisBroker {
             }
         }
         let batch = self.prefetch.load(Ordering::Relaxed).max(1);
-        let mut conn = self.blocking.clone();
-        let mut cmd = redis::cmd("XREADGROUP");
-        cmd.arg("GROUP")
-            .arg(REDIS_GROUP)
-            .arg(&self.consumer)
-            .arg("COUNT")
-            .arg(batch)
-            .arg("BLOCK")
-            .arg(block.as_millis().max(1) as u64)
-            .arg("STREAMS");
-        for queue in &self.queues {
-            cmd.arg(stream_key(queue));
-        }
-        for _ in &self.queues {
-            cmd.arg(">"); // never-delivered only; our own backlog is in `recovered`
-        }
-        let reply: Option<redis::streams::StreamReadReply> = cmd.query_async(&mut conn).await?;
-        let Some(reply) = reply else { return Ok(None) };
+        let Some(reply) = self.read_in_order(batch, block).await? else {
+            return Ok(None);
+        };
         // Everything the read returned is now in this consumer's PEL, so all of
         // it has to be accounted for: hand one out and hold the rest. Taking
         // one and forgetting the others would leave them owned but unrun until
@@ -1658,7 +1716,11 @@ with picked as (
            coalesce(lease_until, created_at) as ready_at
       from tarsk_jobs
      where queue = any($1) and (lease_until is null or lease_until < now())
-     order by id
+     -- Priority before age: `--queues high,low` is an ordering, and
+     -- array_position turns it into one the planner can sort by. Strict here
+     -- in a way Redis cannot be, because this claims one row at a time and so
+     -- never holds a batch of the wrong queue.
+     order by array_position($1::text[], queue), id
        for update skip locked
      limit 1
 )

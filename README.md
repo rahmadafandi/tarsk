@@ -188,6 +188,29 @@ rather than left at asyncio's default of `min(32, cpu + 4)`, which would otherwi
 `--slots 64` at twenty without saying so. Threads only overlap *waiting*: a sync handler that
 computes holds the GIL and gains nothing.
 
+## Priority
+
+```
+tarsk worker --queues high,low
+```
+
+The order is a priority, not a preference: nothing from `low` is claimed while `high` has work.
+Postgres sorts by it in the same statement that claims the row, so it costs nothing there.
+Redis needs a read per queue — the highest with anything waiting wins, and only when they are
+all empty is there anything to wait on, which is one blocking read across all of them. The
+price is one extra round trip per claim while a high queue is empty and a low one is not, paid
+by workers that asked for more than one queue.
+
+**Strict at the moment of claiming, which is the only moment it can be.** A batch already
+claimed is already leased to this worker and still runs; priority decides what is read next,
+not what is already held. On Redis that is a prefetch batch of slack; on Postgres, which claims
+one row at a time, there is none.
+
+This page used to say `--queues high,low` merely preferred the first within one read, which was
+true and is what a single `XREADGROUP` over two streams does — Redis answers it with up to
+`COUNT` from *each*, so a batch held low work that ran ahead of high work arriving while it
+drained.
+
 `--hard-max-rss` is the exception, and it is off by default. Set it and a child that reaches it
 mid-task is killed rather than allowed to keep growing — the task is retried, and if it cannot
 fit it is dead-lettered instead of retried forever. It cannot make an oversized task succeed;
@@ -710,8 +733,6 @@ checked rather than believed.
 
 - Not on PyPI yet — the wheel builds and installs, it just has not been uploaded
 - No chord. `chain` and `group` are here; fanning back in to a callback is not
-- No strict priority. A worker reads `--queues high,low` in that order within one claim, which
-  prefers the first without being a priority queue
 - Windows runs the suites that need no broker, since neither Redis nor Postgres ships for it.
   Everything else — the channel, recycling, the memory ceiling — is tested there
 

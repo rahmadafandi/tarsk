@@ -66,8 +66,8 @@ dead-letter store you can read and replay from the CLI, opt-in results with a
 required TTL, UTC cron elected through the broker, chains and groups, rate limits
 and concurrency caps held in the broker rather than per worker, cancellation,
 expiry per task or per send, deduplication, soft timeouts that ask a handler to
-stop before the hard one takes it, an async producer, and a Prometheus endpoint
-that reports
+stop before the hard one takes it, strict queue priority, an async producer, and
+a Prometheus endpoint that reports
 queue depth and the supervisor's own RSS so both constants can be checked rather
 than believed.
 
@@ -235,8 +235,6 @@ gets the byte budget without the handover, which is the 139 ms column.
 
 - Not on PyPI yet — the wheel builds and installs, it just has not been uploaded
 - No chord; chains and groups are there, fanning back in is not
-- No strict priority. `--queues high,low` prefers the first within a read, which is not a
-  priority queue
 
 ---
 

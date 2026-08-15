@@ -131,6 +131,19 @@ def carries_meta(ctx=Depends(Context)):
     return ctx.meta
 
 
+@app.task(name="urgent", queue="high")
+def urgent(tag):
+    """Queued second, must run first."""
+    _log(tag)
+    return tag
+
+
+@app.task(name="whenever", queue="low")
+def whenever(tag):
+    _log(tag)
+    return tag
+
+
 @app.task(name="metered", rate_limit="5/s")
 def metered(tag):
     """Nothing slow: whatever paces this is the limiter, not the handler."""

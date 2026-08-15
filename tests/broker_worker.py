@@ -15,7 +15,7 @@ Supervisor(
     max_dead=int(os.environ.get("TARSK_MAX_DEAD", "1000")),
 ).work(
     os.environ["TARSK_BROKER"],
-    ["default"],
+    os.environ.get("TARSK_QUEUES", "default").split(","),
     lease_grace=float(os.environ.get("TARSK_LEASE_GRACE", "30")),
     metrics_addr=os.environ.get("TARSK_METRICS"),
 )

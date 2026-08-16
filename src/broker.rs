@@ -995,6 +995,11 @@ impl AmqpBroker {
         let headers = msg.properties.headers().as_ref().unwrap_or(&empty);
         let record = amqp_record_from(headers, &msg.data);
         let ready_at_ms = amqp_header_u64(headers, "tarsk-ready-at");
+        // ponytail: the payload is held twice per in-flight job — once here
+        // for dispatch, once in the receipt for a retry's republish. Halving
+        // that means Bytes/Arc through Delivery and Job, a type change across
+        // both crates' hot path, and nothing has shown payloads big enough to
+        // pay for it. If yours are, this line is where the second copy is born.
         Delivery {
             id: record.id.clone(),
             name: record.name.clone(),

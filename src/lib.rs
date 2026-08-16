@@ -1030,10 +1030,19 @@ fn slot_budget(rss: u64, growth: Growth, max_rss: u64) -> usize {
 }
 
 /// How close this child is to the nearest of its recycle triggers.
+/// One reading, three consumers — each field names its question so none of
+/// them borrows a number that answers a different one. Slot budgeting is the
+/// fourth question and deliberately not here: `slot_budget` works from raw
+/// RSS and the growth estimate, not from a fraction of whichever limit
+/// happens to be nearest.
 struct Pressure {
+    /// Has a limit already fired? The retire decision, and only that.
     trigger: Option<&'static str>,
-    /// Fraction of the closest limit already consumed; 0.0 when unlimited.
-    ratio: f64,
+    /// Fraction of the *nearest* limit consumed; 0.0 when nothing is limited.
+    /// Feeds the pre-warm projection in `should_warm`, which extrapolates
+    /// from it — so it must never be read as "how full is memory": with
+    /// `max_tasks` closer than `max_rss`, it is a task count, not bytes.
+    consumed: f64,
     /// Whatever the RSS read cost us, handed on rather than taken twice.
     rss: Option<u64>,
 }
@@ -1082,7 +1091,7 @@ fn pressure(
     }
     Pressure {
         trigger: (worst.0 >= 1.0).then_some(worst.1),
-        ratio: worst.0,
+        consumed: worst.0,
         rss,
     }
 }
@@ -1095,10 +1104,10 @@ fn pressure(
 /// lives 100ms is nowhere near an interpreter startup, while 10% of one that
 /// lives an hour leaves a spare interpreter idling for six minutes.
 fn should_warm(pressure: &Pressure, elapsed: Duration, spawn: Duration, cfg: &Cfg) -> bool {
-    if pressure.ratio <= 0.0 {
+    if pressure.consumed <= 0.0 {
         return false;
     }
-    let remaining = elapsed.as_secs_f64() * (1.0 - pressure.ratio) / pressure.ratio;
+    let remaining = elapsed.as_secs_f64() * (1.0 - pressure.consumed) / pressure.consumed;
     remaining <= spawn.as_secs_f64() * cfg.warm_multiple as f64
 }
 

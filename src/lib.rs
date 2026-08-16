@@ -2401,6 +2401,13 @@ fn rss_of(pid: u32) -> u64 {
 
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Pin the process-wide rustls crypto provider before any TLS connector
+    // exists. With more than one provider in the dependency graph — lapin's
+    // rustls stack can pull aws-lc-rs in beside ring — rustls refuses to
+    // guess and panics at the first handshake instead. Choosing here, once,
+    // makes every broker's TLS deterministic regardless of what the graph
+    // grows next.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     m.add_function(wrap_pyfunction!(run, m)?)?;
     m.add_function(wrap_pyfunction!(work, m)?)?;
     m.add_function(wrap_pyfunction!(rss_of, m)?)?;

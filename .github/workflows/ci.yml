@@ -25,7 +25,10 @@ jobs:
 
       # The broker tests start their own servers on free ports; these are just
       # the binaries. Postgres ships with the runner image.
-      - run: sudo apt-get update && sudo apt-get install -y redis-server
+      # rabbitmq-server starts on install, guest/guest on localhost — exactly
+      # what test_amqp probes for. Without it that test prints "skip", which
+      # reads like a pass and would hide the AMQP backend breaking.
+      - run: sudo apt-get update && sudo apt-get install -y redis-server rabbitmq-server
 
       # A venv so `maturin develop` puts the extension in the source tree,
       # which is where the tests add ROOT to sys.path expects to find it.

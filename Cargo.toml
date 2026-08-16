@@ -41,3 +41,7 @@ tokio-postgres-rustls = { version = "0.14.0", default-features = false, features
     "ring",
     "native-certs",
 ] }
+# tokio runtime explicitly: without a runtime feature lapin fails at connect
+# with NoDefaultRuntime. ring + native certs to match the rustls posture the
+# redis and postgres sides already ship.
+lapin = { version = "4.10.0", default-features = false, features = ["tokio", "rustls--ring", "rustls-native-certs"] }

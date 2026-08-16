@@ -182,6 +182,10 @@ def _scrape_once(port: int) -> str:
 
 def count_dead(url: str) -> int:
     """How many jobs the backend has parked in its dead-letter store."""
+    if url.startswith("amqp://"):
+        from tarsk._core import Producer
+
+        return len(Producer(broker_url=url).dead_list("default", 100_000))
     if url.startswith("redis://"):
         port = url.rsplit(":", 1)[1].split("/")[0]
         out = subprocess.run(["redis-cli", "-p", port, "XLEN", "tarsk:default:dead"],
@@ -194,7 +198,11 @@ def count_dead(url: str) -> int:
     return int(out or 0)
 
 
-def check_broker(url: str, label: str) -> None:
+def check_broker(url: str, label: str, skip: frozenset = frozenset()) -> None:
+    """`skip` names capability blocks a broker cannot express, by design.
+
+    Skipping is loud, not silent: each skipped block prints why, so a suite
+    run says "cannot" rather than looking like it forgot."""
     workdir = Path(tempfile.mkdtemp(prefix="tarsk-broker-"))
     log = workdir / "run.log"
     log.touch()
@@ -345,70 +353,79 @@ def check_broker(url: str, label: str) -> None:
         assert seen_progress == sorted(seen_progress, key=lambda s: s["step"]), seen_progress
         assert seen_progress[-1]["of"] == 3, seen_progress
 
-        # --- cron fires once a minute, once across the fleet ------------
-        log.write_text("")
-        # Two workers, so a schedule fired twice would show up as two ticks.
-        pair = [start_worker(env, TARSK_LEASE_GRACE=1) for _ in range(2)]
-        seen = wait_for(log, {"tick"}, timeout=150)
-        time.sleep(3)  # let a duplicate arrive if one is going to
-        ticks = [t for t in tags_in(log) if t == "tick"]
-        for worker in pair:
-            stop_worker(worker)
-        assert ticks == ["tick"], f"{label}: expected exactly one tick, got {ticks}"
+        if "cron-election" in skip:
+            print(f"  {label}: skip cron-election — cron election is per-worker here: no shared store to elect through, so two workers would both fire")
+        else:
+            # --- cron fires once a minute, once across the fleet ------------
+            log.write_text("")
+            # Two workers, so a schedule fired twice would show up as two ticks.
+            pair = [start_worker(env, TARSK_LEASE_GRACE=1) for _ in range(2)]
+            seen = wait_for(log, {"tick"}, timeout=150)
+            time.sleep(3)  # let a duplicate arrive if one is going to
+            ticks = [t for t in tags_in(log) if t == "tick"]
+            for worker in pair:
+                stop_worker(worker)
+            assert ticks == ["tick"], f"{label}: expected exactly one tick, got {ticks}"
 
-        # --- identical sends collapse into one job ------------------------
-        log.write_text("")
-        first = [app.registry["once"].send("dup") for _ in range(4)]
-        assert len(set(first)) == 1, f"{label}: four identical sends gave {set(first)}"
-        # A different argument is a different job, not a collision.
-        app.registry["once"].send("other")
-        # An explicit key overrides the argument hash, so these two collapse
-        # even though their arguments differ.
-        keyed = [
-            app.registry["once"].options(dedup_key="k", dedup_ttl=30).send(f"keyed-{i}")
-            for i in range(3)
-        ]
-        assert len(set(keyed)) == 1, f"{label}: explicit keys gave {set(keyed)}"
+        if "dedup" in skip:
+            print(f"  {label}: skip dedup — send dedup needs a shared SET-NX; producers on this broker cannot see each other's sends")
+        else:
+            # --- identical sends collapse into one job ------------------------
+            log.write_text("")
+            first = [app.registry["once"].send("dup") for _ in range(4)]
+            assert len(set(first)) == 1, f"{label}: four identical sends gave {set(first)}"
+            # A different argument is a different job, not a collision.
+            app.registry["once"].send("other")
+            # An explicit key overrides the argument hash, so these two collapse
+            # even though their arguments differ.
+            keyed = [
+                app.registry["once"].options(dedup_key="k", dedup_ttl=30).send(f"keyed-{i}")
+                for i in range(3)
+            ]
+            assert len(set(keyed)) == 1, f"{label}: explicit keys gave {set(keyed)}"
 
-        worker = start_worker(env, TARSK_LEASE_GRACE=1)
-        try:
-            deadline = time.time() + 30
-            while time.time() < deadline and len(tags_in(log)) < 3:
-                time.sleep(0.2)
-            time.sleep(0.5)
-        finally:
-            stop_worker(worker)
-        ran = sorted(tags_in(log))
-        assert ran == ["once-dup", "once-keyed-0", "once-other"], f"{label}: {ran}"
+            worker = start_worker(env, TARSK_LEASE_GRACE=1)
+            try:
+                deadline = time.time() + 30
+                while time.time() < deadline and len(tags_in(log)) < 3:
+                    time.sleep(0.2)
+                time.sleep(0.5)
+            finally:
+                stop_worker(worker)
+            ran = sorted(tags_in(log))
+            assert ran == ["once-dup", "once-keyed-0", "once-other"], f"{label}: {ran}"
 
-        # --- a concurrency cap holds across workers, not per worker -------
-        #
-        # Four children with four slots each is sixteen places a job could run.
-        # The cap says two, and the proof is overlap: each job logs its own
-        # start and end, so the deepest nesting is measured rather than inferred
-        # from how long the whole thing took.
-        log.write_text("")
-        for i in range(8):
-            app.registry["capped"].send(f"c{i}")
-        worker = start_worker(env, TARSK_LEASE_GRACE=1, TARSK_CHILDREN=4, TARSK_SLOTS=4)
-        try:
-            deadline = time.time() + 60
-            while time.time() < deadline and \
-                    len([t for t in tags_in(log) if t.startswith("end-")]) < 8:
-                time.sleep(0.2)
-        finally:
-            stop_worker(worker)
-        live = peak = 0
-        for tag in tags_in(log):
-            if tag.startswith("start-"):
-                live += 1
-                peak = max(peak, live)
-            elif tag.startswith("end-"):
-                live -= 1
-        finished = len([t for t in tags_in(log) if t.startswith("end-")])
-        assert finished == 8, f"{label}: only {finished}/8 capped jobs finished"
-        assert peak <= 2, f"{label}: max_concurrency=2 but {peak} ran at once"
-        assert peak == 2, f"{label}: never reached the cap ({peak}) — is anything parallel?"
+        if "shared-concurrency" in skip:
+            print(f"  {label}: skip shared-concurrency — max_concurrency is held per worker here, Celery's shape — the cross-worker half of this test cannot hold")
+        else:
+            # --- a concurrency cap holds across workers, not per worker -------
+            #
+            # Four children with four slots each is sixteen places a job could run.
+            # The cap says two, and the proof is overlap: each job logs its own
+            # start and end, so the deepest nesting is measured rather than inferred
+            # from how long the whole thing took.
+            log.write_text("")
+            for i in range(8):
+                app.registry["capped"].send(f"c{i}")
+            worker = start_worker(env, TARSK_LEASE_GRACE=1, TARSK_CHILDREN=4, TARSK_SLOTS=4)
+            try:
+                deadline = time.time() + 60
+                while time.time() < deadline and \
+                        len([t for t in tags_in(log) if t.startswith("end-")]) < 8:
+                    time.sleep(0.2)
+            finally:
+                stop_worker(worker)
+            live = peak = 0
+            for tag in tags_in(log):
+                if tag.startswith("start-"):
+                    live += 1
+                    peak = max(peak, live)
+                elif tag.startswith("end-"):
+                    live -= 1
+            finished = len([t for t in tags_in(log) if t.startswith("end-")])
+            assert finished == 8, f"{label}: only {finished}/8 capped jobs finished"
+            assert peak <= 2, f"{label}: max_concurrency=2 but {peak} ran at once"
+            assert peak == 2, f"{label}: never reached the cap ({peak}) — is anything parallel?"
 
         # --- the types people actually pass survive the round trip --------
         #
@@ -513,34 +530,37 @@ def check_broker(url: str, label: str) -> None:
         assert answer == {"trace": "abc123", "tenant": 7}, f"{label}: handler saw {answer!r}"
         assert "labelled-abc123" in tags_in(log), f"{label}: {tags_in(log)}"
 
-        # --- the individual jobs are visible, not only the count ----------
-        #
-        # The depth counters say how far behind; this says behind on what. A
-        # delayed job is listed too, and reports time remaining rather than
-        # time waited — it has not started waiting yet.
-        log.write_text("")
-        soon = app.registry["note"].send("listed-now")
-        later = app.registry["note"].options(delay=600).send("listed-later")
-        listed = {row[0]: row for row in producer.jobs(["default"], 50)}
-        assert soon in listed, f"{label}: a queued job is not in the listing"
-        assert later in listed, f"{label}: a delayed job is not in the listing"
-        assert listed[soon][2] == "note", f"{label}: wrong name {listed[soon][2]!r}"
-        assert listed[soon][3] == "ready", f"{label}: {listed[soon][3]!r}"
-        assert listed[later][3] == "delayed", f"{label}: {listed[later][3]!r}"
-        # Ten minutes out, so the age is negative by roughly that much.
-        assert listed[later][5] < -500_000, f"{label}: due-in looks wrong: {listed[later][5]}"
-        # The name has to survive: the payload beside it is msgpack, and
-        # reading the whole record as text used to blank every field.
-        assert listed[later][2] == "note", f"{label}: delayed name {listed[later][2]!r}"
+        if "listing-and-cancel" in skip:
+            print(f"  {label}: skip listing-and-cancel — delayed jobs live in TTL queues this broker cannot enumerate, and the block ends by cancelling one")
+        else:
+            # --- the individual jobs are visible, not only the count ----------
+            #
+            # The depth counters say how far behind; this says behind on what. A
+            # delayed job is listed too, and reports time remaining rather than
+            # time waited — it has not started waiting yet.
+            log.write_text("")
+            soon = app.registry["note"].send("listed-now")
+            later = app.registry["note"].options(delay=600).send("listed-later")
+            listed = {row[0]: row for row in producer.jobs(["default"], 50)}
+            assert soon in listed, f"{label}: a queued job is not in the listing"
+            assert later in listed, f"{label}: a delayed job is not in the listing"
+            assert listed[soon][2] == "note", f"{label}: wrong name {listed[soon][2]!r}"
+            assert listed[soon][3] == "ready", f"{label}: {listed[soon][3]!r}"
+            assert listed[later][3] == "delayed", f"{label}: {listed[later][3]!r}"
+            # Ten minutes out, so the age is negative by roughly that much.
+            assert listed[later][5] < -500_000, f"{label}: due-in looks wrong: {listed[later][5]}"
+            # The name has to survive: the payload beside it is msgpack, and
+            # reading the whole record as text used to blank every field.
+            assert listed[later][2] == "note", f"{label}: delayed name {listed[later][2]!r}"
 
-        app.cancel(later)
-        worker = start_worker(env, TARSK_LEASE_GRACE=1)
-        try:
-            deadline = time.time() + 30
-            while time.time() < deadline and "listed-now" not in tags_in(log):
-                time.sleep(0.2)
-        finally:
-            stop_worker(worker)
+            app.cancel(later)
+            worker = start_worker(env, TARSK_LEASE_GRACE=1)
+            try:
+                deadline = time.time() + 30
+                while time.time() < deadline and "listed-now" not in tags_in(log):
+                    time.sleep(0.2)
+            finally:
+                stop_worker(worker)
 
         # --- the backlog is visible before, during and after -------------
         log.write_text("")
@@ -783,33 +803,36 @@ def check_broker(url: str, label: str) -> None:
         # a limit, thirty-two slots would have this done in well under one.
         assert took >= 1.5, f"{label}: 15 tasks at 5/s finished in {took:.2f}s"
 
-        # --- a queued job can be cancelled while the worker is running ----
-        #
-        # Ordering matters: the cancellation is sent *after* the worker is up
-        # and already chewing through the queue, which is when a caller would
-        # actually send it. Cancelling before the worker starts would test the
-        # easy half.
-        log.write_text("")
-        first = app.registry["medium"].send("running")   # occupies the child
-        doomed = [app.registry["note"].send(f"cancelled-{i}") for i in range(5)]
-        alive = [app.registry["note"].send(f"kept-{i}") for i in range(5)]
-        worker = start_worker(env, TARSK_LEASE_GRACE=1)
-        try:
-            time.sleep(1.0)                              # worker is on `medium`
-            for job_id in doomed:
-                app.cancel(job_id)
-            deadline = time.time() + 40
-            while time.time() < deadline and len(tags_in(log)) < 6:
-                time.sleep(0.2)
-        finally:
-            stop_worker(worker)
-        ran = tags_in(log)
-        assert not [t for t in ran if t.startswith("cancelled-")], \
-            f"{label}: cancelled jobs ran anyway: {ran}"
-        assert len([t for t in ran if t.startswith("kept-")]) == 5, \
-            f"{label}: cancelling took uncancelled jobs with it: {ran}"
-        assert "running" in ran, f"{label}: the in-flight job did not finish: {ran}"
-        del first, alive
+        if "cancel" in skip:
+            print(f"  {label}: skip cancel — cancellation needs state every worker can read; this broker has no shared store to hold it")
+        else:
+            # --- a queued job can be cancelled while the worker is running ----
+            #
+            # Ordering matters: the cancellation is sent *after* the worker is up
+            # and already chewing through the queue, which is when a caller would
+            # actually send it. Cancelling before the worker starts would test the
+            # easy half.
+            log.write_text("")
+            first = app.registry["medium"].send("running")   # occupies the child
+            doomed = [app.registry["note"].send(f"cancelled-{i}") for i in range(5)]
+            alive = [app.registry["note"].send(f"kept-{i}") for i in range(5)]
+            worker = start_worker(env, TARSK_LEASE_GRACE=1)
+            try:
+                time.sleep(1.0)                              # worker is on `medium`
+                for job_id in doomed:
+                    app.cancel(job_id)
+                deadline = time.time() + 40
+                while time.time() < deadline and len(tags_in(log)) < 6:
+                    time.sleep(0.2)
+            finally:
+                stop_worker(worker)
+            ran = tags_in(log)
+            assert not [t for t in ran if t.startswith("cancelled-")], \
+                f"{label}: cancelled jobs ran anyway: {ran}"
+            assert len([t for t in ran if t.startswith("kept-")]) == 5, \
+                f"{label}: cancelling took uncancelled jobs with it: {ran}"
+            assert "running" in ran, f"{label}: the in-flight job did not finish: {ran}"
+            del first, alive
 
         # --- retries run out, job is dead-lettered ----------------------
         log.write_text("")
@@ -932,6 +955,32 @@ def test_cli_broker_from_env_and_dotenv():
         assert probe.returncode == 0, (probe.stdout, probe.stderr)
 
 
+def _amqp_url() -> str | None:
+    """TARSK_AMQP_URL, or whatever answers on the conventional ports."""
+    if os.environ.get("TARSK_AMQP_URL"):
+        return os.environ["TARSK_AMQP_URL"]
+    for port in (5672, 5680):
+        with socket.socket() as probe:
+            probe.settimeout(0.5)
+            if probe.connect_ex(("127.0.0.1", port)) == 0:
+                return f"amqp://guest:guest@127.0.0.1:{port}/%2f"
+    return None
+
+
+def test_amqp():
+    url = _amqp_url()
+    if url is None:
+        print("skip test_amqp (no rabbitmq listening; set TARSK_AMQP_URL)")
+        return
+    check_broker(url, "amqp", skip=frozenset({
+        # All one root cause: AMQP moves messages and holds no shared state,
+        # so anything needing a store every worker can read is per-worker
+        # (Celery's own shape on RabbitMQ) or refused.
+        "cron-election", "dedup", "shared-concurrency",
+        "listing-and-cancel", "cancel",
+    }))
+
+
 def test_postgres():
     if PG_BIN is None:
         print("skip test_postgres (no postgres binaries)")
@@ -982,7 +1031,8 @@ def test_tls_is_compiled_in():
 
 
 if __name__ == "__main__":
-    for check in (test_redis, test_cli_broker_from_env_and_dotenv, test_postgres, test_tls_is_compiled_in,
+    for check in (test_redis, test_cli_broker_from_env_and_dotenv, test_amqp,
+                  test_postgres, test_tls_is_compiled_in,
                   test_postgres_tls_is_compiled_in):
         check()
         print("ok", check.__name__)

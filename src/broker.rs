@@ -68,6 +68,15 @@ pub enum Receipt {
     Memory {
         id: u64,
     },
+    /// AMQP consumes destructively: once a delivery is acked the server has
+    /// nothing left to requeue, so the receipt itself carries the record a
+    /// retry or a dead-letter would republish. Redis and Postgres keep the
+    /// record server-side and their receipts are just keys.
+    Amqp {
+        queue: String,
+        acker: lapin::Acker,
+        record: AmqpRecord,
+    },
     Redis {
         queue: String,
         id: String,
@@ -158,6 +167,10 @@ pub enum Broker {
     Memory(MemoryBroker),
     Redis(RedisBroker),
     Postgres(PgBroker),
+    // Boxed for size only: lapin's connection state makes this variant dwarf
+    // the others, and one Broker exists per process — the indirection costs
+    // nothing anyone can measure.
+    Amqp(Box<AmqpBroker>),
 }
 
 impl Broker {
@@ -169,6 +182,10 @@ impl Broker {
             Ok(Broker::Redis(RedisBroker::connect(url, queues).await?))
         } else if url.starts_with("postgres://") || url.starts_with("postgresql://") {
             Ok(Broker::Postgres(PgBroker::connect(url, queues).await?))
+        } else if url.starts_with("amqp://") || url.starts_with("amqps://") {
+            Ok(Broker::Amqp(Box::new(
+                AmqpBroker::connect(url, queues).await?,
+            )))
         } else {
             Err(format!("unsupported broker url: {url}").into())
         }
@@ -185,6 +202,7 @@ impl Broker {
             Broker::Memory(b) => b.push(job, delay),
             Broker::Redis(b) => b.push(job, delay).await,
             Broker::Postgres(b) => b.push(job, delay).await,
+            Broker::Amqp(b) => b.push(job, delay).await,
         }
     }
 
@@ -196,6 +214,9 @@ impl Broker {
             Broker::Memory(b) => Ok(b.claim()),
             Broker::Redis(b) => b.claim(block).await,
             Broker::Postgres(b) => b.claim(grace, block).await,
+            // `grace` is the lease slack, and AMQP needs none: an unacked
+            // delivery returns the instant its connection dies.
+            Broker::Amqp(b) => b.claim(block).await,
         }
     }
 
@@ -205,6 +226,12 @@ impl Broker {
             (Broker::Memory(b), Receipt::Memory { id }) => b.settle(*id),
             (Broker::Redis(b), r) => b.ack(r).await,
             (Broker::Postgres(b), r) => b.ack(r).await,
+            (Broker::Amqp(_), Receipt::Amqp { acker, .. }) => {
+                acker
+                    .ack(lapin::options::BasicAckOptions::default())
+                    .await?;
+                Ok(())
+            }
             _ => Err("receipt does not belong to this broker".into()),
         }
     }
@@ -216,6 +243,7 @@ impl Broker {
             (Broker::Memory(b), Receipt::Memory { id }) => b.requeue(*id, delay),
             (Broker::Redis(b), r) => b.requeue(r, delay).await,
             (Broker::Postgres(b), r) => b.requeue(r, delay).await,
+            (Broker::Amqp(b), r @ Receipt::Amqp { .. }) => b.retry(r, delay).await,
             _ => Err("receipt does not belong to this broker".into()),
         }
     }
@@ -238,6 +266,7 @@ impl Broker {
             Broker::Memory(b) => Ok(b.acquire_slot(task, job_id, max, lease_ms)),
             Broker::Redis(b) => b.acquire_slot(task, job_id, max, lease_ms).await,
             Broker::Postgres(b) => b.acquire_slot(task, job_id, max, lease_ms).await,
+            Broker::Amqp(b) => Ok(b.acquire_slot(task, job_id, max, lease_ms)),
         }
     }
 
@@ -250,6 +279,10 @@ impl Broker {
             }
             Broker::Redis(b) => b.release_slot(task, job_id).await,
             Broker::Postgres(b) => b.release_slot(task, job_id).await,
+            Broker::Amqp(b) => {
+                b.release_slot(task, job_id);
+                Ok(())
+            }
         }
     }
 
@@ -264,6 +297,7 @@ impl Broker {
             Broker::Memory(b) => Ok(b.take_token(task, per_sec, burst)),
             Broker::Redis(b) => b.take_token(task, per_sec, burst).await,
             Broker::Postgres(b) => b.take_token(task, per_sec, burst).await,
+            Broker::Amqp(b) => Ok(b.take_token(task, per_sec, burst)),
         }
     }
 
@@ -277,6 +311,14 @@ impl Broker {
             Broker::Memory(b) => b.revoke(id, ttl_ms),
             Broker::Redis(b) => b.revoke(queue, id, ttl_ms).await,
             Broker::Postgres(b) => b.revoke(queue, id, ttl_ms).await,
+            // Not faked with a local set: a cancel the producer records and no
+            // worker can see would report success and change nothing.
+            Broker::Amqp(_) => Err(
+                "cancellation needs state every worker can read, and AMQP has no \
+                 shared store to hold it — use the Redis or Postgres broker if you \
+                 need to cancel queued work"
+                    .into(),
+            ),
         }
     }
 
@@ -297,6 +339,7 @@ impl Broker {
                 Ok(out)
             }
             Broker::Postgres(b) => b.revoked_all().await,
+            Broker::Amqp(_) => Ok(Vec::new()),
         }
     }
 
@@ -307,6 +350,7 @@ impl Broker {
             Broker::Memory(_) => Ok(Vec::new()),
             Broker::Redis(b) => b.depth(&b.queues).await,
             Broker::Postgres(b) => b.depth(&b.queues).await,
+            Broker::Amqp(b) => b.depth(&b.queues).await,
         }
     }
 
@@ -317,6 +361,7 @@ impl Broker {
             Broker::Memory(_) => Ok(Vec::new()),
             Broker::Redis(b) => b.depth(queues).await,
             Broker::Postgres(b) => b.depth(queues).await,
+            Broker::Amqp(b) => b.depth(queues).await,
         }
     }
 
@@ -327,6 +372,7 @@ impl Broker {
             Broker::Memory(_) => Vec::new(),
             Broker::Redis(b) => b.queues.clone(),
             Broker::Postgres(b) => b.queues.clone(),
+            Broker::Amqp(b) => b.queues.clone(),
         }
     }
 
@@ -336,6 +382,7 @@ impl Broker {
             Broker::Memory(_) => Vec::new(),
             Broker::Redis(b) => b.jobs(queues, limit).await?,
             Broker::Postgres(b) => b.jobs(queues, limit).await?,
+            Broker::Amqp(b) => b.jobs(queues, limit).await?,
         };
         // The Redis side reads the stream and the delayed set separately, so
         // the bound has to be applied again to the two of them together — a
@@ -353,6 +400,7 @@ impl Broker {
             Broker::Redis(b) => b.dead_list(queue, limit).await,
             Broker::Postgres(b) => b.dead_list(queue, limit).await,
             Broker::Memory(_) => Ok(Vec::new()),
+            Broker::Amqp(b) => b.dead_list(queue, limit).await,
         }
     }
 
@@ -367,6 +415,7 @@ impl Broker {
             Broker::Redis(b) => b.dead_replay(queue, ids).await,
             Broker::Postgres(b) => b.dead_replay(queue, ids).await,
             Broker::Memory(_) => Ok(0),
+            Broker::Amqp(b) => b.dead_drain(queue, ids, true).await,
         }
     }
 
@@ -376,6 +425,7 @@ impl Broker {
             Broker::Redis(b) => b.dead_purge(queue, ids).await,
             Broker::Postgres(b) => b.dead_purge(queue, ids).await,
             Broker::Memory(_) => Ok(0),
+            Broker::Amqp(b) => b.dead_drain(queue, ids, false).await,
         }
     }
 
@@ -406,6 +456,9 @@ impl Broker {
             (Broker::Memory(b), Receipt::Memory { id }) => b.settle(*id),
             (Broker::Redis(b), r) => b.dead_letter(r, error, traceback, keep).await,
             (Broker::Postgres(b), r) => b.dead_letter(r, error, traceback, keep).await,
+            (Broker::Amqp(b), r @ Receipt::Amqp { .. }) => {
+                b.dead_letter(r, error, traceback, keep).await
+            }
             _ => Err("receipt does not belong to this broker".into()),
         }
     }
@@ -447,6 +500,7 @@ impl Broker {
             Broker::Memory(b) => Ok(b.claim_tick(name, minute)),
             Broker::Redis(b) => b.claim_tick(name, minute).await,
             Broker::Postgres(b) => b.claim_tick(name, minute).await,
+            Broker::Amqp(b) => Ok(b.claim_tick(name, minute)),
         }
     }
 
@@ -461,6 +515,10 @@ impl Broker {
             Broker::Memory(_) => Ok(None),
             Broker::Redis(b) => b.claim_dedup(key, job_id, ttl_ms).await,
             Broker::Postgres(b) => b.claim_dedup(key, job_id, ttl_ms).await,
+            // None means "not a duplicate, go ahead": with no shared store two
+            // producers cannot see each other's sends, so dedup on AMQP only
+            // holds within one producer process. The docs say so.
+            Broker::Amqp(_) => Ok(None),
         }
     }
 
@@ -472,6 +530,7 @@ impl Broker {
             Broker::Memory(b) => b.store_result(id, blob, ttl),
             Broker::Redis(b) => b.store_result(id, blob, ttl).await,
             Broker::Postgres(b) => b.store_result(id, blob, ttl).await,
+            Broker::Amqp(b) => b.store_result(id, blob, ttl).await,
         }
     }
 
@@ -480,6 +539,7 @@ impl Broker {
             Broker::Memory(b) => Ok(b.get_result(id)),
             Broker::Redis(b) => b.get_result(id).await,
             Broker::Postgres(b) => b.get_result(id).await,
+            Broker::Amqp(b) => b.get_result(id).await,
         }
     }
 
@@ -491,6 +551,9 @@ impl Broker {
                 let promoted = b.promote_due().await?;
                 Ok(b.reclaim_expired(grace).await? + promoted)
             }
+            // On AMQP the server does this itself: an unacked delivery
+            // requeues the moment its connection dies, and TTL queues promote
+            // on their own. Memory and Postgres reclaim inside claim.
             _ => Ok(0),
         }
     }
@@ -646,6 +709,693 @@ impl MemoryBroker {
 }
 
 // ------------------------------------------------------------------- redis
+
+// ---------------------------------------------------------------- amqp broker
+
+/// Everything a claimed AMQP delivery needs to be retried or dead-lettered.
+///
+/// Carried inside the receipt because AMQP consumes destructively: after an
+/// ack the server holds nothing to requeue, so a retry is a fresh publish of
+/// this record with the attempt bumped.
+#[derive(Clone, Debug)]
+pub struct AmqpRecord {
+    pub id: String,
+    pub name: String,
+    pub payload: Vec<u8>,
+    pub timeout_ms: u32,
+    pub chain: Vec<u8>,
+    pub meta: Vec<u8>,
+    pub expires_ms: u64,
+    /// Explicit retries only. A crash redelivery reuses the server's copy of
+    /// the message, whose headers this process never got to bump — so on AMQP
+    /// `retries` counts handler failures, not worker deaths. Said in the docs.
+    pub attempt: u32,
+}
+
+/// RabbitMQ and anything else speaking AMQP 0.9.1.
+///
+/// What maps cleanly: durable queues, publisher confirms, ack/nack, crash
+/// redelivery (an unacked delivery returns the instant the connection dies —
+/// no lease clock needed, the connection *is* the lease), delays via per-TTL
+/// queues that dead-letter back, and a capped dead-letter queue.
+///
+/// What AMQP has no primitive for is shared state: no counters, no sets, no
+/// compare-and-swap. Rate limits, concurrency caps and the cron election are
+/// held in this process instead — correct with one worker, per-worker across
+/// many, which is exactly the shape Celery has always had on RabbitMQ.
+/// Cancellation and send-dedup are refused outright rather than faked.
+pub struct AmqpBroker {
+    channel: lapin::Channel,
+    conn: lapin::Connection,
+    queues: Vec<String>,
+    /// Queues declared this run, so steady-state publishes skip the declare.
+    /// Only queues without `x-expires` are cached: a delay queue deletes
+    /// itself when idle, and publishing to a deleted queue through the default
+    /// exchange drops the message without a sound.
+    declared: Mutex<std::collections::HashSet<String>>,
+    // Per-process stand-ins for state AMQP cannot hold.
+    ticks: Mutex<std::collections::HashSet<(String, i64)>>,
+    buckets: Mutex<HashMap<String, (f64, std::time::Instant)>>,
+    slots: Mutex<HashMap<String, HashMap<String, std::time::Instant>>>,
+}
+
+fn dead_key(queue: &str) -> String {
+    format!("{}:dead", stream_key(queue))
+}
+
+fn amqp_result_key(id: &str) -> String {
+    format!("tarsk:result:{id}")
+}
+
+fn amqp_header_str(headers: &lapin::types::FieldTable, key: &str) -> String {
+    match headers.inner().get(key) {
+        Some(lapin::types::AMQPValue::LongString(v)) => {
+            String::from_utf8_lossy(v.as_bytes()).into_owned()
+        }
+        _ => String::new(),
+    }
+}
+
+fn amqp_header_u64(headers: &lapin::types::FieldTable, key: &str) -> u64 {
+    match headers.inner().get(key) {
+        Some(lapin::types::AMQPValue::LongLongInt(v)) => (*v).max(0) as u64,
+        _ => 0,
+    }
+}
+
+fn amqp_header_bytes(headers: &lapin::types::FieldTable, key: &str) -> Vec<u8> {
+    match headers.inner().get(key) {
+        Some(lapin::types::AMQPValue::ByteArray(v)) => v.as_slice().to_vec(),
+        _ => Vec::new(),
+    }
+}
+
+impl AmqpBroker {
+    async fn connect(url: &str, queues: Vec<String>) -> Res<AmqpBroker> {
+        let conn = lapin::Connection::connect(url, lapin::ConnectionProperties::default()).await?;
+        let channel = conn.create_channel().await?;
+        // Publisher confirms, so push returning Ok means the server has the
+        // message — the durability push promises everywhere else.
+        channel
+            .confirm_select(lapin::options::ConfirmSelectOptions::default())
+            .await?;
+        let broker = AmqpBroker {
+            channel,
+            conn,
+            queues,
+            declared: Mutex::new(std::collections::HashSet::new()),
+            ticks: Mutex::new(std::collections::HashSet::new()),
+            buckets: Mutex::new(HashMap::new()),
+            slots: Mutex::new(HashMap::new()),
+        };
+        for queue in broker.queues.clone() {
+            broker.declare_plain(&stream_key(&queue)).await?;
+        }
+        Ok(broker)
+    }
+
+    /// Declare a durable queue with no arguments; cache it, since it cannot
+    /// expire out from under the cache.
+    async fn declare_plain(&self, name: &str) -> Res<u32> {
+        let q = self
+            .channel
+            .queue_declare(
+                name.into(),
+                lapin::options::QueueDeclareOptions {
+                    durable: true,
+                    ..Default::default()
+                },
+                lapin::types::FieldTable::default(),
+            )
+            .await?;
+        self.declared.lock().unwrap().insert(name.to_string());
+        Ok(q.message_count())
+    }
+
+    /// The wait queue for one exact delay: fixed per-queue TTL, dead-lettering
+    /// back to the real queue when it fires.
+    ///
+    /// One queue per distinct delay value rather than per message, because a
+    /// queue only expires its *head* — mixed TTLs in one queue leave a 5s
+    /// delay stuck behind an hour. `x-expires` deletes an idle wait queue, so
+    /// the set stays bounded by the delays actually in use; the declare is
+    /// repeated every publish for the same reason it is not cached.
+    async fn delay_queue(&self, queue: &str, ms: u64) -> Res<String> {
+        let name = format!("{}:delay:{}", stream_key(queue), ms);
+        let mut args = lapin::types::FieldTable::default();
+        args.insert(
+            "x-message-ttl".into(),
+            lapin::types::AMQPValue::LongLongInt(ms as i64),
+        );
+        args.insert(
+            "x-dead-letter-exchange".into(),
+            lapin::types::AMQPValue::LongString("".into()),
+        );
+        args.insert(
+            "x-dead-letter-routing-key".into(),
+            lapin::types::AMQPValue::LongString(stream_key(queue).into()),
+        );
+        args.insert(
+            "x-expires".into(),
+            lapin::types::AMQPValue::LongLongInt(ms as i64 + 60_000),
+        );
+        self.channel
+            .queue_declare(
+                name.as_str().into(),
+                lapin::options::QueueDeclareOptions {
+                    durable: true,
+                    ..Default::default()
+                },
+                args,
+            )
+            .await?;
+        Ok(name)
+    }
+
+    fn encode(
+        record: &AmqpRecord,
+        ready_at_ms: u64,
+        extra: &[(&str, &str)],
+    ) -> lapin::BasicProperties {
+        use lapin::types::AMQPValue;
+        let mut headers = lapin::types::FieldTable::default();
+        headers.insert(
+            "tarsk-id".into(),
+            AMQPValue::LongString(record.id.as_str().into()),
+        );
+        headers.insert(
+            "tarsk-name".into(),
+            AMQPValue::LongString(record.name.as_str().into()),
+        );
+        headers.insert(
+            "tarsk-timeout-ms".into(),
+            AMQPValue::LongLongInt(record.timeout_ms as i64),
+        );
+        headers.insert(
+            "tarsk-expires-ms".into(),
+            AMQPValue::LongLongInt(record.expires_ms as i64),
+        );
+        headers.insert(
+            "tarsk-attempt".into(),
+            AMQPValue::LongLongInt(record.attempt as i64),
+        );
+        headers.insert(
+            "tarsk-ready-at".into(),
+            AMQPValue::LongLongInt(ready_at_ms as i64),
+        );
+        if !record.chain.is_empty() {
+            headers.insert(
+                "tarsk-chain".into(),
+                AMQPValue::ByteArray(record.chain.clone().into()),
+            );
+        }
+        if !record.meta.is_empty() {
+            headers.insert(
+                "tarsk-meta".into(),
+                AMQPValue::ByteArray(record.meta.clone().into()),
+            );
+        }
+        for (key, value) in extra {
+            headers.insert((*key).into(), AMQPValue::LongString((*value).into()));
+        }
+        lapin::BasicProperties::default()
+            .with_delivery_mode(2)
+            .with_headers(headers)
+    }
+
+    async fn publish_record(
+        &self,
+        target: &str,
+        record: &AmqpRecord,
+        ready_at_ms: u64,
+        extra: &[(&str, &str)],
+    ) -> Res<()> {
+        self.channel
+            .basic_publish(
+                "".into(),
+                target.into(),
+                lapin::options::BasicPublishOptions::default(),
+                &record.payload,
+                Self::encode(record, ready_at_ms, extra),
+            )
+            .await?
+            .await?;
+        Ok(())
+    }
+
+    async fn push(&self, job: NewJob, delay: Duration) -> Res<()> {
+        let queue = job.queue.clone();
+        let record = AmqpRecord {
+            id: job.id,
+            name: job.name,
+            payload: job.payload,
+            timeout_ms: job.timeout_ms,
+            chain: job.chain,
+            meta: job.meta,
+            expires_ms: job.expires_ms,
+            attempt: 0,
+        };
+        let ready_at = now_ms() + delay.as_millis() as u64;
+        // The queue has to exist first: a publish through the default exchange
+        // to a missing queue is dropped without a sound — no error, no return,
+        // just a message that never was. Redis creates its stream on first
+        // XADD; AMQP does not, and a producer connects knowing no queue names.
+        let main = stream_key(&queue);
+        if !self.declared.lock().unwrap().contains(&main) {
+            self.declare_plain(&main).await?;
+        }
+        let target = if delay.is_zero() {
+            main
+        } else {
+            self.delay_queue(&queue, delay.as_millis() as u64).await?
+        };
+        self.publish_record(&target, &record, ready_at, &[]).await
+    }
+
+    fn delivery(&self, queue: &str, msg: lapin::message::BasicGetMessage) -> Delivery {
+        let empty = lapin::types::FieldTable::default();
+        let headers = msg.properties.headers().as_ref().unwrap_or(&empty);
+        let record = AmqpRecord {
+            id: amqp_header_str(headers, "tarsk-id"),
+            name: amqp_header_str(headers, "tarsk-name"),
+            payload: msg.data.clone(),
+            timeout_ms: amqp_header_u64(headers, "tarsk-timeout-ms") as u32,
+            chain: amqp_header_bytes(headers, "tarsk-chain"),
+            meta: amqp_header_bytes(headers, "tarsk-meta"),
+            expires_ms: amqp_header_u64(headers, "tarsk-expires-ms"),
+            attempt: amqp_header_u64(headers, "tarsk-attempt") as u32,
+        };
+        let ready_at_ms = amqp_header_u64(headers, "tarsk-ready-at");
+        Delivery {
+            id: record.id.clone(),
+            name: record.name.clone(),
+            payload: record.payload.clone(),
+            attempt: record.attempt + 1,
+            ready_at_ms,
+            expires_ms: record.expires_ms,
+            chain: record.chain.clone(),
+            meta: record.meta.clone(),
+            receipt: Receipt::Amqp {
+                queue: queue.to_string(),
+                acker: msg.acker.clone(),
+                record,
+            },
+        }
+    }
+
+    /// One pass over the queues in priority order; sleep and repeat until
+    /// `block` runs out. Polling, like the Postgres broker — AMQP's push-based
+    /// consumers cannot give strict priority across queues, and a claim that
+    /// buffers pushed messages is holding work other workers could be doing.
+    async fn claim(&self, block: Duration) -> Res<Option<Delivery>> {
+        let deadline = std::time::Instant::now() + block;
+        loop {
+            for queue in &self.queues {
+                let got = self
+                    .channel
+                    .basic_get(
+                        stream_key(queue).as_str().into(),
+                        lapin::options::BasicGetOptions { no_ack: false },
+                    )
+                    .await?;
+                if let Some(msg) = got {
+                    return Ok(Some(self.delivery(queue, msg)));
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return Ok(None);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    async fn retry(&self, receipt: &Receipt, delay: Duration) -> Res<()> {
+        let Receipt::Amqp {
+            queue,
+            acker,
+            record,
+        } = receipt
+        else {
+            return Err("not an amqp receipt".into());
+        };
+        let mut again = record.clone();
+        again.attempt += 1;
+        let ready_at = now_ms() + delay.as_millis() as u64;
+        let target = if delay.is_zero() {
+            stream_key(queue)
+        } else {
+            self.delay_queue(queue, delay.as_millis() as u64).await?
+        };
+        // Publish before ack: a crash between the two duplicates the job,
+        // which is the at-least-once this queue promises. The other order
+        // loses it.
+        self.publish_record(&target, &again, ready_at, &[]).await?;
+        acker
+            .ack(lapin::options::BasicAckOptions::default())
+            .await?;
+        Ok(())
+    }
+
+    async fn dead_letter(
+        &self,
+        receipt: &Receipt,
+        error: &str,
+        traceback: &str,
+        keep: u64,
+    ) -> Res<()> {
+        let Receipt::Amqp {
+            queue,
+            acker,
+            record,
+        } = receipt
+        else {
+            return Err("not an amqp receipt".into());
+        };
+        let dead = dead_key(queue);
+        if !self.declared.lock().unwrap().contains(&dead) {
+            self.declare_plain(&dead).await?;
+        }
+        let died = now_ms().to_string();
+        self.publish_record(
+            &dead,
+            record,
+            now_ms(),
+            &[
+                ("tarsk-error", error),
+                ("tarsk-traceback", traceback),
+                ("tarsk-died-at", &died),
+            ],
+        )
+        .await?;
+        acker
+            .ack(lapin::options::BasicAckOptions::default())
+            .await?;
+        if keep > 0 {
+            // The cap, enforced the only way AMQP offers after the fact:
+            // count, then eat the oldest. Redis trims with MAXLEN and
+            // Postgres deletes past the newest N; this is the same promise
+            // paid for one get at a time.
+            let mut count = self.declare_plain(&dead).await? as u64;
+            while count > keep {
+                let Some(oldest) = self
+                    .channel
+                    .basic_get(
+                        dead.as_str().into(),
+                        lapin::options::BasicGetOptions { no_ack: false },
+                    )
+                    .await?
+                else {
+                    break;
+                };
+                oldest
+                    .acker
+                    .ack(lapin::options::BasicAckOptions::default())
+                    .await?;
+                count -= 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// Peek up to `limit` messages: get, record, and put every one back.
+    async fn peek(
+        &self,
+        name: &str,
+        limit: usize,
+    ) -> Res<Vec<(AmqpRecord, u64, lapin::types::FieldTable, lapin::Acker)>> {
+        if !self.declared.lock().unwrap().contains(name) {
+            self.declare_plain(name).await?;
+        }
+        let mut seen = Vec::new();
+        for _ in 0..limit {
+            let Some(msg) = self
+                .channel
+                .basic_get(
+                    name.into(),
+                    lapin::options::BasicGetOptions { no_ack: false },
+                )
+                .await?
+            else {
+                break;
+            };
+            let empty = lapin::types::FieldTable::default();
+            let headers = msg.properties.headers().as_ref().unwrap_or(&empty).clone();
+            let record = AmqpRecord {
+                id: amqp_header_str(&headers, "tarsk-id"),
+                name: amqp_header_str(&headers, "tarsk-name"),
+                payload: msg.data.clone(),
+                timeout_ms: amqp_header_u64(&headers, "tarsk-timeout-ms") as u32,
+                chain: amqp_header_bytes(&headers, "tarsk-chain"),
+                meta: amqp_header_bytes(&headers, "tarsk-meta"),
+                expires_ms: amqp_header_u64(&headers, "tarsk-expires-ms"),
+                attempt: amqp_header_u64(&headers, "tarsk-attempt") as u32,
+            };
+            let ready = amqp_header_u64(&headers, "tarsk-ready-at");
+            seen.push((record, ready, headers, msg.acker.clone()));
+        }
+        Ok(seen)
+    }
+
+    async fn requeue_all(
+        &self,
+        seen: Vec<(AmqpRecord, u64, lapin::types::FieldTable, lapin::Acker)>,
+    ) -> Res<()> {
+        for (_, _, _, acker) in seen {
+            acker
+                .nack(lapin::options::BasicNackOptions {
+                    requeue: true,
+                    ..Default::default()
+                })
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn store_result(&self, id: &str, blob: Vec<u8>, ttl: Duration) -> Res<()> {
+        let name = amqp_result_key(id);
+        let ttl_ms = ttl.as_millis().max(1) as i64;
+        let mut args = lapin::types::FieldTable::default();
+        args.insert(
+            "x-expires".into(),
+            lapin::types::AMQPValue::LongLongInt(ttl_ms),
+        );
+        args.insert(
+            "x-message-ttl".into(),
+            lapin::types::AMQPValue::LongLongInt(ttl_ms),
+        );
+        self.channel
+            .queue_declare(
+                name.as_str().into(),
+                lapin::options::QueueDeclareOptions {
+                    durable: true,
+                    ..Default::default()
+                },
+                args,
+            )
+            .await?;
+        // Purge first: progress overwrites, and a result queue holds one blob.
+        self.channel
+            .queue_purge(
+                name.as_str().into(),
+                lapin::options::QueuePurgeOptions::default(),
+            )
+            .await?;
+        self.channel
+            .basic_publish(
+                "".into(),
+                name.as_str().into(),
+                lapin::options::BasicPublishOptions::default(),
+                &blob,
+                lapin::BasicProperties::default().with_delivery_mode(2),
+            )
+            .await?
+            .await?;
+        Ok(())
+    }
+
+    async fn get_result(&self, id: &str) -> Res<Option<Vec<u8>>> {
+        // A passive declare on a missing queue closes the channel, so this
+        // uses a throwaway one and reads a closed channel as "no result yet".
+        let channel = match self.conn.create_channel().await {
+            Ok(channel) => channel,
+            Err(_) => return Ok(None),
+        };
+        let name = amqp_result_key(id);
+        let exists = channel
+            .queue_declare(
+                name.as_str().into(),
+                lapin::options::QueueDeclareOptions {
+                    passive: true,
+                    ..Default::default()
+                },
+                lapin::types::FieldTable::default(),
+            )
+            .await;
+        if exists.is_err() {
+            return Ok(None);
+        }
+        let Some(msg) = channel
+            .basic_get(
+                name.as_str().into(),
+                lapin::options::BasicGetOptions { no_ack: false },
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let blob = msg.data.clone();
+        msg.acker
+            .nack(lapin::options::BasicNackOptions {
+                requeue: true,
+                ..Default::default()
+            })
+            .await?;
+        Ok(Some(blob))
+    }
+
+    fn take_token(&self, task: &str, per_sec: f64, burst: u32) -> u64 {
+        let now = std::time::Instant::now();
+        let mut buckets = self.buckets.lock().unwrap();
+        let (tokens, seen) = buckets
+            .entry(task.to_string())
+            .or_insert((burst as f64, now));
+        *tokens = (*tokens + seen.elapsed().as_secs_f64() * per_sec).min(burst as f64);
+        *seen = now;
+        if *tokens >= 1.0 {
+            *tokens -= 1.0;
+            0
+        } else {
+            (((1.0 - *tokens) / per_sec) * 1000.0).ceil() as u64
+        }
+    }
+
+    fn acquire_slot(&self, task: &str, job_id: &str, cap: u32, lease_ms: u64) -> bool {
+        let now = std::time::Instant::now();
+        let mut slots = self.slots.lock().unwrap();
+        let held = slots.entry(task.to_string()).or_default();
+        held.retain(|_, deadline| *deadline > now);
+        if held.len() >= cap as usize {
+            return false;
+        }
+        held.insert(
+            job_id.to_string(),
+            now + Duration::from_millis(lease_ms.max(1)),
+        );
+        true
+    }
+
+    fn release_slot(&self, task: &str, job_id: &str) {
+        if let Some(held) = self.slots.lock().unwrap().get_mut(task) {
+            held.remove(job_id);
+        }
+    }
+
+    fn claim_tick(&self, name: &str, minute: i64) -> bool {
+        self.ticks
+            .lock()
+            .unwrap()
+            .insert((name.to_string(), minute))
+    }
+
+    /// Ready and dead are what a declare reports; in-flight and delayed are
+    /// zeros, honestly. Unacked counts live in the management API this driver
+    /// does not speak, and delay queues are named by value, so neither is
+    /// countable from AMQP proper. The docs say so next to the status table.
+    async fn depth(&self, wanted: &[String]) -> Res<Vec<Depth>> {
+        let mut rows = Vec::new();
+        for queue in wanted {
+            let ready = self.declare_plain(&stream_key(queue)).await? as u64;
+            let dead = self.declare_plain(&dead_key(queue)).await? as u64;
+            rows.push(Depth {
+                queue: queue.clone(),
+                ready,
+                in_flight: 0,
+                delayed: 0,
+                dead,
+            });
+        }
+        Ok(rows)
+    }
+
+    async fn jobs(&self, wanted: &[String], limit: usize) -> Res<Vec<Listed>> {
+        let mut rows = Vec::new();
+        for queue in wanted {
+            let seen = self
+                .peek(&stream_key(queue), limit.saturating_sub(rows.len()))
+                .await?;
+            let now = now_ms();
+            for (record, ready, _, _) in &seen {
+                rows.push(Listed {
+                    id: record.id.clone(),
+                    queue: queue.clone(),
+                    name: record.name.clone(),
+                    state: "ready",
+                    attempt: record.attempt + 1,
+                    age_ms: now.saturating_sub(*ready) as i64,
+                    worker: String::new(),
+                    meta: record.meta.clone(),
+                });
+            }
+            self.requeue_all(seen).await?;
+            if rows.len() >= limit {
+                break;
+            }
+        }
+        Ok(rows)
+    }
+
+    async fn dead_list(&self, queue: &str, limit: usize) -> Res<Vec<Dead>> {
+        let seen = self.peek(&dead_key(queue), limit).await?;
+        let rows = seen
+            .iter()
+            .map(|(record, _, headers, _)| Dead {
+                id: record.id.clone(),
+                name: record.name.clone(),
+                error: amqp_header_str(headers, "tarsk-error"),
+                traceback: amqp_header_str(headers, "tarsk-traceback"),
+                died_at_ms: amqp_header_str(headers, "tarsk-died-at")
+                    .parse()
+                    .unwrap_or(0),
+            })
+            .collect();
+        self.requeue_all(seen).await?;
+        Ok(rows)
+    }
+
+    /// Drain the dead queue once, replaying or purging what matches and
+    /// putting the rest back. Bounded by what one pass sees, which for a
+    /// capped dead queue is the whole of it.
+    async fn dead_drain(&self, queue: &str, ids: &[String], replay: bool) -> Res<usize> {
+        let seen = self.peek(&dead_key(queue), 10_000).await?;
+        let mut hit = 0;
+        let mut keep = Vec::new();
+        for entry in seen {
+            let wanted = ids.is_empty() || ids.contains(&entry.0.id);
+            if !wanted {
+                keep.push(entry);
+                continue;
+            }
+            let (record, _, _, acker) = entry;
+            if replay {
+                let main = stream_key(queue);
+                if !self.declared.lock().unwrap().contains(&main) {
+                    self.declare_plain(&main).await?;
+                }
+                let fresh = AmqpRecord {
+                    attempt: 0,
+                    ..record
+                };
+                self.publish_record(&main, &fresh, now_ms(), &[]).await?;
+            }
+            acker
+                .ack(lapin::options::BasicAckOptions::default())
+                .await?;
+            hit += 1;
+        }
+        self.requeue_all(keep).await?;
+        Ok(hit)
+    }
+}
 
 pub struct RedisBroker {
     /// Cloned per command rather than locked. A MultiplexedConnection is built

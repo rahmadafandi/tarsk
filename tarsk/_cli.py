@@ -58,53 +58,56 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="tarsk")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    web = sub.add_parser("web", help="serve the console without running a worker")
-    web.add_argument("--broker", default=os.environ.get("TARSK_BROKER"),
-                     help="redis://…, postgres://… (or TARSK_BROKER)")
-    web.add_argument("--queues", default="default", help="comma separated")
+    # Every subcommand talks to a broker, so the flag pair lives once, here.
+    # A parent parser rather than a loop over subparsers, because argparse
+    # copies parent arguments in at add_parser time — which also means the
+    # environment must be read before build_parser runs (see load_dotenv).
+    broker_args = argparse.ArgumentParser(add_help=False)
+    broker_args.add_argument("--broker", default=os.environ.get("TARSK_BROKER"),
+                             help="redis://…, postgres://…, amqp://… (or TARSK_BROKER, or ./.env)")
+    broker_args.add_argument("--queues", default="default", help="comma separated")
+
+    web = sub.add_parser("web", parents=[broker_args],
+                         help="serve the console without running a worker")
     web.add_argument("--addr", default="127.0.0.1:9099",
                      help="where to listen. Off loopback it refuses to start without "
                           "TARSK_ADMIN_TOKEN, since the console shows task payloads")
 
-    status = sub.add_parser("status", help="how much work is waiting")
-    status.add_argument("--broker", default=os.environ.get("TARSK_BROKER"),
-                        help="redis://…, postgres://… (or TARSK_BROKER)")
-    status.add_argument("--queues", default="default", help="comma separated")
+    status = sub.add_parser("status", parents=[broker_args],
+                            help="how much work is waiting")
 
-    jobs = sub.add_parser("jobs", help="which jobs are waiting or running")
-    jobs.add_argument("--broker", default=os.environ.get("TARSK_BROKER"),
-                      help="redis://…, postgres://… (or TARSK_BROKER)")
-    jobs.add_argument("--queues", default="default", help="comma separated")
+    jobs = sub.add_parser("jobs", parents=[broker_args],
+                          help="which jobs are waiting or running")
     jobs.add_argument("--state", choices=["ready", "running", "delayed"],
                       help="only this one")
     jobs.add_argument("--limit", type=int, default=50)
     jobs.add_argument("--meta", action="store_true",
                       help="show what the sender attached, on its own line")
 
-    cancel = sub.add_parser("cancel", help="stop queued jobs from running")
+    # cancel and dead act on one queue, so they take --queue, not --queues.
+    single_queue = argparse.ArgumentParser(add_help=False)
+    single_queue.add_argument("--broker", default=os.environ.get("TARSK_BROKER"),
+                              help="redis://…, postgres://…, amqp://… (or TARSK_BROKER, or ./.env)")
+    single_queue.add_argument("--queue", default="default")
+
+    cancel = sub.add_parser("cancel", parents=[single_queue],
+                            help="stop queued jobs from running")
     cancel.add_argument("ids", nargs="+", metavar="ID")
-    cancel.add_argument("--broker", default=os.environ.get("TARSK_BROKER"),
-                        help="redis://…, postgres://… (or TARSK_BROKER)")
-    cancel.add_argument("--queue", default="default")
     cancel.add_argument("--ttl", type=float, default=86400.0,
                         help="how long to remember the cancellation. Must outlive the job: "
                              "something scheduled for next week needs a week")
 
-    dead = sub.add_parser("dead", help="inspect and replay the dead letters")
+    dead = sub.add_parser("dead", parents=[single_queue],
+                          help="inspect and replay the dead letters")
     dead.add_argument("action", choices=["list", "show", "replay", "purge"])
     dead.add_argument("ids", nargs="*", metavar="ID",
                       help="which entries. Empty means all, except for `show`")
-    dead.add_argument("--broker", default=os.environ.get("TARSK_BROKER"),
-                      help="redis://…, postgres://… (or TARSK_BROKER)")
-    dead.add_argument("--queue", default="default")
     dead.add_argument("--limit", type=int, default=50, help="how many to list")
 
-    worker = sub.add_parser("worker", help="run a supervisor and its children")
+    worker = sub.add_parser("worker", parents=[broker_args],
+                            help="run a supervisor and its children")
     worker.add_argument("--app", required=True, metavar="module:app",
                         help="where children find your tasks")
-    worker.add_argument("--broker", default=os.environ.get("TARSK_BROKER"),
-                        help="redis://…, postgres://… (or TARSK_BROKER)")
-    worker.add_argument("--queues", default="default", help="comma separated")
     worker.add_argument("--children", type=int, default=2)
     worker.add_argument("--slots", type=int, default=DEFAULT_SLOTS,
                         help=f"tasks in flight per child (default {DEFAULT_SLOTS}). "

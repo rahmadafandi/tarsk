@@ -710,6 +710,32 @@ def check_broker(url: str, label: str) -> None:
             stop_worker(worker)
         assert answer == 9, f"{label}: paced chain returned {answer!r}"
 
+        # --- set_progress works from both kinds of handler ----------------
+        #
+        # From an async handler it used to block the loop thread on a frame
+        # the blocked loop could never send — freezing every slot in the
+        # child, not just the task that called it. From a sync handler it
+        # must keep blocking its executor thread, so progress is on the wire
+        # before the work continues.
+        log.write_text("")
+        worker = start_worker(env, TARSK_LEASE_GRACE=1, TARSK_SLOTS=8)
+        try:
+            for name, expect in (("async_progress", "done-async"),
+                                 ("sync_progress", "done-sync")):
+                rid = app.registry[name].send()
+                handle = app.result(rid)
+                seen = None
+                deadline = time.time() + 20
+                while time.time() < deadline and not handle.ready():
+                    seen = handle.progress() or seen
+                    time.sleep(0.05)
+                assert handle.get(timeout=10) == expect, f"{label}: {name} result"
+                assert seen == 2, (
+                    f"{label}: {name} progress read {seen!r}, wanted the last report"
+                )
+        finally:
+            stop_worker(worker)
+
         # --- a delayed send keeps what was attached to it -----------------
         #
         # Delayed jobs wait in a hash beside the stream rather than in it, and

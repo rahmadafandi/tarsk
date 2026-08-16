@@ -219,7 +219,22 @@ async def _one(app, wire: Wire, app_spec: str, task_id: int, name: str, payload,
         loop = asyncio.get_running_loop()
 
         def emit(value, _id=task_id):
-            wire.send_threadsafe(loop, "Progress", _id, _proto.pack_result(value))
+            payload = _proto.pack_result(value)
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                # A sync handler calls this from its executor thread: block
+                # that thread until the frame is out, so progress is on the
+                # wire before the work continues.
+                wire.send_threadsafe(loop, "Progress", _id, payload)
+            else:
+                # An async handler calls this from the loop thread itself, and
+                # blocking here is a deadlock: .result() would wait on a
+                # coroutine the blocked loop can never run — freezing not just
+                # this task but every slot in the child, since the read loop
+                # shares the same thread. Scheduled instead; Wire's lock keeps
+                # the frame whole against concurrent Acks.
+                loop.create_task(wire.send("Progress", _id, payload))
 
         ctx = Context(
             name=name,

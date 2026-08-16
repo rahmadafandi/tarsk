@@ -144,6 +144,26 @@ def whenever(tag):
     return tag
 
 
+@app.task(name="async_progress", result_ttl=60)
+async def async_progress(ctx=Depends(Context)):
+    """set_progress from the loop thread used to deadlock the whole child."""
+    import asyncio
+
+    for step in (1, 2):
+        ctx.set_progress(step)
+        await asyncio.sleep(0.2)
+    return "done-async"
+
+
+@app.task(name="sync_progress", result_ttl=60)
+def sync_progress(ctx=Depends(Context)):
+    """The executor-thread path, which must keep blocking until the frame is out."""
+    for step in (1, 2):
+        ctx.set_progress(step)
+        time.sleep(0.2)
+    return "done-sync"
+
+
 @app.task(name="metered", rate_limit="5/s")
 def metered(tag):
     """Nothing slow: whatever paces this is the limiter, not the handler."""

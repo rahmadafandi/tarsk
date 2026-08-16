@@ -89,11 +89,8 @@ class Supervisor:
         from . import Chain, Signature
 
         if isinstance(job, Chain):
-            head, rest = job.steps[0], job.steps[1:]
-            chain = _proto.pack_chain([s._row() for s in rest]) if rest else b""
-            return (head.task.spec.name, _proto.pack_args(head.args, head.kwargs),
-                    head.task_id, head.task.spec.queue, head.task.spec.timeout_ms,
-                    chain, b"", 0)
+            head, packed = job._parts()
+            return Supervisor._record(head)[:5] + (packed, b"", 0)
         if isinstance(job, Signature):
             return (job.task.spec.name, _proto.pack_args(job.args, job.kwargs),
                     job.task_id, job.task.spec.queue, job.task.spec.timeout_ms,

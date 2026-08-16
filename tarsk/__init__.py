@@ -607,12 +607,19 @@ class Chain:
         """
         return self.steps[-1].task_id
 
-    def send(self) -> str:
+    def _parts(self) -> tuple:
+        """The head signature and the packed tail — the two things every
+        transport needs, whether the send goes through a producer or straight
+        into the batch runner."""
         from . import _proto
 
         head, rest = self.steps[0], self.steps[1:]
-        chain = _proto.pack_chain([s._row() for s in rest]) if rest else b""
-        Enqueue(head.task, task_id=head.task_id, chain=chain).send(*head.args, **head.kwargs)
+        packed = _proto.pack_chain([s._row() for s in rest]) if rest else b""
+        return head, packed
+
+    def send(self) -> str:
+        head, packed = self._parts()
+        Enqueue(head.task, task_id=head.task_id, chain=packed).send(*head.args, **head.kwargs)
         return self.result_id
 
     async def send_async(self) -> str:

@@ -45,6 +45,25 @@ def slow_sync():
     return "unreachable"
 
 
+@app.task(name="one_lane", max_concurrency=1)
+def one_lane(n):
+    """Held to one at a time by the broker, however many slots exist."""
+    time.sleep(0.3)
+    return n
+
+
+@app.task(name="slow_lane")
+def slow_lane():
+    time.sleep(1.2)
+    return "done"
+
+
+@app.task(name="milk", expires=0.5)
+def milk():
+    """Half a second on the shelf; anything later is not worth running."""
+    return "fresh"
+
+
 @app.task(name="hard_crash", retries=1)
 def hard_crash():
     os._exit(1)

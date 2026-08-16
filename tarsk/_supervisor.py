@@ -48,14 +48,21 @@ class Supervisor:
         self.stats: dict[str, int] = {}
         self.exits: list[int] = []
 
-    def run(self, jobs: list[tuple[str, tuple, dict]]) -> dict[int, tuple[str, Any]]:
+    def run(self, jobs: list) -> dict[int, tuple[str, Any]]:
         """Run `jobs` to completion over the in-memory broker.
 
+        Each entry is a `(name, args, kwargs)` triple, a `tarsk.Signature`, or
+        a `tarsk.Chain` — the last so the whole chain machinery is exercisable
+        without a broker process, which is how a chain bug once went
+        unreproducible here and had to be chased on Postgres instead.
+
         Returns {task_id: ("ack", value) | ("nack", (error_type, traceback))}.
-        This is the batch path — tests and benchmarks. Production uses `work`,
-        which consumes a real broker and does not return on its own.
+        Chain steps settle under their own later task_ids, in completion
+        order past the submitted jobs. This is the batch path — tests and
+        benchmarks. Production uses `work`, which consumes a real broker and
+        does not return on its own.
         """
-        packed = [(name, _proto.pack_args(args, kwargs)) for name, args, kwargs in jobs]
+        packed = [self._record(job) for job in jobs]
         outcomes, self.stats, self.exits = _core.run(
             self.app_spec,
             packed,
@@ -71,6 +78,28 @@ class Supervisor:
             task_id: ("ack", _proto.unpack_result(result)) if ok else ("nack", (error_type, tb))
             for task_id, ok, result, error_type, tb in outcomes
         }
+
+    @staticmethod
+    def _record(job) -> tuple:
+        """One batch job in the shape `_core.run` takes.
+
+        Mirrors what `Chain.send` and `Enqueue.send` put on a real broker, so
+        batch mode runs the same records production would.
+        """
+        from . import Chain, Signature
+
+        if isinstance(job, Chain):
+            head, rest = job.steps[0], job.steps[1:]
+            chain = _proto.pack_chain([s._row() for s in rest]) if rest else b""
+            return (head.task.spec.name, _proto.pack_args(head.args, head.kwargs),
+                    head.task_id, head.task.spec.queue, head.task.spec.timeout_ms,
+                    chain, b"", 0)
+        if isinstance(job, Signature):
+            return (job.task.spec.name, _proto.pack_args(job.args, job.kwargs),
+                    job.task_id, job.task.spec.queue, job.task.spec.timeout_ms,
+                    b"", b"", 0)
+        name, args, kwargs = job
+        return (name, _proto.pack_args(args, kwargs), "", "default", 0, b"", b"", 0)
 
     def work(
         self,

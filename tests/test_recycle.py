@@ -276,6 +276,49 @@ def test_soft_timeout_is_refused_where_it_cannot_work():
         raise AssertionError("soft_timeout >= timeout was accepted")
 
 
+def test_memory_broker_carries_the_full_record():
+    """Chains, concurrency caps and expiry on the in-memory broker.
+
+    These three lived only on Redis and Postgres for a while: batch jobs
+    carried no id/queue/chain, acquire_slot always said yes, and the memory
+    broker never stamped when a job became runnable — so expiry read every
+    job as too young to drop. A chain bug once had to be chased on Postgres
+    because this broker could not express a chain at all.
+    """
+    import time as _time
+
+    from tarsk import chain
+    import tests.demo_app as demo
+
+    # A chain ends the batch only after its tail has settled, and the tail is
+    # fed the head's result.
+    sup = Supervisor("tests.demo_app:app", children=1, slots=4)
+    results = sup.run([chain(demo.add.s(1, 2), demo.add.s(10))])
+    answers = sorted(v for kind, v in results.values() if kind == "ack")
+    assert answers == [3, 13], f"chain on memory broker returned {results}"
+
+    # max_concurrency=1 must serialise three 0.3s tasks even with slots free.
+    sup = Supervisor("tests.demo_app:app", children=2, slots=4)
+    started = _time.time()
+    results = sup.run([("one_lane", (n,), {}) for n in range(3)])
+    wall = _time.time() - started
+    assert all(kind == "ack" for kind, _ in results.values()), results
+    assert wall >= 0.75, (
+        f"three capped 0.3s tasks finished in {wall:.2f}s — the cap did not hold"
+    )
+
+    # A job that waited past its expires is dropped, not run. Needs the memory
+    # broker to know when the job became runnable; it used to say "no idea",
+    # which no expiry check treats as expired.
+    sup = Supervisor("tests.demo_app:app", children=1, slots=1)
+    results = sup.run([("slow_lane", (), {}), ("milk", (), {})])
+    assert results[0] == ("ack", "done"), results[0]
+    kind, detail = results[1]
+    assert kind == "nack" and detail[0] == "Expired", (
+        f"a job 1.2s past expires=0.5 came back as {results[1]}"
+    )
+
+
 if __name__ == "__main__":
     for check in (test_leaky_handler_is_bounded, test_recycling_is_overlapped,
                   test_baseline_above_ceiling_is_refused,
@@ -285,6 +328,7 @@ if __name__ == "__main__":
                   test_middleware_wraps_and_dependencies_inject,
                   test_before_send_can_attach_to_the_payload,
                   test_soft_timeout_asks_before_it_takes,
-                  test_soft_timeout_is_refused_where_it_cannot_work):
+                  test_soft_timeout_is_refused_where_it_cannot_work,
+                  test_memory_broker_carries_the_full_record):
         check()
         print("ok", check.__name__)

@@ -218,7 +218,10 @@ pub(crate) struct Shared {
     /// Only populated in batch mode. A worker draining a real broker runs for
     /// weeks; keeping every outcome in a map would be a leak with a schedule.
     results: Mutex<HashMap<u64, Outcome>>,
-    total: usize,
+    /// How many settled results end a batch run. Grows when a chain step is
+    /// queued: a chain's tail is work this run created and still owes, and a
+    /// count fixed at submission would end the run with the tail unrun.
+    total: std::sync::atomic::AtomicUsize,
     next_task_id: AtomicU64,
     work: Notify,
     done: AtomicBool,
@@ -317,7 +320,7 @@ impl Shared {
         results.entry(task_id).or_insert(outcome); // at-least-once: first wins
         let settled = results.len();
         drop(results);
-        if settled >= self.total {
+        if settled >= self.total.load(Ordering::SeqCst) {
             self.done.store(true, Ordering::SeqCst);
         }
         self.work.notify_waiters();
@@ -447,6 +450,9 @@ impl Shared {
             meta: Vec::new(),
             expires_ms: 0,
         };
+        if self.batch() {
+            self.total.fetch_add(1, Ordering::SeqCst);
+        }
         if self.broker.push(next_job, Duration::ZERO).await.is_err() {
             self.counters.broker_errors.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -1879,7 +1885,9 @@ async fn supervise(
     // Say so rather than hanging or reporting a clean run.
     if batch && !shared.done.load(Ordering::SeqCst) {
         let settled = shared.results.lock().unwrap().len();
-        for task_id in 0..total as u64 {
+        // The grown total, not the submitted one: chain steps queued mid-run
+        // took memory ids past the original count and deserve the same answer.
+        for task_id in 0..shared.total.load(Ordering::SeqCst) as u64 {
             if shared.results.lock().unwrap().contains_key(&task_id) {
                 continue;
             }
@@ -1930,7 +1938,7 @@ fn new_shared(broker: Broker, total: usize, batch: bool) -> Arc<Shared> {
     Arc::new(Shared {
         broker,
         results: Mutex::new(HashMap::new()),
-        total,
+        total: std::sync::atomic::AtomicUsize::new(total),
         next_task_id: AtomicU64::new(0),
         work: Notify::new(),
         done: AtomicBool::new(batch && total == 0),
@@ -2038,6 +2046,12 @@ type BatchResult = (Vec<Py<PyAny>>, HashMap<String, u64>, Vec<i32>);
 /// Batch mode: run a fixed list of jobs to completion over the memory broker.
 /// The tests and the benchmark harness live here; production goes through
 /// `work`, which never returns on its own.
+/// One batch job as Python hands it over: name, packed args, result id,
+/// queue, timeout ms, packed chain tail, packed meta, per-send expiry ms.
+/// A tuple rather than a struct because pyo3 converts it for free and the
+/// only caller is `Supervisor.run`, which builds it in one place.
+type BatchJob = (String, Vec<u8>, String, String, u64, Vec<u8>, Vec<u8>, u64);
+
 #[pyfunction]
 #[pyo3(signature = (app_spec, jobs, python, children=2, slots=1, max_rss=0, max_tasks=0,
                     max_lifetime=0.0, hard_max_rss=0))]
@@ -2045,7 +2059,7 @@ type BatchResult = (Vec<Py<PyAny>>, HashMap<String, u64>, Vec<i32>);
 fn run(
     py: Python<'_>,
     app_spec: String,
-    jobs: Vec<(String, Vec<u8>)>,
+    jobs: Vec<BatchJob>,
     python: String,
     children: usize,
     slots: usize,
@@ -2081,18 +2095,18 @@ fn run(
                     let broker = Broker::connect("memory://", Vec::new())
                         .await
                         .map_err(io_err)?;
-                    for (name, payload) in jobs {
+                    for (name, payload, id, queue, timeout_ms, chain, meta, expires_ms) in jobs {
                         broker
                             .push(
                                 NewJob {
-                                    id: String::new(), // batch mode keeps no results
-                                    queue: "default".into(),
+                                    id,
+                                    queue,
                                     name,
                                     payload,
-                                    timeout_ms: 0,
-                                    chain: Vec::new(),
-                                    meta: Vec::new(),
-                                    expires_ms: 0,
+                                    timeout_ms: timeout_ms as u32,
+                                    chain,
+                                    meta,
+                                    expires_ms,
                                 },
                                 Duration::ZERO,
                             )

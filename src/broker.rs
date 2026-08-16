@@ -235,7 +235,7 @@ impl Broker {
         lease_ms: u64,
     ) -> Res<bool> {
         match self {
-            Broker::Memory(_) => Ok(true),
+            Broker::Memory(b) => Ok(b.acquire_slot(task, job_id, max, lease_ms)),
             Broker::Redis(b) => b.acquire_slot(task, job_id, max, lease_ms).await,
             Broker::Postgres(b) => b.acquire_slot(task, job_id, max, lease_ms).await,
         }
@@ -244,7 +244,10 @@ impl Broker {
     /// Give the slot back. Idempotent, so settling twice cannot free two.
     pub async fn release_slot(&self, task: &str, job_id: &str) -> Res<()> {
         match self {
-            Broker::Memory(_) => Ok(()),
+            Broker::Memory(b) => {
+                b.release_slot(task, job_id);
+                Ok(())
+            }
             Broker::Redis(b) => b.release_slot(task, job_id).await,
             Broker::Postgres(b) => b.release_slot(task, job_id).await,
         }
@@ -500,12 +503,20 @@ impl Broker {
 #[derive(Default)]
 pub struct MemoryBroker {
     ready: Mutex<VecDeque<(u64, Option<std::time::Instant>)>>,
-    jobs: Mutex<HashMap<u64, (NewJob, u32)>>,
+    /// job -> (record, attempts, the epoch-ms it became runnable). The third
+    /// field is what expiry measures from; leaving it zero made `expires`
+    /// silently unenforceable on this broker, since a zero ready time reads
+    /// as "unknown" and no expiry check treats unknown as expired.
+    jobs: Mutex<HashMap<u64, (NewJob, u32, u64)>>,
     next_id: AtomicU64,
     results: Mutex<HashMap<String, (Vec<u8>, std::time::Instant)>>,
     ticks: Mutex<std::collections::HashSet<(String, i64)>>,
     revoked: Mutex<HashMap<String, std::time::Instant>>,
     buckets: Mutex<HashMap<String, (f64, std::time::Instant)>>,
+    /// task -> job_id -> lease deadline, for `max_concurrency`. The other two
+    /// brokers hold this server-side; in one process a map with the same
+    /// expiring-lease shape is the whole feature.
+    slots: Mutex<HashMap<String, HashMap<String, std::time::Instant>>>,
 }
 
 impl MemoryBroker {
@@ -540,7 +551,8 @@ impl MemoryBroker {
 
     fn push(&self, job: NewJob, delay: Duration) -> Res<()> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        self.jobs.lock().unwrap().insert(id, (job, 0));
+        let ready_ms = now_ms() + delay.as_millis() as u64;
+        self.jobs.lock().unwrap().insert(id, (job, 0, ready_ms));
         let due = (!delay.is_zero()).then(|| std::time::Instant::now() + delay);
         self.ready.lock().unwrap().push_back((id, due));
         Ok(())
@@ -556,7 +568,7 @@ impl MemoryBroker {
             ready.remove(position)?.0
         };
         let mut jobs = self.jobs.lock().unwrap();
-        let (job, attempt) = jobs.get_mut(&id)?;
+        let (job, attempt, ready_ms) = jobs.get_mut(&id)?;
         *attempt += 1;
         Some(Delivery {
             name: job.name.clone(),
@@ -564,7 +576,7 @@ impl MemoryBroker {
             attempt: *attempt,
             receipt: Receipt::Memory { id },
             id: job.id.clone(),
-            ready_at_ms: 0,
+            ready_at_ms: *ready_ms,
             expires_ms: job.expires_ms,
             chain: job.chain.clone(),
             meta: job.meta.clone(),
@@ -595,6 +607,27 @@ impl MemoryBroker {
             }
             Some((blob, _)) => Some(blob.clone()),
             None => None,
+        }
+    }
+
+    fn acquire_slot(&self, task: &str, job_id: &str, cap: u32, lease_ms: u64) -> bool {
+        let now = std::time::Instant::now();
+        let mut slots = self.slots.lock().unwrap();
+        let held = slots.entry(task.to_string()).or_default();
+        held.retain(|_, deadline| *deadline > now);
+        if held.len() >= cap as usize {
+            return false;
+        }
+        held.insert(
+            job_id.to_string(),
+            now + Duration::from_millis(lease_ms.max(1)),
+        );
+        true
+    }
+
+    fn release_slot(&self, task: &str, job_id: &str) {
+        if let Some(held) = self.slots.lock().unwrap().get_mut(task) {
+            held.remove(job_id);
         }
     }
 

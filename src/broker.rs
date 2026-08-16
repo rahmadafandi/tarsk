@@ -263,10 +263,10 @@ impl Broker {
         lease_ms: u64,
     ) -> Res<bool> {
         match self {
-            Broker::Memory(b) => Ok(b.acquire_slot(task, job_id, max, lease_ms)),
+            Broker::Memory(b) => Ok(b.local.acquire_slot(task, job_id, max, lease_ms)),
             Broker::Redis(b) => b.acquire_slot(task, job_id, max, lease_ms).await,
             Broker::Postgres(b) => b.acquire_slot(task, job_id, max, lease_ms).await,
-            Broker::Amqp(b) => Ok(b.acquire_slot(task, job_id, max, lease_ms)),
+            Broker::Amqp(b) => Ok(b.local.acquire_slot(task, job_id, max, lease_ms)),
         }
     }
 
@@ -274,13 +274,13 @@ impl Broker {
     pub async fn release_slot(&self, task: &str, job_id: &str) -> Res<()> {
         match self {
             Broker::Memory(b) => {
-                b.release_slot(task, job_id);
+                b.local.release_slot(task, job_id);
                 Ok(())
             }
             Broker::Redis(b) => b.release_slot(task, job_id).await,
             Broker::Postgres(b) => b.release_slot(task, job_id).await,
             Broker::Amqp(b) => {
-                b.release_slot(task, job_id);
+                b.local.release_slot(task, job_id);
                 Ok(())
             }
         }
@@ -294,10 +294,10 @@ impl Broker {
     /// here, and only tasks that asked for a limit pay it.
     pub async fn take_token(&self, task: &str, per_sec: f64, burst: u32) -> Res<u64> {
         match self {
-            Broker::Memory(b) => Ok(b.take_token(task, per_sec, burst)),
+            Broker::Memory(b) => Ok(b.local.take_token(task, per_sec, burst)),
             Broker::Redis(b) => b.take_token(task, per_sec, burst).await,
             Broker::Postgres(b) => b.take_token(task, per_sec, burst).await,
-            Broker::Amqp(b) => Ok(b.take_token(task, per_sec, burst)),
+            Broker::Amqp(b) => Ok(b.local.take_token(task, per_sec, burst)),
         }
     }
 
@@ -497,10 +497,10 @@ impl Broker {
     /// schedule, which is the failure mode of bolting cron onto a worker pool.
     pub async fn claim_tick(&self, name: &str, minute: i64) -> Res<bool> {
         match self {
-            Broker::Memory(b) => Ok(b.claim_tick(name, minute)),
+            Broker::Memory(b) => Ok(b.local.claim_tick(name, minute)),
             Broker::Redis(b) => b.claim_tick(name, minute).await,
             Broker::Postgres(b) => b.claim_tick(name, minute).await,
-            Broker::Amqp(b) => Ok(b.claim_tick(name, minute)),
+            Broker::Amqp(b) => Ok(b.local.claim_tick(name, minute)),
         }
     }
 
@@ -561,28 +561,22 @@ impl Broker {
 
 // ------------------------------------------------------------------ memory
 
-/// Backs the batch API and the test suite. Nothing durable: a crash loses the
-/// queue, which is the honest trade for having no broker to run.
+/// The coordination state a broker without a shared store keeps in-process:
+/// rate-limit buckets, concurrency slots, and the once-per-minute cron tick.
+///
+/// Two brokers embed this. For `memory://` in-process *is* the whole world,
+/// so these simply are the feature. For AMQP they are the per-worker
+/// degradation the docs describe — correct alone, one copy per worker across
+/// many — and one implementation means the bucket arithmetic cannot drift
+/// between the two.
 #[derive(Default)]
-pub struct MemoryBroker {
-    ready: Mutex<VecDeque<(u64, Option<std::time::Instant>)>>,
-    /// job -> (record, attempts, the epoch-ms it became runnable). The third
-    /// field is what expiry measures from; leaving it zero made `expires`
-    /// silently unenforceable on this broker, since a zero ready time reads
-    /// as "unknown" and no expiry check treats unknown as expired.
-    jobs: Mutex<HashMap<u64, (NewJob, u32, u64)>>,
-    next_id: AtomicU64,
-    results: Mutex<HashMap<String, (Vec<u8>, std::time::Instant)>>,
+struct LocalCoordination {
     ticks: Mutex<std::collections::HashSet<(String, i64)>>,
-    revoked: Mutex<HashMap<String, std::time::Instant>>,
     buckets: Mutex<HashMap<String, (f64, std::time::Instant)>>,
-    /// task -> job_id -> lease deadline, for `max_concurrency`. The other two
-    /// brokers hold this server-side; in one process a map with the same
-    /// expiring-lease shape is the whole feature.
     slots: Mutex<HashMap<String, HashMap<String, std::time::Instant>>>,
 }
 
-impl MemoryBroker {
+impl LocalCoordination {
     fn take_token(&self, task: &str, per_sec: f64, burst: u32) -> u64 {
         let now = std::time::Instant::now();
         let mut buckets = self.buckets.lock().unwrap();
@@ -599,6 +593,52 @@ impl MemoryBroker {
         }
     }
 
+    fn acquire_slot(&self, task: &str, job_id: &str, cap: u32, lease_ms: u64) -> bool {
+        let now = std::time::Instant::now();
+        let mut slots = self.slots.lock().unwrap();
+        let held = slots.entry(task.to_string()).or_default();
+        held.retain(|_, deadline| *deadline > now);
+        if held.len() >= cap as usize {
+            return false;
+        }
+        held.insert(
+            job_id.to_string(),
+            now + Duration::from_millis(lease_ms.max(1)),
+        );
+        true
+    }
+
+    fn release_slot(&self, task: &str, job_id: &str) {
+        if let Some(held) = self.slots.lock().unwrap().get_mut(task) {
+            held.remove(job_id);
+        }
+    }
+
+    fn claim_tick(&self, name: &str, minute: i64) -> bool {
+        self.ticks
+            .lock()
+            .unwrap()
+            .insert((name.to_string(), minute))
+    }
+}
+
+/// Backs the batch API and the test suite. Nothing durable: a crash loses the
+/// queue, which is the honest trade for having no broker to run.
+#[derive(Default)]
+pub struct MemoryBroker {
+    ready: Mutex<VecDeque<(u64, Option<std::time::Instant>)>>,
+    /// job -> (record, attempts, the epoch-ms it became runnable). The third
+    /// field is what expiry measures from; leaving it zero made `expires`
+    /// silently unenforceable on this broker, since a zero ready time reads
+    /// as "unknown" and no expiry check treats unknown as expired.
+    jobs: Mutex<HashMap<u64, (NewJob, u32, u64)>>,
+    next_id: AtomicU64,
+    results: Mutex<HashMap<String, (Vec<u8>, std::time::Instant)>>,
+    revoked: Mutex<HashMap<String, std::time::Instant>>,
+    local: LocalCoordination,
+}
+
+impl MemoryBroker {
     fn revoke(&self, id: &str, ttl_ms: u64) -> Res<()> {
         let until = std::time::Instant::now() + Duration::from_millis(ttl_ms);
         self.revoked.lock().unwrap().insert(id.to_string(), until);
@@ -646,13 +686,6 @@ impl MemoryBroker {
         })
     }
 
-    fn claim_tick(&self, name: &str, minute: i64) -> bool {
-        self.ticks
-            .lock()
-            .unwrap()
-            .insert((name.to_string(), minute))
-    }
-
     fn store_result(&self, id: &str, blob: Vec<u8>, ttl: Duration) -> Res<()> {
         self.results
             .lock()
@@ -670,27 +703,6 @@ impl MemoryBroker {
             }
             Some((blob, _)) => Some(blob.clone()),
             None => None,
-        }
-    }
-
-    fn acquire_slot(&self, task: &str, job_id: &str, cap: u32, lease_ms: u64) -> bool {
-        let now = std::time::Instant::now();
-        let mut slots = self.slots.lock().unwrap();
-        let held = slots.entry(task.to_string()).or_default();
-        held.retain(|_, deadline| *deadline > now);
-        if held.len() >= cap as usize {
-            return false;
-        }
-        held.insert(
-            job_id.to_string(),
-            now + Duration::from_millis(lease_ms.max(1)),
-        );
-        true
-    }
-
-    fn release_slot(&self, task: &str, job_id: &str) {
-        if let Some(held) = self.slots.lock().unwrap().get_mut(task) {
-            held.remove(job_id);
         }
     }
 
@@ -754,17 +766,11 @@ pub struct AmqpBroker {
     /// exchange drops the message without a sound.
     declared: Mutex<std::collections::HashSet<String>>,
     // Per-process stand-ins for state AMQP cannot hold.
-    ticks: Mutex<std::collections::HashSet<(String, i64)>>,
-    buckets: Mutex<HashMap<String, (f64, std::time::Instant)>>,
-    slots: Mutex<HashMap<String, HashMap<String, std::time::Instant>>>,
+    local: LocalCoordination,
 }
 
 fn dead_key(queue: &str) -> String {
     format!("{}:dead", stream_key(queue))
-}
-
-fn amqp_result_key(id: &str) -> String {
-    format!("tarsk:result:{id}")
 }
 
 fn amqp_header_str(headers: &lapin::types::FieldTable, key: &str) -> String {
@@ -790,6 +796,20 @@ fn amqp_header_bytes(headers: &lapin::types::FieldTable, key: &str) -> Vec<u8> {
     }
 }
 
+/// The record, read back off the headers `encode` wrote.
+fn amqp_record_from(headers: &lapin::types::FieldTable, data: &[u8]) -> AmqpRecord {
+    AmqpRecord {
+        id: amqp_header_str(headers, "tarsk-id"),
+        name: amqp_header_str(headers, "tarsk-name"),
+        payload: data.to_vec(),
+        timeout_ms: amqp_header_u64(headers, "tarsk-timeout-ms") as u32,
+        chain: amqp_header_bytes(headers, "tarsk-chain"),
+        meta: amqp_header_bytes(headers, "tarsk-meta"),
+        expires_ms: amqp_header_u64(headers, "tarsk-expires-ms"),
+        attempt: amqp_header_u64(headers, "tarsk-attempt") as u32,
+    }
+}
+
 impl AmqpBroker {
     async fn connect(url: &str, queues: Vec<String>) -> Res<AmqpBroker> {
         let conn = lapin::Connection::connect(url, lapin::ConnectionProperties::default()).await?;
@@ -804,9 +824,7 @@ impl AmqpBroker {
             conn,
             queues,
             declared: Mutex::new(std::collections::HashSet::new()),
-            ticks: Mutex::new(std::collections::HashSet::new()),
-            buckets: Mutex::new(HashMap::new()),
-            slots: Mutex::new(HashMap::new()),
+            local: LocalCoordination::default(),
         };
         for queue in broker.queues.clone() {
             broker.declare_plain(&stream_key(&queue)).await?;
@@ -975,16 +993,7 @@ impl AmqpBroker {
     fn delivery(&self, queue: &str, msg: lapin::message::BasicGetMessage) -> Delivery {
         let empty = lapin::types::FieldTable::default();
         let headers = msg.properties.headers().as_ref().unwrap_or(&empty);
-        let record = AmqpRecord {
-            id: amqp_header_str(headers, "tarsk-id"),
-            name: amqp_header_str(headers, "tarsk-name"),
-            payload: msg.data.clone(),
-            timeout_ms: amqp_header_u64(headers, "tarsk-timeout-ms") as u32,
-            chain: amqp_header_bytes(headers, "tarsk-chain"),
-            meta: amqp_header_bytes(headers, "tarsk-meta"),
-            expires_ms: amqp_header_u64(headers, "tarsk-expires-ms"),
-            attempt: amqp_header_u64(headers, "tarsk-attempt") as u32,
-        };
+        let record = amqp_record_from(headers, &msg.data);
         let ready_at_ms = amqp_header_u64(headers, "tarsk-ready-at");
         Delivery {
             id: record.id.clone(),
@@ -1140,16 +1149,7 @@ impl AmqpBroker {
             };
             let empty = lapin::types::FieldTable::default();
             let headers = msg.properties.headers().as_ref().unwrap_or(&empty).clone();
-            let record = AmqpRecord {
-                id: amqp_header_str(&headers, "tarsk-id"),
-                name: amqp_header_str(&headers, "tarsk-name"),
-                payload: msg.data.clone(),
-                timeout_ms: amqp_header_u64(&headers, "tarsk-timeout-ms") as u32,
-                chain: amqp_header_bytes(&headers, "tarsk-chain"),
-                meta: amqp_header_bytes(&headers, "tarsk-meta"),
-                expires_ms: amqp_header_u64(&headers, "tarsk-expires-ms"),
-                attempt: amqp_header_u64(&headers, "tarsk-attempt") as u32,
-            };
+            let record = amqp_record_from(&headers, &msg.data);
             let ready = amqp_header_u64(&headers, "tarsk-ready-at");
             seen.push((record, ready, headers, msg.acker.clone()));
         }
@@ -1172,7 +1172,7 @@ impl AmqpBroker {
     }
 
     async fn store_result(&self, id: &str, blob: Vec<u8>, ttl: Duration) -> Res<()> {
-        let name = amqp_result_key(id);
+        let name = result_key(id);
         let ttl_ms = ttl.as_millis().max(1) as i64;
         let mut args = lapin::types::FieldTable::default();
         args.insert(
@@ -1228,7 +1228,7 @@ impl AmqpBroker {
             Ok(channel) => channel,
             Err(_) => return Ok(None),
         };
-        let name = amqp_result_key(id);
+        let name = result_key(id);
         let exists = channel
             .queue_declare(
                 name.as_str().into(),
@@ -1259,50 +1259,6 @@ impl AmqpBroker {
             })
             .await?;
         Ok(Some(blob))
-    }
-
-    fn take_token(&self, task: &str, per_sec: f64, burst: u32) -> u64 {
-        let now = std::time::Instant::now();
-        let mut buckets = self.buckets.lock().unwrap();
-        let (tokens, seen) = buckets
-            .entry(task.to_string())
-            .or_insert((burst as f64, now));
-        *tokens = (*tokens + seen.elapsed().as_secs_f64() * per_sec).min(burst as f64);
-        *seen = now;
-        if *tokens >= 1.0 {
-            *tokens -= 1.0;
-            0
-        } else {
-            (((1.0 - *tokens) / per_sec) * 1000.0).ceil() as u64
-        }
-    }
-
-    fn acquire_slot(&self, task: &str, job_id: &str, cap: u32, lease_ms: u64) -> bool {
-        let now = std::time::Instant::now();
-        let mut slots = self.slots.lock().unwrap();
-        let held = slots.entry(task.to_string()).or_default();
-        held.retain(|_, deadline| *deadline > now);
-        if held.len() >= cap as usize {
-            return false;
-        }
-        held.insert(
-            job_id.to_string(),
-            now + Duration::from_millis(lease_ms.max(1)),
-        );
-        true
-    }
-
-    fn release_slot(&self, task: &str, job_id: &str) {
-        if let Some(held) = self.slots.lock().unwrap().get_mut(task) {
-            held.remove(job_id);
-        }
-    }
-
-    fn claim_tick(&self, name: &str, minute: i64) -> bool {
-        self.ticks
-            .lock()
-            .unwrap()
-            .insert((name.to_string(), minute))
     }
 
     /// Ready and dead are what a declare reports; in-flight and delayed are

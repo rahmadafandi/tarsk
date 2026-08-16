@@ -1728,19 +1728,27 @@ async fn supervise(
     // cancelled. Batch mode skips it: there is no one to cancel from.
     let revoker = (!batch).then(|| {
         let shared = shared.clone();
+        // The depth poll only feeds the /metrics and console gauges. With no
+        // metrics address there is no reader, and the poll was still costing a
+        // broker round trip per queue per second on every worker — on AMQP,
+        // two queue declares per queue per second, for a number nobody could
+        // ever scrape.
+        let wants_depth = cfg.metrics_addr.is_some();
         tokio::spawn(async move {
             while !shared.done.load(Ordering::SeqCst) {
-                match shared.broker.depth().await {
-                    Ok(rows) => shared.metrics.set_depth(
-                        rows.into_iter()
-                            .map(|d| (d.queue, [d.ready, d.in_flight, d.delayed, d.dead]))
-                            .collect(),
-                    ),
-                    Err(_) => {
-                        shared
-                            .counters
-                            .broker_errors
-                            .fetch_add(1, Ordering::Relaxed);
+                if wants_depth {
+                    match shared.broker.depth().await {
+                        Ok(rows) => shared.metrics.set_depth(
+                            rows.into_iter()
+                                .map(|d| (d.queue, [d.ready, d.in_flight, d.delayed, d.dead]))
+                                .collect(),
+                        ),
+                        Err(_) => {
+                            shared
+                                .counters
+                                .broker_errors
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
                 match shared.broker.revoked_all().await {

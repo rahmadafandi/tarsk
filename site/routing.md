@@ -43,6 +43,16 @@ Redis Streams and Postgres. Both at-least-once, both leasing per task rather tha
 neither needing lease renewal — a task's timeout is capped, so a lease cannot outlive a known
 ceiling.
 
+There is a third, `memory://`, and it is deliberately not a production option: an in-process
+broker that lives and dies with the batch run the test suite and the benchmarks use. Inside
+one process it carries the full job record — chains, groups fan out, `max_concurrency` holds,
+`expires` drops stale work, rate limits meter, results and progress read back — so every
+behaviour that is *about a job* can be tested without a server. What it cannot express is
+anything that is about *more than one process*: a second worker, the CLI inspecting a running
+worker's queues or dead letters, cancellation from outside, send deduplication between
+producers. Those need a broker that outlives a process, which is the entire difference between
+it and the other two.
+
 Both speak TLS, which every managed instance requires. `rediss://` for Redis, and for Postgres
 whatever `sslmode` says — `require`, `verify-ca` and `verify-full` all verify the chain and the
 hostname, since rustls does that on every handshake. The last two are spellings tokio-postgres

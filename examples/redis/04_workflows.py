@@ -1,8 +1,8 @@
 """Chains, groups, schedules, and the flags that decide when work runs.
 
-    Terminal 1:  tarsk worker --app examples.04_workflows:app \
+    Terminal 1:  tarsk worker --app examples.redis.04_workflows:app \
                      --broker redis://localhost:6379/0 --queues high,low,default
-    Terminal 2:  python examples/04_workflows.py
+    Terminal 2:  python examples/redis/04_workflows.py
 
 The order in `--queues` is a priority, not a preference: nothing from `low` is
 claimed while `high` has work. A worker only sees the queues it is given, so
@@ -19,7 +19,7 @@ app = App(broker=BROKER)
 
 # Every task is given an explicit `name=`. Without one the name is derived from
 # where the function was defined, so this file produces `__main__.greet` when
-# you run it and `examples.01_basics.greet` when the worker imports it — the
+# you run it and `examples.redis.01_basics.greet` when the worker imports it — the
 # same function under two names, and the worker rejects what the producer sent.
 # An explicit name is the fix and is worth doing in real code for the same
 # reason: it survives the module being moved or renamed.

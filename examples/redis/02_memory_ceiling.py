@@ -1,8 +1,8 @@
 """The thing this project exists for: a leaky handler that never wins.
 
-    Terminal 1:  tarsk worker --app examples.02_memory_ceiling:app \
+    Terminal 1:  tarsk worker --app examples.redis.02_memory_ceiling:app \
                      --broker redis://localhost:6379/0 --max-rss 200MB --slots 1
-    Terminal 2:  python examples/02_memory_ceiling.py
+    Terminal 2:  python examples/redis/02_memory_ceiling.py
 
 Watch the worker's log. It retires a child and starts a replacement before the
 ceiling is crossed, and no task is lost doing it — the replacement is already
@@ -23,7 +23,7 @@ app = App(broker=BROKER)
 
 # Every task is given an explicit `name=`. Without one the name is derived from
 # where the function was defined, so this file produces `__main__.greet` when
-# you run it and `examples.01_basics.greet` when the worker imports it — the
+# you run it and `examples.redis.01_basics.greet` when the worker imports it — the
 # same function under two names, and the worker rejects what the producer sent.
 # An explicit name is the fix and is worth doing in real code for the same
 # reason: it survives the module being moved or renamed.

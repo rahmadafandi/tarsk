@@ -876,6 +876,62 @@ def test_redis():
         check_broker(redis.url, "redis")
 
 
+def test_cli_broker_from_env_and_dotenv():
+    """--broker beats TARSK_BROKER beats ./.env, and each works alone.
+
+    The precedence every dotenv tool trains people to expect; getting it
+    backwards would make a shell export impossible to override per-project.
+    """
+    import tempfile
+
+    with Redis() as redis:
+        redis_url = redis.url
+        base = {k: v for k, v in os.environ.items() if k != "TARSK_BROKER"}
+        base["PYTHONPATH"] = str(ROOT)
+        tarsk_bin = str(ROOT / ".venv" / "bin" / "tarsk")
+
+        def status(cwd, env, *extra):
+            return subprocess.run(
+                [tarsk_bin, "status", *extra],
+                cwd=cwd, env=env, capture_output=True, text=True, timeout=30,
+            )
+
+        with tempfile.TemporaryDirectory() as workdir:
+            # Nothing anywhere: refused, and the message names all three ways.
+            p = status(workdir, dict(base))
+            assert p.returncode != 0 and ".env" in (p.stdout + p.stderr), (p.stdout, p.stderr)
+
+            # ./.env alone is enough — with quotes, an export prefix, a
+            # comment, and a non-TARSK key that must stay unexported.
+            (Path(workdir) / ".env").write_text(
+                "# local dev\n"
+                f"export TARSK_BROKER='{redis_url}'\n"
+                "DATABASE_URL=postgres://not/mine\n"
+            )
+            p = status(workdir, dict(base))
+            assert p.returncode == 0 and "queue" in p.stdout, (p.stdout, p.stderr)
+
+            # A real environment variable beats the file.
+            (Path(workdir) / ".env").write_text("TARSK_BROKER=redis://127.0.0.1:1/9\n")
+            p = status(workdir, {**base, "TARSK_BROKER": redis_url})
+            assert p.returncode == 0, (p.stdout, p.stderr)
+
+            # And the flag beats the environment.
+            p = status(workdir, {**base, "TARSK_BROKER": "redis://127.0.0.1:1/9"},
+                       "--broker", redis_url)
+            assert p.returncode == 0, (p.stdout, p.stderr)
+
+        # The library half: App() with no URL reads the variable, so producer
+        # code deployed twelve ways needs no per-deployment edit.
+        probe = subprocess.run(
+            [sys.executable, "-c",
+             "from tarsk import App; import sys; sys.exit(0 if App().broker == 'redis://x/1' else 1)"],
+            env={**base, "TARSK_BROKER": "redis://x/1"},
+            capture_output=True, text=True, timeout=30,
+        )
+        assert probe.returncode == 0, (probe.stdout, probe.stderr)
+
+
 def test_postgres():
     if PG_BIN is None:
         print("skip test_postgres (no postgres binaries)")
@@ -926,7 +982,7 @@ def test_tls_is_compiled_in():
 
 
 if __name__ == "__main__":
-    for check in (test_redis, test_postgres, test_tls_is_compiled_in,
+    for check in (test_redis, test_cli_broker_from_env_and_dotenv, test_postgres, test_tls_is_compiled_in,
                   test_postgres_tls_is_compiled_in):
         check()
         print("ok", check.__name__)

@@ -133,6 +133,15 @@ your handlers put credentials in exception messages, the console will display th
 **Keep the broker password out of `ps`.** `--broker postgres://user:pass@host` is visible to
 every process on the machine. `TARSK_BROKER` in the environment is not.
 
+Every `tarsk` subcommand resolves the broker the same way: `--broker` if given, else
+`TARSK_BROKER` from the environment, else `TARSK_BROKER` from a `./.env` file in the working
+directory — the precedence every dotenv tool trains people to expect, so a shell export can
+always override a project file and a flag can always override both. Only `TARSK_`-prefixed
+keys are read from `.env`: a queue CLI has no business exporting the rest of a project's
+secrets into its own process. The library half matches: `App()` with no URL reads
+`TARSK_BROKER` too, though only the variable — a library that reads files at import time is a
+surprise, so `.env` belongs to the CLI.
+
 ```
 tarsk web --broker redis://… --addr 127.0.0.1:9099
 ```

@@ -25,6 +25,35 @@ def parse_size(text: str) -> int:
     return int(float(match.group(1)) * _SCALE[match.group(2).upper()])
 
 
+def load_dotenv() -> None:
+    """TARSK_* keys from ./.env, for whatever the environment does not set.
+
+    Only this prefix: a queue CLI quietly exporting a project's whole .env —
+    database passwords included — into its own process would be a surprise,
+    and the keys tarsk reads are the only ones it has any business loading.
+    Real environment variables win over the file, and --broker wins over both,
+    which is the precedence every dotenv tool trains people to expect.
+
+    KEY=VALUE lines, `export ` prefixes tolerated, quotes stripped, `#`
+    comments and blanks skipped. No interpolation — a value is what it says.
+    """
+    try:
+        lines = open(".env", encoding="utf-8").read().splitlines()
+    except OSError:
+        return
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if key.startswith("export "):
+            key = key[len("export "):].strip()
+        if not key.startswith("TARSK_") or key in os.environ:
+            continue
+        os.environ[key] = value.strip().strip("'\"")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="tarsk")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -180,9 +209,12 @@ def _when(millis: int) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Before the parser is built: --broker defaults are read from the
+    # environment at add_argument time, so the file has to land first.
+    load_dotenv()
     args = build_parser().parse_args(argv)
     if not args.broker:
-        sys.exit("no broker: pass --broker or set TARSK_BROKER")
+        sys.exit("no broker: pass --broker, set TARSK_BROKER, or put it in ./.env")
     if args.command == "web":
         from ._core import console
 

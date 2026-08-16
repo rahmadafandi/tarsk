@@ -13,6 +13,7 @@ import functools
 import hashlib
 import importlib
 import inspect
+import os
 import re
 import secrets
 import time
@@ -324,7 +325,12 @@ class App:
             raise ValueError(
                 f"default_timeout={default_timeout}s exceeds max_timeout={max_timeout}s"
             )
-        self.broker = broker
+        # None falls back to the environment, so `App()` in code deployed
+        # twelve ways needs no per-deployment edit — and so the producer and
+        # the CLI agree on where the broker comes from. The library reads the
+        # variable only, never a .env file: files are the CLI's business, and
+        # a library that reads files at import time is a surprise.
+        self.broker = broker or os.environ.get("TARSK_BROKER")
         self.default_timeout = default_timeout
         self.max_timeout = max_timeout
         self.registry: dict[str, Task] = {}

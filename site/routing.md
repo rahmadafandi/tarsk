@@ -39,11 +39,31 @@ graceful ceiling could never fire.
 
 ## Brokers
 
-Redis Streams and Postgres. Both at-least-once, both leasing per task rather than per worker,
+Redis Streams, Postgres, and RabbitMQ. The first two are the full-featured pair: at-least-once, leasing per task rather than per worker,
 neither needing lease renewal — a task's timeout is capped, so a lease cannot outlive a known
 ceiling.
 
-There is a third, `memory://`, and it is deliberately not a production option: an in-process
+**RabbitMQ, or anything speaking AMQP 0.9.1**, is the third production option: `amqp://` and
+`amqps://`. It changes the trade rather than just the dependency, because AMQP is a message
+transport with no shared store, and that cuts both ways.
+
+What it does better than a lease can: an unacked delivery is redelivered the *instant* the
+worker's connection dies — the connection is the lease, and there is no timeout to wait out.
+Delays ride per-value TTL queues that dead-letter back when they fire, and clean themselves up
+when idle. The dead-letter queue, results, progress, chains, groups, per-send expiry and
+strict queue priority all work as they do elsewhere.
+
+What degrades to per-worker, which is the shape Celery has always had on RabbitMQ: rate
+limits, `max_concurrency`, and the cron election. Each is enforced correctly inside one
+worker; N workers each enforce their own copy, so a `5/s` limit across four workers is `20/s`.
+Two things are refused rather than faked, with an error that says why: cancelling queued work
+and send deduplication — both need state every worker can read. And `retries` counts handler
+failures, not crashes: a crash redelivery reuses the server's copy of the message, whose
+attempt counter the dead worker never got to bump. `tarsk status` shows ready and dead counts;
+in-flight and delayed sit in places AMQP proper cannot count. If any of these are the feature
+you came for, Redis and Postgres hold them broker-side.
+
+There is a fourth, `memory://`, and it is deliberately not a production option: an in-process
 broker that lives and dies with the batch run the test suite and the benchmarks use. Inside
 one process it carries the full job record — chains, groups fan out, `max_concurrency` holds,
 `expires` drops stale work, rate limits meter, results and progress read back — so every

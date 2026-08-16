@@ -8,6 +8,7 @@ maintaining the same five files three times.
 |---|---|
 | [`redis/`](redis/) | The full tour: basics, the memory ceiling, retries and soft timeouts, chains/groups/priority/cron, async handlers and progress |
 | [`postgres/`](postgres/) | What actually differs on Postgres — schema, claiming, TLS. Every file in `redis/` also runs here unchanged: `TARSK_BROKER=postgres://… python examples/redis/01_basics.py` (and the same URL on the worker) |
+| [`rabbitmq/`](rabbitmq/) | The AMQP trade, printed on the label: crash redelivery the instant a connection dies, coordination features per-worker (Celery's own shape), cancel and dedup refused rather than faked. Every file in `redis/` runs here too with an `amqp://` URL — minus cancellation |
 | [`memory/`](memory/) | The in-process batch broker: no server, no separate worker, one command. Different code on purpose — `Supervisor.run` instead of a producer and a worker |
 
 Each file's docstring carries the exact worker command it expects. Every task

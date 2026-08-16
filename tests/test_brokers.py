@@ -684,6 +684,32 @@ def check_broker(url: str, label: str) -> None:
             f"{max(highs)} with lows from {min(lows)}: {order}"
         )
 
+        # --- a chain against an idle high-slot worker is not paced by hz --
+        #
+        # A nonblocking claim used to send `XREADGROUP … BLOCK 1`, and Redis
+        # rounds every BLOCK timeout up to its serverCron sweep (`hz`, default
+        # 10 — so ~100ms). A worker with N slots pays that stall once per
+        # Ready, serially, and the Ack of a chain's first step queues behind
+        # all of them: at 200 slots the second step dispatched ~20 seconds
+        # after the first finished, which read as a hang. The worker starts
+        # first and goes idle on purpose — that is the shape that stalls.
+        #
+        # Teeth, measured on the reverted fix: 200 slots stall this exact
+        # shape for 9.9 seconds, so the 6-second budget fails it. With the
+        # fix the same chain answers in well under a second.
+        log.write_text("")
+        worker = start_worker(env, TARSK_LEASE_GRACE=1, TARSK_SLOTS=200)
+        try:
+            time.sleep(3.0)  # idle: the Ready burst must be in flight first
+            paced = chain(
+                app.registry["double"].s(4),      # 8
+                app.registry["add_to"].s(1),      # 9
+            )
+            answer = app.result(paced.send()).get(timeout=6)
+        finally:
+            stop_worker(worker)
+        assert answer == 9, f"{label}: paced chain returned {answer!r}"
+
         # --- a delayed send keeps what was attached to it -----------------
         #
         # Delayed jobs wait in a hash beside the stream rather than in it, and

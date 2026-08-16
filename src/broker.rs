@@ -957,7 +957,16 @@ impl RedisBroker {
                 }
             }
         }
-        self.read_streams(&self.queues, batch, Some(block)).await
+        // A zero block means "do not wait", and the only way to say that to
+        // Redis is to omit BLOCK entirely. Sending BLOCK 1 instead parks the
+        // consumer until the server's next timeout sweep, which runs at `hz`
+        // (default 10) — so "wait one millisecond" actually waits ~100ms.
+        // Measured: BLOCK 1 on an empty stream answers in 100.8ms, BLOCK 100
+        // in 201ms, no BLOCK in 0.1ms. A worker with N slots pays that stall
+        // once per Ready, serially — 100 slots put ~10 seconds between a chain
+        // step's Ack and the dispatch of the next step, which read as a hang.
+        self.read_streams(&self.queues, batch, (!block.is_zero()).then_some(block))
+            .await
     }
 
     async fn claim(&self, block: Duration) -> Res<Option<Delivery>> {

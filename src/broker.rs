@@ -1183,6 +1183,21 @@ impl AmqpBroker {
             "x-message-ttl".into(),
             lapin::types::AMQPValue::LongLongInt(ttl_ms),
         );
+        // A result queue holds exactly one blob, and the server itself makes
+        // that true: at length one, publishing drops the head — so a fresh
+        // progress report replaces the old one with no purge round trip. A
+        // task reporting progress in a loop used to pay declare + purge +
+        // publish every time; this is declare + publish, and the declare
+        // cannot be cached away because x-expires deletes idle queues out
+        // from under any cache.
+        args.insert(
+            "x-max-length".into(),
+            lapin::types::AMQPValue::LongLongInt(1),
+        );
+        args.insert(
+            "x-overflow".into(),
+            lapin::types::AMQPValue::LongString("drop-head".into()),
+        );
         self.channel
             .queue_declare(
                 name.as_str().into(),
@@ -1191,13 +1206,6 @@ impl AmqpBroker {
                     ..Default::default()
                 },
                 args,
-            )
-            .await?;
-        // Purge first: progress overwrites, and a result queue holds one blob.
-        self.channel
-            .queue_purge(
-                name.as_str().into(),
-                lapin::options::QueuePurgeOptions::default(),
             )
             .await?;
         self.channel

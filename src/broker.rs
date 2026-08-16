@@ -739,7 +739,16 @@ impl RedisBroker {
     async fn connect(url: &str, queues: Vec<String>) -> Res<RedisBroker> {
         let client = redis::Client::open(url)?;
         let mut conn = client.get_multiplexed_async_connection().await?;
-        let blocking = client.get_multiplexed_async_connection().await?;
+        let mut blocking = client.get_multiplexed_async_connection().await?;
+        // Every serve loop parks its `XREADGROUP … BLOCK` here, and one socket
+        // answers them one at a time — with each wait rounded up to the
+        // server's next `hz` sweep (~100ms at the default hz 10), N children
+        // stack up to ~N × 300ms before the last reply lands. The driver's
+        // default response timeout is 500ms, so two idle children were enough
+        // to manufacture a steady "timed out" every ~300ms: broker_errors
+        // climbed ~3/s on a healthy worker doing nothing, burying real errors.
+        // The commands themselves are fine; only the deadline was wrong.
+        blocking.set_response_timeout(std::time::Duration::from_secs(30));
         for queue in &queues {
             // MKSTREAM so producers and consumers can start in either order;
             // from 0 so messages published before the group existed are seen.

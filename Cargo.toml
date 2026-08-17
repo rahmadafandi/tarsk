@@ -1,6 +1,6 @@
 [package]
 name = "tarsk"
-version = "0.1.1"
+version = "0.1.2"
 license = "MIT"
 description = "Memory-bounded task queue for Python with a Rust runtime"
 repository = "https://github.com/rahmadafandi/tarsk"

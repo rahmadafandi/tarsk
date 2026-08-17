@@ -13,9 +13,10 @@ child supervision are Rust; the only Python in the hot path is your handler.
 pip install tarsk
 ```
 
-> **Status: 0.1.0, the first release.** Wheels for Linux (glibc and musl, x86_64 and
-> aarch64), macOS universal2 and Windows x64, on Python 3.11 through 3.14 including the
-> free-threaded build. See [What is missing](#what-is-missing).
+> **Status: early.** The version badge above reads live from PyPI — a number written here
+> went stale twice before this sentence replaced it. Wheels for Linux (glibc and musl,
+> x86_64 and aarch64), macOS universal2 and Windows x64, on Python 3.11 through 3.14
+> including the free-threaded build. See [What is missing](#what-is-missing).
 
 **📖 [Documentation](https://rahmadafandi.github.io/tarsk/)** — everything below the fold lives
 there: [how it works](https://rahmadafandi.github.io/tarsk/how-it-works),
@@ -116,8 +117,9 @@ python -m venv .venv && .venv/bin/pip install maturin msgpack
 cargo test --lib                         # cron, console, socket permissions
 ```
 
-The broker tests start their own `redis-server` and Postgres cluster and skip whichever is not
-installed. `python demo/run.py --minutes 1 --ceiling 150MB --rate 30` is the definition of done
+The broker tests start their own `redis-server` and Postgres cluster, use any RabbitMQ
+answering on the conventional ports (or `TARSK_AMQP_URL`), and skip whichever is missing —
+loudly, so a skip cannot pass for a pass. `python demo/run.py --minutes 1 --ceiling 150MB --rate 30` is the definition of done
 in miniature: it exits non-zero if a task goes missing or the supervisor drifts.
 
 ## License

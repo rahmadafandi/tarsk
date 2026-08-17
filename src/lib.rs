@@ -97,6 +97,27 @@ struct Job {
     expires_ms: u64,
 }
 
+impl Job {
+    /// The key a concurrency slot is held under.
+    ///
+    /// Normally the producer's id, which is unique across every worker — and
+    /// has to be, since Redis and Postgres hold these slots server-side and
+    /// two supervisors must not collide.
+    ///
+    /// A batch triple carries no producer id, and an empty string would file
+    /// every job of one task under the same key: the cap would then count one
+    /// holder forever and never bind. `task_id` is this supervisor's own
+    /// counter, which is unique wherever an empty id is possible at all —
+    /// batch mode, one process, the in-memory broker.
+    fn slot_key(&self) -> String {
+        if self.id.is_empty() {
+            self.task_id.to_string()
+        } else {
+            self.id.clone()
+        }
+    }
+}
+
 /// What the handler asked for, on top of having failed.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 enum Directive {
@@ -394,7 +415,7 @@ impl Shared {
             .get(&job.name)
             .is_some_and(|s| s.max_concurrency > 0);
         if capped {
-            let _ = self.broker.release_slot(&job.name, &job.id).await;
+            let _ = self.broker.release_slot(&job.name, &job.slot_key()).await;
         }
     }
 
@@ -1309,7 +1330,7 @@ async fn serve(shared: &Arc<Shared>, child: &mut ChildHandle, cfg: &Arc<Cfg>) ->
                     let lease = lease_ms + cfg.lease_grace.as_millis() as u64;
                     match shared
                         .broker
-                        .acquire_slot(&job.name, &job.id, cap, lease)
+                        .acquire_slot(&job.name, &job.slot_key(), cap, lease)
                         .await
                     {
                         Ok(true) => {}

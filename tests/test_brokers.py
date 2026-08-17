@@ -338,6 +338,13 @@ def _b06_progress_published_from_inside(url, label, skip, app, env, log, produce
         if step and step not in seen_progress:
             seen_progress.append(step)
         time.sleep(0.05)
+    # One more read once the loop has stopped. It stops on ready(), so a report
+    # published between the last poll and the result is never looked at
+    # otherwise — and asserting on the final report would then be a race the
+    # poller loses on a slow runner rather than anything about the feature.
+    step = handle.progress()
+    if step and step not in seen_progress:
+        seen_progress.append(step)
     assert handle.get(timeout=30) == "finished", label
     stop_worker(worker)
     assert seen_progress, f"{label}: no progress was ever visible"
@@ -769,6 +776,9 @@ def _b21_set_progress_works_from(url, label, skip, app, env, log, producer):
             while time.time() < deadline and not handle.ready():
                 seen = handle.progress() or seen
                 time.sleep(0.05)
+            # The loop stops on ready(), so the last report can land after the
+            # final poll. See the same read in the earlier progress block.
+            seen = handle.progress() or seen
             assert handle.get(timeout=10) == expect, f"{label}: {name} result"
             assert seen == 2, (
                 f"{label}: {name} progress read {seen!r}, wanted the last report"

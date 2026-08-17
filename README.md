@@ -113,7 +113,7 @@ python -m venv .venv && .venv/bin/pip install maturin msgpack
 
 .venv/bin/python tests/test_ipc.py       # protocol, timeouts, retries
 .venv/bin/python tests/test_recycle.py   # the ceiling, soft timeouts, middleware
-.venv/bin/python tests/test_brokers.py   # Redis, Postgres, RabbitMQ end to end
+.venv/bin/python tests/test_brokers.py   # all four brokers end to end
 cargo test --lib                         # cron, console, socket permissions
 ```
 

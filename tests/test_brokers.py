@@ -975,6 +975,175 @@ def check_broker(url: str, label: str, skip: frozenset = frozenset()) -> None:
         shutil.rmtree(workdir, ignore_errors=True)
 
 
+# ---------------------------------------------------------------------------
+# memory:// — the batch path.
+#
+# check_broker cannot reach this broker, and not by oversight: it starts
+# `tarsk worker` as a separate process, and an in-process queue is empty seen
+# from over there. Batch mode is the only way work reaches memory://, so the
+# parity worth guarding is asserted through Supervisor.run instead.
+#
+# The blocks below are the capability blocks batch mode can express. The ones
+# missing need an actor outside the run — cancelling work already submitted,
+# electing a cron leader against another worker, deduplicating across
+# producers — and a single run() call that returns when the work is done has
+# nowhere to put them.
+
+
+def _m01_delivery_and_results(label, log, run):
+    # --- every job runs and its return value comes back ----------------
+    out = run([("note", ("n0",), {}), ("answers", (2, 3), {}),
+               ("shout", ("hello",), {})])
+    assert len(out) == 3, f"{label}: {len(out)} outcomes for 3 jobs"
+    acks = [v for kind, v in out.values() if kind == "ack"]
+    assert "n0" in acks and "HELLO" in acks, f"{label}: got {acks}"
+    # A dict, so this also says the codec carried a structure and not just
+    # scalars — and the pid inside says a child ran it, not this process.
+    answer = next(v for v in acks if isinstance(v, dict))
+    assert answer["sum"] == 5, f"{label}: got {answer}"
+    assert answer["pid"] != os.getpid(), f"{label}: the handler ran in the parent"
+
+
+def _m02_failures_come_back_as_nacks(label, log, run):
+    # --- a handler that raises settles, it does not vanish -------------
+    out = run([("explodes", (), {}), ("note", ("survivor",), {})])
+    nacks = [v for kind, v in out.values() if kind == "nack"]
+    assert len(nacks) == 1, f"{label}: expected one nack, got {out}"
+    error_type, traceback = nacks[0]
+    assert "Error" in error_type or error_type, f"{label}: no error type: {error_type!r}"
+    assert traceback, f"{label}: nack carried no traceback"
+    assert ("ack", "survivor") in out.values(), f"{label}: the sibling job was lost"
+
+
+def _m03_a_raising_handler_is_retried(label, log, run):
+    # --- retries=1 means two attempts, then the failure settles --------
+    #
+    # always_fails logs on the way in and then raises, so the count is the
+    # number of attempts and not a guess from how long the run took.
+    log.write_text("")
+    out = run([("always_fails", ("doomed",), {})])
+    attempts = len([t for t in tags_in(log) if t == "doomed"])
+    assert attempts == 2, f"{label}: retries=1 should run it twice, ran {attempts}"
+    nacks = [v for kind, v in out.values() if kind == "nack"]
+    assert len(nacks) == 1, f"{label}: expected the failure to settle once: {out}"
+    assert "never works" in nacks[0][1], f"{label}: lost the traceback: {nacks[0]}"
+
+
+def _m04_a_child_that_dies_hands_its_job_back(label, log, run):
+    # --- the job outlives the process that was running it --------------
+    #
+    # crash_once kills its child outright the first time — no exception to
+    # catch, no ack, no nack. In batch mode the in-process broker has to
+    # notice the delivery is unfinished and hand it to another child, which
+    # is the whole reason a job record exists here rather than a callback.
+    #
+    # It logs only on the attempt that survives, so one line *is* the
+    # evidence: the first attempt never got that far.
+    log.write_text("")
+    Path(str(log) + ".crashed").unlink(missing_ok=True)
+    out = run([("crash_once", ("r0",), {})])
+    assert ("ack", "r0") in out.values(), f"{label}: the job died with its child: {out}"
+    assert tags_in(log) == ["r0"], f"{label}: expected one surviving attempt: {tags_in(log)}"
+
+
+def _m05_a_chain_runs_in_order(label, log, run):
+    # --- each step feeds the next, and immutable steps do not ----------
+    #
+    # This is the block that earned the batch path its job record: a chain
+    # bug once had to be chased on Postgres because memory:// could not
+    # carry a chain at all.
+    from tarsk import chain
+
+    import tests.broker_app as mod
+
+    log.write_text("")
+    out = run([chain(mod.double.s(5), mod.add_to.s(3), mod.shout.si("done"))])
+    acks = [v for kind, v in out.values() if kind == "ack"]
+    assert 10 in acks, f"{label}: first step did not run: {acks}"
+    assert 13 in acks, f"{label}: 5*2+3 never landed: {acks}"
+    assert "DONE" in acks, f"{label}: immutable step missing or fed: {acks}"
+    order = [t for t in tags_in(log) if not t.startswith("note")]
+    assert order == ["double-5", "add_to-10+3", "shout-done"], f"{label}: order was {order}"
+
+
+def _m07_a_concurrency_cap_holds(label, log, run):
+    # --- max_concurrency binds in batch mode as well -------------------
+    #
+    # Two children of three slots is six places a job could run; the cap
+    # says two. Overlap is measured from each job's own start and end,
+    # not inferred from how long the batch took. Held in-process here,
+    # which for this broker is the whole world.
+    log.write_text("")
+    run([("capped", (f"c{i}",), {}) for i in range(6)], children=2, slots=3)
+    live = peak = 0
+    for tag in tags_in(log):
+        if tag.startswith("start-"):
+            live += 1
+            peak = max(peak, live)
+        elif tag.startswith("end-"):
+            live -= 1
+    finished = len([t for t in tags_in(log) if t.startswith("end-")])
+    assert finished == 6, f"{label}: only {finished}/6 capped jobs finished"
+    assert peak <= 2, f"{label}: max_concurrency=2 but {peak} ran at once"
+    assert peak == 2, f"{label}: never reached the cap ({peak}) — is anything parallel?"
+
+
+def _m08_a_job_that_waited_too_long_is_dropped(label, log, run):
+    # --- expiry is enforced against the time the job became ready ------
+    #
+    # One child with one slot, three one-second jobs ahead of it: the
+    # perishable job is claimed about three seconds in, past its two.
+    # `durable` sits behind the same queue with no expiry and must still
+    # run — otherwise this block would pass just as well if batch mode
+    # were dropping the tail of every queue.
+    #
+    # The measurement this guards is the ready-at stamp: while it stayed
+    # zero, `expires` was silently unenforceable on this broker.
+    log.write_text("")
+    out = run([("unhurried", (f"u{i}",), {}) for i in range(3)]
+              + [("perishable", ("gone",), {}), ("durable", ("kept",), {})],
+              children=1, slots=1)
+    dropped = [(t, tb) for t, tb in
+               (v for kind, v in out.values() if kind == "nack")]
+    assert len(dropped) == 1, f"{label}: expected one expiry, got {out}"
+    error_type, why = dropped[0]
+    assert error_type == "Expired", f"{label}: dropped for the wrong reason: {error_type}"
+    assert "past its expires" in why, f"{label}: unhelpful expiry message: {why!r}"
+    assert ("ack", "kept") in out.values(), f"{label}: the unexpiring job was dropped too"
+    assert "gone" not in tags_in(log), f"{label}: an expired job ran anyway"
+
+
+def check_batch_broker(label: str = "memory") -> None:
+    """The capability blocks batch mode can express, run against memory://."""
+    from tarsk._supervisor import Supervisor
+
+    workdir = Path(tempfile.mkdtemp(prefix="tarsk-batch-"))
+    log = workdir / "run.log"
+    log.touch()
+    # The children are separate interpreters that import the task module, so
+    # these have to be on the environment rather than passed in.
+    os.environ["TARSK_LOG"] = str(log)
+    os.environ["PYTHONPATH"] = str(ROOT)
+
+    def run(jobs, children=2, slots=2):
+        return Supervisor("tests.broker_app:app", children=children, slots=slots).run(jobs)
+
+    try:
+        _m01_delivery_and_results(label, log, run)
+        _m02_failures_come_back_as_nacks(label, log, run)
+        _m03_a_raising_handler_is_retried(label, log, run)
+        _m04_a_child_that_dies_hands_its_job_back(label, log, run)
+        _m05_a_chain_runs_in_order(label, log, run)
+        _m07_a_concurrency_cap_holds(label, log, run)
+        _m08_a_job_that_waited_too_long_is_dropped(label, log, run)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_memory():
+    check_batch_broker()
+
+
 def test_redis():
     if not shutil.which("redis-server"):
         print("skip test_redis (no redis-server)")
@@ -1115,8 +1284,10 @@ def test_tls_is_compiled_in():
 
 
 if __name__ == "__main__":
-    for check in (test_redis, test_cli_broker_from_env_and_dotenv, test_amqp,
-                  test_postgres, test_tls_is_compiled_in,
+    # memory first: it needs no server, so a broken build says so in seconds
+    # rather than after Postgres has finished initdb.
+    for check in (test_memory, test_redis, test_cli_broker_from_env_and_dotenv,
+                  test_amqp, test_postgres, test_tls_is_compiled_in,
                   test_postgres_tls_is_compiled_in):
         check()
         print("ok", check.__name__)

@@ -305,12 +305,16 @@ impl Shared {
 
     /// Fold one child's RSS reading into the estimate.
     ///
-    /// `(rss - baseline) / tasks_done` is what this child has cost per task so
-    /// far. Attributing all of it to the tasks is deliberate: a handler that
-    /// grows the interpreter for any other reason still grows it, and a ceiling
-    /// that only counted the growth it approved of would not hold.
-    fn observe_growth(&self, rss: u64, baseline: u64, tasks_done: u64) {
-        let Some(per_task) = per_task_growth(rss, baseline, tasks_done) else {
+    /// `(rss - baseline) / (tasks_done + inflight)` is what this child has cost
+    /// per task so far. Attributing all of it to the tasks is deliberate: a
+    /// handler that grows the interpreter for any other reason still grows it,
+    /// and a ceiling that only counted the growth it approved of would not hold.
+    ///
+    /// `growth_samples` still counts completions only. The denominator asks
+    /// "whose memory is this", which the running tasks answer; `measured` asks
+    /// "has a task finished and shown what it costs", which they do not.
+    fn observe_growth(&self, rss: u64, baseline: u64, tasks_done: u64, inflight: u64) {
+        let Some(per_task) = per_task_growth(rss, baseline, tasks_done, inflight) else {
             return;
         };
         self.task_growth.fetch_max(per_task, Ordering::Relaxed);
@@ -991,13 +995,21 @@ async fn drain_owned(shared: Arc<Shared>, child: ChildHandle, cfg: Arc<Cfg>) {
 /// Bytes per task from one reading, or `None` when the reading cannot answer.
 ///
 /// A baseline of zero means no ceiling was set and nothing was measured at
-/// spawn, so there is no zero to subtract from; a child that has completed
-/// nothing has no per-task cost yet.
-fn per_task_growth(rss: u64, baseline: u64, tasks_done: u64) -> Option<u64> {
-    if tasks_done == 0 || baseline == 0 {
+/// spawn, so there is no zero to subtract from; a child holding no tasks at all
+/// has no per-task cost yet.
+///
+/// The denominator is every task that has touched this child's memory, not just
+/// the finished ones: `rss` includes what the running tasks are holding right
+/// now, and charging that to the completed ones alone reports a 20MB task as an
+/// 80MB one for as long as the burst lasts. Since `task_growth` keeps the
+/// running maximum, one such burst would cut the slot budget for the rest of
+/// the run.
+fn per_task_growth(rss: u64, baseline: u64, tasks_done: u64, inflight: u64) -> Option<u64> {
+    let tasks = tasks_done + inflight;
+    if tasks == 0 || baseline == 0 {
         return None;
     }
-    Some(rss.saturating_sub(baseline) / tasks_done)
+    Some(rss.saturating_sub(baseline) / tasks)
 }
 
 /// RSS to judge against the ceiling: what it is now, plus what the next task is
@@ -1189,7 +1201,7 @@ async fn serve(shared: &Arc<Shared>, child: &mut ChildHandle, cfg: &Arc<Cfg>) ->
                 // Learn from this reading before anything acts on it, so the
                 // first child to grow pays for the lesson once and every child
                 // after it starts already knowing.
-                shared.observe_growth(bytes, *baseline, *tasks_done);
+                shared.observe_growth(bytes, *baseline, *tasks_done, inflight.len() as u64);
                 allowed = slot_budget(bytes, shared.growth_estimate(), cfg.max_rss);
             }
             if spare.is_none()
@@ -2537,10 +2549,33 @@ mod ceiling_tests {
 
     #[test]
     fn growth_is_per_task_and_ignores_unanswerable_readings() {
-        assert_eq!(per_task_growth(123 * MB, 23 * MB, 5), Some(20 * MB));
-        assert_eq!(per_task_growth(123 * MB, 23 * MB, 0), None);
-        assert_eq!(per_task_growth(123 * MB, 0, 5), None);
+        assert_eq!(per_task_growth(123 * MB, 23 * MB, 5, 0), Some(20 * MB));
+        assert_eq!(per_task_growth(123 * MB, 23 * MB, 0, 0), None);
+        assert_eq!(per_task_growth(123 * MB, 0, 5, 0), None);
         // A child that shrank is not a negative cost.
-        assert_eq!(per_task_growth(10 * MB, 23 * MB, 5), Some(0));
+        assert_eq!(per_task_growth(10 * MB, 23 * MB, 5, 0), Some(0));
+    }
+
+    #[test]
+    fn in_flight_tasks_do_not_inflate_the_estimate() {
+        // 23MB baseline, 400MB of growth, 20 tasks holding 20MB each — of
+        // which 5 have completed and 15 are still running. Dividing by the 5
+        // attributes the running tasks' memory to the finished ones and calls
+        // a 20MB task an 80MB one — permanently, since the estimate is a
+        // running maximum.
+        assert_eq!(per_task_growth(423 * MB, 23 * MB, 5, 15), Some(20 * MB));
+        // The same child a moment later, with all 20 finished: the same answer,
+        // rather than a figure that falls back to the truth after the burst.
+        assert_eq!(per_task_growth(423 * MB, 23 * MB, 20, 0), Some(20 * MB));
+    }
+
+    #[test]
+    fn a_child_that_has_finished_nothing_can_still_be_measured() {
+        // Four tasks in flight, none done: the growth is real and belongs to
+        // them, so there is an answer here where dividing by completions had
+        // none. It arrives a whole task earlier than the first completion.
+        assert_eq!(per_task_growth(103 * MB, 23 * MB, 0, 4), Some(20 * MB));
+        // But nothing at all in the child is still unanswerable.
+        assert_eq!(per_task_growth(103 * MB, 23 * MB, 0, 0), None);
     }
 }

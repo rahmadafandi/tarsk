@@ -1450,11 +1450,17 @@ async fn serve(shared: &Arc<Shared>, child: &mut ChildHandle, cfg: &Arc<Cfg>) ->
                         let (Some(task_id), Some(result)) = (items[1].as_u64(), items[2].as_slice()) else {
                             return Served { exit: Exit::Died, spare };
                         };
+                        // Counted only for work this supervisor handed out. An
+                        // Ack for a task not in flight is a duplicate or a
+                        // fabrication — the child hosts user code and is not a
+                        // trusted source — and counting it would move the
+                        // max_tasks trigger, the projected RSS and the growth
+                        // denominator on the child's say-so.
                         if let Some(job) = inflight.remove(&task_id) {
                             let done = Outcome { ok: true, result: result.to_vec(), error_type: String::new(), traceback: String::new(), directive: Directive::Policy };
                             shared.settle(job, done).await;
+                            *tasks_done += 1;
                         }
-                        *tasks_done += 1;
                     }
                     Some("Nack") => {
                         let (Some(task_id), Some(kind), Some(tb)) =
@@ -1466,8 +1472,8 @@ async fn serve(shared: &Arc<Shared>, child: &mut ChildHandle, cfg: &Arc<Cfg>) ->
                             let mut outcome = Outcome::nack(kind, tb.to_string());
                             outcome.directive = directive;
                             shared.settle(job, outcome).await;
+                            *tasks_done += 1;
                         }
-                        *tasks_done += 1;
                     }
                     Some("Progress") => {
                         // The child holds no broker connection by design, so

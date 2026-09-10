@@ -172,6 +172,31 @@ def test_reject_skips_the_remaining_retries():
     assert sup.stats["tasks_dead_lettered"] == 1, sup.stats
 
 
+def test_a_duplicate_ack_is_not_counted():
+    """The child hosts user code, so it is not a trusted counter of its own work.
+
+    Read through the max_tasks recycle rather than the counter itself: two jobs
+    under a limit of four is a run that never recycles, and only counting an Ack
+    the supervisor never dispatched gets it there. The metrics endpoint reports
+    the same number but wants a live broker and an HTTP scrape to say so.
+    """
+    from tests import scripted_child
+
+    jobs = [("add", (1, 1), {}), ("add", (2, 2), {})]
+    with tempfile.TemporaryDirectory() as tmp:
+        # The control: four is genuinely out of reach for two tasks, so the
+        # assertion below is about the duplicate and not about the limit.
+        honest = Supervisor("tests.demo_app:app", children=1, max_tasks=4,
+                            python=scripted_child.launcher(tmp, acks=1))
+        honest.run(jobs)
+        assert honest.stats.get("recycle_max_tasks", 0) == 0, honest.stats
+
+        liar = Supervisor("tests.demo_app:app", children=1, max_tasks=4,
+                          python=scripted_child.launcher(tmp, acks=2))
+        liar.run(jobs)
+        assert liar.stats.get("recycle_max_tasks", 0) == 0, liar.stats
+
+
 def test_retry_hands_the_job_back():
     marker = Path(tempfile.gettempdir()) / "tarsk-retry-marker"
     marker.unlink(missing_ok=True)
@@ -187,6 +212,7 @@ def test_retry_hands_the_job_back():
 if __name__ == "__main__":
     for check in (test_slots_overlap_inside_one_child, test_slots_overlap_sync_handlers_too, test_registry_hash, test_timeout_cap, test_end_to_end,
                   test_retry_then_succeed, test_retries_run_out,
-                  test_reject_skips_the_remaining_retries, test_retry_hands_the_job_back):
+                  test_reject_skips_the_remaining_retries, test_retry_hands_the_job_back,
+                  test_a_duplicate_ack_is_not_counted):
         check()
         print("ok", check.__name__)

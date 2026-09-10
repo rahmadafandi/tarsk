@@ -88,9 +88,12 @@ This file claimed a 1.45× lead until the numbers were checked on more than one 
 retraction, and every column where tarsk loses, is in
 [the benchmarks](https://rahmadafandi.github.io/tarsk/benchmarks).
 
-**Not a hard ceiling regardless of task size.** The ceiling is read while a child is idle, so a
-child never *starts* a task it cannot afford — but a handler that allocates 300 MB will allocate
-it. Overshoot is bounded by one task's peak, not by zero.
+**Not a hard ceiling regardless of task size.** The ceiling is read at the dispatch decision, and
+a handler that allocates 300 MB will allocate it. Overshoot is bounded by the peak of whatever is
+in flight when the limit is crossed — with `--slots 1` that is one task, because the child is idle
+at the moment it is read; at the default of 100 slots it is up to 100. The budget divides the
+remaining headroom by the measured per-task cost, so that number is usually far below the slot
+count, but the only way to bound it at one task is `--slots 1`.
 
 **Not durable execution.** That is Temporal's category, and it is much heavier.
 

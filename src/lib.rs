@@ -1160,8 +1160,56 @@ struct Served {
     spare: Option<ChildHandle>,
 }
 
+/// One child's broker round trips, off its frame loop.
+///
+/// A settle is an ack plus, sometimes, a result store and a chain push. Awaited
+/// inline it stopped that child reading any other frame and stopped its RSS
+/// ticker, so a hundred slots' acks queued behind a hundred sequential round
+/// trips. One channel with one consumer moves the waiting off the loop and
+/// still hands the broker what the child acked in the order it acked it —
+/// which two settle paths, or a task per settle, would not.
+///
+/// Bounded, and never anything else: an unbounded queue would grow exactly when
+/// the broker slows, which is the failure this project exists to prevent. Full
+/// means `send` waits, which is what every settle did before this existed, so
+/// the worst case here is the old behaviour.
+fn settle_task(
+    shared: &Arc<Shared>,
+    capacity: usize,
+) -> (mpsc::Sender<(Job, Outcome)>, tokio::task::JoinHandle<()>) {
+    // The slot count is the ceiling on how many acks can land at once: a child
+    // cannot answer for work it was never handed.
+    let (tx, mut rx) = mpsc::channel::<(Job, Outcome)>(capacity.max(1));
+    let shared = shared.clone();
+    let task = tokio::spawn(async move {
+        while let Some((job, outcome)) = rx.recv().await {
+            shared.settle(job, outcome).await;
+        }
+    });
+    (tx, task)
+}
+
 /// Handle one child until it needs replacing, dies, or the work runs out.
+///
+/// A wrapper around the loop rather than a drain at each of its nine exits:
+/// dropping the sender ends the consumer, and awaiting it is what guarantees
+/// every ack this child gave has reached the broker before its jobs are handed
+/// back. A slow broker now delays recycling by whatever it still owes, which is
+/// the same work as before and the price of losing none of it.
 async fn serve(shared: &Arc<Shared>, child: &mut ChildHandle, cfg: &Arc<Cfg>) -> Served {
+    let (settle, task) = settle_task(shared, cfg.slots);
+    let served = serve_inner(shared, child, cfg, &settle).await;
+    drop(settle);
+    let _ = task.await;
+    served
+}
+
+async fn serve_inner(
+    shared: &Arc<Shared>,
+    child: &mut ChildHandle,
+    cfg: &Arc<Cfg>,
+    settle: &mpsc::Sender<(Job, Outcome)>,
+) -> Served {
     let ChildHandle {
         pid,
         frames,
@@ -1273,8 +1321,8 @@ async fn serve(shared: &Arc<Shared>, child: &mut ChildHandle, cfg: &Arc<Cfg>) ->
                     let waited = broker::now_ms().saturating_sub(job.ready_at_ms);
                     if waited > expires_ms {
                         shared.counters.expired.fetch_add(1, Ordering::Relaxed);
-                        shared
-                            .settle(
+                        if settle
+                            .send((
                                 job,
                                 Outcome::nack(
                                     "Expired",
@@ -1283,8 +1331,13 @@ async fn serve(shared: &Arc<Shared>, child: &mut ChildHandle, cfg: &Arc<Cfg>) ->
                                         waited, expires_ms
                                     ),
                                 ),
-                            )
-                            .await;
+                            ))
+                            .await
+                            .is_err()
+                        {
+                            outcome = Fill::Dead;
+                            break;
+                        }
                         continue;
                     }
                 }
@@ -1372,12 +1425,17 @@ async fn serve(shared: &Arc<Shared>, child: &mut ChildHandle, cfg: &Arc<Cfg>) ->
                 if shared.revoked.lock().unwrap().contains(&job.id) {
                     // Settled, not run. The delivery still has to be acked or
                     // the lease would expire and hand it back for another go.
-                    shared
-                        .settle(
+                    if settle
+                        .send((
                             job,
                             Outcome::nack("Cancelled", "cancelled before it started".into()),
-                        )
-                        .await;
+                        ))
+                        .await
+                        .is_err()
+                    {
+                        outcome = Fill::Dead;
+                        break;
+                    }
                     continue;
                 }
                 let dispatch = Value::Array(vec![
@@ -1458,7 +1516,15 @@ async fn serve(shared: &Arc<Shared>, child: &mut ChildHandle, cfg: &Arc<Cfg>) ->
                         // denominator on the child's say-so.
                         if let Some(job) = inflight.remove(&task_id) {
                             let done = Outcome { ok: true, result: result.to_vec(), error_type: String::new(), traceback: String::new(), directive: Directive::Policy };
-                            shared.settle(job, done).await;
+                            // A closed channel means the settle task is gone,
+                            // so this ack and every one after it would reach
+                            // nobody: the broker would redeliver the lot on
+                            // lease expiry and nothing would say why. Retire
+                            // the child instead, which is a failure the
+                            // supervisor counts and reports.
+                            if settle.send((job, done)).await.is_err() {
+                                return Served { exit: Exit::Died, spare };
+                            }
                             *tasks_done += 1;
                         }
                     }
@@ -1471,7 +1537,9 @@ async fn serve(shared: &Arc<Shared>, child: &mut ChildHandle, cfg: &Arc<Cfg>) ->
                         if let Some(job) = inflight.remove(&task_id) {
                             let mut outcome = Outcome::nack(kind, tb.to_string());
                             outcome.directive = directive;
-                            shared.settle(job, outcome).await;
+                            if settle.send((job, outcome)).await.is_err() {
+                                return Served { exit: Exit::Died, spare };
+                            }
                             *tasks_done += 1;
                         }
                     }

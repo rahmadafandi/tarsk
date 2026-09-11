@@ -320,6 +320,10 @@ class Enqueue:
                 attempt=0,  # not run yet
                 args=args,
                 kwargs=kwargs,
+                # The real dict, not a copy: `meta` is mutable and frozen only
+                # blocks rebinding, so a middleware adding to it here is what
+                # `pack_result(self.meta)` picks up below.
+                meta=self.meta,
             )
             for middleware in app.middlewares:
                 hook = getattr(middleware, "before_send", None)

@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- `before_send` middleware now sees and can add to `ctx.meta`. It was
+  constructed empty and never read back, so the documented way to attach a
+  trace id to a job did not reach the job.
+
 ## 0.2.0
 
 ### Breaking: one distribution per broker

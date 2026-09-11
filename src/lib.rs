@@ -2653,3 +2653,137 @@ mod ceiling_tests {
         assert_eq!(per_task_growth(103 * MB, 23 * MB, 0, 0), None);
     }
 }
+
+#[cfg(test)]
+mod settle_tests {
+    use super::*;
+
+    /// Enough that a settle task per ack would have to be lucky to stay in
+    /// order on a multi-threaded runtime, rather than merely likely to.
+    const ACKS: usize = 200;
+
+    /// A task that is retried once with no backoff.
+    ///
+    /// The retry is what makes a settle visible: the in-memory broker keeps no
+    /// ack log, but a requeue goes on the back of its ready queue, so the order
+    /// jobs come back in is the order they were settled in. "none" backoff,
+    /// because the default jitters and would sort the answer by a random draw.
+    fn retried_once(queue: &str) -> Spec {
+        Spec {
+            timeout_ms: 1_000,
+            retries: 1,
+            backoff: "none".into(),
+            result_ttl_ms: 0,
+            queue: queue.into(),
+            cron: String::new(),
+            rate_per_sec: 0.0,
+            rate_burst: 0,
+            expires_ms: 0,
+            max_concurrency: 0,
+        }
+    }
+
+    /// `n` jobs pushed, claimed and named for the order they were pushed in.
+    async fn claimed(shared: &Arc<Shared>, n: usize) -> Vec<Job> {
+        let mut jobs = Vec::with_capacity(n);
+        for i in 0..n {
+            let name = format!("ack-{i:04}");
+            shared
+                .specs
+                .lock()
+                .unwrap()
+                .insert(name.clone(), retried_once("default"));
+            shared
+                .broker
+                .push(
+                    broker::NewJob {
+                        id: name.clone(),
+                        queue: "default".into(),
+                        name,
+                        payload: Vec::new(),
+                        timeout_ms: 1_000,
+                        meta: Vec::new(),
+                        expires_ms: 0,
+                        chain: Vec::new(),
+                    },
+                    Duration::ZERO,
+                )
+                .await
+                .unwrap();
+            jobs.push(shared.try_job(Duration::ZERO).await.unwrap());
+        }
+        jobs
+    }
+
+    /// What the broker saw, in the order it saw it.
+    async fn requeued(shared: &Arc<Shared>) -> Vec<String> {
+        let mut seen = Vec::new();
+        while let Some(job) = shared.try_job(Duration::ZERO).await {
+            seen.push(job.name);
+        }
+        seen
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn settles_reach_the_broker_in_the_order_they_were_acked() {
+        // One channel and one consumer is the whole reason ordering survives
+        // moving off the loop. A task per settle, or a second settle path for
+        // the pre-dispatch failures, would land these in whatever order the
+        // scheduler and the broker happened to agree on.
+        let shared = new_shared(
+            broker::Broker::connect("memory://", Vec::new())
+                .await
+                .unwrap(),
+            0,
+            false,
+        );
+        let jobs = claimed(&shared, ACKS).await;
+        let expected: Vec<String> = jobs.iter().map(|job| job.name.clone()).collect();
+
+        let (tx, task) = settle_task(&shared, 8);
+        for job in jobs {
+            tx.send((job, Outcome::nack("Nope", String::new())))
+                .await
+                .unwrap();
+        }
+        // What `serve` does once its loop is over, and the only reason the
+        // count below can be checked without sleeping on it.
+        drop(tx);
+        task.await.unwrap();
+
+        let seen = requeued(&shared).await;
+        assert_eq!(seen, expected, "settles reached the broker out of order");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_retiring_child_settles_everything_it_queued() {
+        // A single-threaded runtime is the only honest stand-in for broker
+        // latency without a broker: the consumer cannot run until this test
+        // awaits it, so every ack is still outstanding at the moment the child
+        // stops — which is the state a slow broker leaves behind for real. The
+        // sender is dropped and the task awaited exactly as `serve` does it;
+        // without that await, all of this would go with the receiver.
+        let shared = new_shared(
+            broker::Broker::connect("memory://", Vec::new())
+                .await
+                .unwrap(),
+            0,
+            false,
+        );
+        let jobs = claimed(&shared, ACKS).await;
+
+        let (tx, task) = settle_task(&shared, ACKS);
+        for job in jobs {
+            tx.try_send((job, Outcome::nack("Nope", String::new())))
+                .expect("queued, not yet settled");
+        }
+        drop(tx);
+        task.await.unwrap();
+
+        assert_eq!(
+            requeued(&shared).await.len(),
+            ACKS,
+            "a child retired holding acks the broker never heard"
+        );
+    }
+}

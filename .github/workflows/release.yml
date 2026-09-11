@@ -157,14 +157,23 @@ jobs:
           - { dist: tarsk-postgres, variant: postgres }
           - { dist: tarsk-amqp, variant: amqp }
     environment:
-      name: pypi
+      # One environment per distribution, and not for tidiness: PyPI keys a
+      # trusted publisher on (owner, repository, workflow, environment) and
+      # refuses to register two pending publishers that share one. All four
+      # legs here are the same owner, repository and workflow, so the
+      # environment is the only field left to tell them apart. A shared `pypi`
+      # rejects the second registration with "already been registered for a
+      # different project name", and leaving it blank collides the same way
+      # while also giving up the protection rules an environment can carry.
+      name: pypi-${{ matrix.dist }}
       url: https://pypi.org/p/${{ matrix.dist }}
     permissions:
       # Trusted publishing, so there is no API token in this repository to
-      # rotate or leak. PyPI has to know about this workflow first: add a
-      # pending publisher for each of the four project names, each naming this
-      # repository, `release.yml` and the `pypi` environment. Renaming this
-      # file breaks all four links.
+      # rotate or leak. PyPI has to know about this workflow first: each of the
+      # four project names needs its own pending publisher naming this
+      # repository, `release.yml`, and its own `pypi-<dist>` environment above.
+      # Renaming this file, or an environment, breaks the link for that
+      # distribution.
       id-token: write
       # For the artifact attestation.
       attestations: write

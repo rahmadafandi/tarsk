@@ -250,6 +250,17 @@ def _redis_xlen(url: str, key: str) -> int:
 
 
 _told_you_once: set[str] = set()
+_producers: dict = {}
+
+
+def _producer_for(url: str):
+    """One producer per URL, kept: count_dead runs in a polling loop, and a
+    fresh connection every 200ms is how a backend answers "db error"."""
+    if url not in _producers:
+        from tarsk._core import Producer
+
+        _producers[url] = Producer(broker_url=url)
+    return _producers[url]
 
 
 def count_dead(url: str) -> int:
@@ -273,9 +284,7 @@ def count_dead(url: str) -> int:
         _told_you_once.add(url)
         print("  note: no psql here, so the dead-letter count comes from dead_list "
               "and block 26 cross-checks it against itself")
-    from tarsk._core import Producer
-
-    return len(Producer(broker_url=url).dead_list("default", 100_000))
+    return len(_producer_for(url).dead_list("default", 100_000))
 
 
 def _b01_delivery(url, label, skip, app, env, log, producer):

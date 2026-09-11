@@ -3,7 +3,7 @@
 #     mise install     # fetches the toolchains
 #     mise exec -- true  # or just cd in with the shell hook: creates .venv
 #     .venv/bin/pip install maturin msgpack
-#     .venv/bin/maturin develop --release
+#     .venv/bin/maturin develop --release -F redis,postgres,amqp
 #
 # Pinned to exact patches rather than "latest". The extension is a compiled
 # artifact and the tests measure memory and timing, so "it worked on mine" is a

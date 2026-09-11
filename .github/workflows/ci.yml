@@ -166,11 +166,17 @@ jobs:
         run: |
           set -u
           broken=""
+          # Every read and write in variant.py must name its encoding: on
+          # Windows an unnamed one is the locale codepage, which wrote the
+          # em-dashes in pyproject.toml as cp1252 and left maturin unable to
+          # read the file. This flag pair turns that mistake into an error
+          # here, on Linux, where the round trip runs on every push.
+          variant="python -X warn_default_encoding -W error::EncodingWarning packaging/variant.py"
           for backend in memory redis postgres amqp; do
             echo "::group::$backend"
-            python packaging/variant.py "$backend"
+            $variant "$backend"
             maturin build --release --out "dist/$backend"
-            python packaging/variant.py memory
+            $variant memory
             case $backend in
               memory)   url=memory:// ;;
               redis)    url=redis://127.0.0.1:6379/0 ;;

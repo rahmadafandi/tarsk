@@ -46,7 +46,7 @@ DESCRIPTION = "Memory-bounded task queue for Python with a Rust runtime"
 def apply(backend: str) -> str:
     dist, suffix = VARIANTS[backend]
     features = ["pyo3/extension-module"] + ([backend] if backend != "memory" else [])
-    text = PYPROJECT.read_text()
+    text = PYPROJECT.read_text(encoding="utf-8")
     for pattern, value in (
         (r'^name = "tarsk[\w-]*"$', f'name = "{dist}"'),
         (r"^description = .*$", f'description = "{DESCRIPTION}{suffix}"'),
@@ -63,13 +63,17 @@ def main() -> None:
     if arg == "--check":
         # The committed file is the plain `tarsk` one. A build that forgot to
         # put it back would publish the next distribution under the wrong name.
-        if PYPROJECT.read_text() != apply("memory"):
+        if PYPROJECT.read_text(encoding="utf-8") != apply("memory"):
             sys.exit("pyproject.toml is left on a variant: run variant.py memory")
         print("pyproject.toml is the committed `tarsk` form")
         return
     if arg not in VARIANTS:
         sys.exit(__doc__)
-    PYPROJECT.write_text(apply(arg))
+    # encoding and newline both spelled out: Windows would otherwise write the
+    # locale encoding (cp1252 mangles the em-dashes in this file's comments and
+    # in the descriptions below, and maturin then refuses to read it) and turn
+    # every LF into CRLF. The round trip has to be byte-identical everywhere.
+    PYPROJECT.write_text(apply(arg), encoding="utf-8", newline="\n")
     print(f"pyproject.toml now builds {VARIANTS[arg][0]} ({arg})")
 
 

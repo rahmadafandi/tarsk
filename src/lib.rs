@@ -1447,6 +1447,10 @@ async fn serve_inner(
                     // reads this without unpacking the user's arguments, and
                     // the chain splicer would have had to learn about it.
                     Value::Binary(job.meta.clone()),
+                    // The broker's count, the same number the retry and
+                    // backoff decisions use, so `ctx.attempt` agrees with why
+                    // this delivery happened.
+                    Value::from(job.attempt),
                 ]);
                 inflight.insert(job.task_id, job);
                 free -= 1;

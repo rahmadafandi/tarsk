@@ -205,7 +205,7 @@ async def _shutdown(app, writer) -> None:
 
 
 async def _one(app, wire: Wire, app_spec: str, task_id: int, name: str, payload,
-               meta: bytes = b"") -> None:
+               meta: bytes = b"", attempt: int = 1) -> None:
     """Run a single dispatched task and report it. Never raises."""
     task = app.registry.get(name)
     if task is None:
@@ -239,7 +239,7 @@ async def _one(app, wire: Wire, app_spec: str, task_id: int, name: str, payload,
         ctx = Context(
             name=name,
             task_id=str(task_id),
-            attempt=1,
+            attempt=attempt,
             args=tuple(call_args),
             kwargs=call_kwargs,
             meta=_proto.unpack_result(meta) if meta else {},
@@ -335,9 +335,9 @@ async def main(socket_path: str, app_spec: str, child_id: int, slots: int = 1) -
     for _ in range(slots):
         await wire.send("Ready")
 
-    async def run_and_report(task_id, name, payload, meta):
+    async def run_and_report(task_id, name, payload, meta, attempt):
         try:
-            await _one(app, wire, app_spec, task_id, name, payload, meta)
+            await _one(app, wire, app_spec, task_id, name, payload, meta, attempt)
         except _SyncTimeout:
             # Nothing above is awaiting this task, so the exit has to happen
             # here — letting it settle into the task object would leave the
@@ -357,10 +357,12 @@ async def main(socket_path: str, app_spec: str, child_id: int, slots: int = 1) -
         if tag != "Dispatch":
             raise RuntimeError(f"unexpected frame from supervisor: {tag!r}")
         # Indexed rather than unpacked: the frame grew a field for the sender's
-        # metadata, and an older supervisor still sends three.
+        # metadata and then one for the attempt, and an older supervisor still
+        # sends the shorter frame.
         task_id, name, payload = args[0], args[1], args[2]
         meta = args[3] if len(args) > 3 else b""
-        job = asyncio.create_task(run_and_report(task_id, name, payload, meta))
+        attempt = args[4] if len(args) > 4 else 1
+        job = asyncio.create_task(run_and_report(task_id, name, payload, meta, attempt))
         running.add(job)
         job.add_done_callback(running.discard)
 

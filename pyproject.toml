@@ -43,6 +43,7 @@ requires = ["maturin>=1.5,<2.0"]
 build-backend = "maturin"
 
 [tool.maturin]
+manifest-path = "crates/tarsk-python/Cargo.toml"
 module-name = "tarsk._core"
 python-source = "."
 features = ["pyo3/extension-module"]

@@ -1,0 +1,35 @@
+[package]
+name = "tarsk-core"
+description = "Memory-bounded task supervisor engine — the Rust half of tarsk, with no Python binding"
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+
+[dependencies]
+libc = "0.2.189"
+# tls-rustls rather than native-tls: a manylinux wheel cannot depend on
+# whatever OpenSSL the build host happened to have. `insecure` only does
+# anything when a URL asks for it with #insecure — see docs on rediss://.
+redis = { version = "1.5.0", features = [
+    "tokio-comp",
+    "streams",
+    "tokio-rustls-comp",
+    "tls-rustls-insecure",
+] }
+rmpv = "1.3.1"
+sysinfo = "0.38.4"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "process", "io-util", "time", "sync", "signal"] }
+tokio-postgres = "0.7.18"
+# Same reasoning as the Redis TLS above: rustls rather than native-tls so a
+# manylinux wheel does not depend on the build host's OpenSSL, ring rather than
+# aws-lc-rs so it does not want cmake, and the system trust store so
+# sslmode=verify-full has roots to verify against.
+tokio-postgres-rustls = { version = "0.14.0", default-features = false, features = [
+    "ring",
+    "native-certs",
+] }
+# tokio runtime explicitly: without a runtime feature lapin fails at connect
+# with NoDefaultRuntime. ring + native certs to match the rustls posture the
+# redis and postgres sides already ship.
+lapin = { version = "4.10.0", default-features = false, features = ["tokio", "rustls--ring", "rustls-native-certs"] }

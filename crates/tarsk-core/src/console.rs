@@ -172,7 +172,7 @@ fn guard(addr: &str) -> Result<Guard, String> {
     })
 }
 
-pub(crate) async fn serve<F>(addr: String, shared: Arc<Shared>, snapshot: F)
+pub async fn serve<F>(addr: String, shared: Arc<Shared>, snapshot: F)
 where
     F: Fn() -> String + Send + Sync + 'static,
 {

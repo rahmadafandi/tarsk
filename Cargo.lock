@@ -2167,19 +2167,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
 
 [[package]]
-name = "tarsk"
+name = "tarsk-core"
 version = "0.1.3"
 dependencies = [
  "lapin",
  "libc",
- "pyo3",
  "redis",
  "rmpv",
- "rustls",
  "sysinfo",
  "tokio",
  "tokio-postgres",
  "tokio-postgres-rustls",
+]
+
+[[package]]
+name = "tarsk-python"
+version = "0.1.3"
+dependencies = [
+ "pyo3",
+ "rustls",
+ "sysinfo",
+ "tarsk-core",
+ "tokio",
 ]
 
 [[package]]

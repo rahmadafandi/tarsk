@@ -5,7 +5,10 @@ delivery, redelivery when a child dies holding a job, and redelivery when the
 whole worker disappears and the lease has to expire on its own.
 
 Spins up its own redis-server and Postgres cluster, so it touches nothing you
-already have running. Skips a backend whose server binaries are missing.
+already have running. Skips a backend whose server binaries are missing —
+unless TARSK_REDIS_URL, TARSK_PG_URL or TARSK_AMQP_URL names one to use, which
+is how a machine without the binaries still tests the backend rather than
+printing a skip that reads like a pass.
 
 Run: python tests/test_brokers.py
 """
@@ -20,6 +23,11 @@ import tempfile
 import time
 from pathlib import Path
 from unittest import SkipTest
+from urllib.parse import urlsplit
+
+
+def scheme_is(url: str, schemes: tuple[str, ...]) -> bool:
+    return url.startswith(schemes)
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -53,11 +61,22 @@ def free_port() -> int:
 
 
 class Redis:
+    """A private redis-server, or TARSK_REDIS_URL when one is named.
+
+    The override mirrors TARSK_AMQP_URL and exists for the same reason: a
+    machine with no redis-server binary but a Redis to point at would
+    otherwise skip the backend, and a skip is not a pass. Give it a database
+    of its own — the tests write real keys and delete only their own.
+    """
+
     def __enter__(self):
+        self.external = os.environ.get("TARSK_REDIS_URL")
+        if self.external:
+            return self
         # Here rather than in the tests: two of them need a server, and a
         # missing binary has to skip both instead of crashing the second.
         if not shutil.which("redis-server"):
-            raise SkipTest("no redis-server")
+            raise SkipTest("no redis-server; set TARSK_REDIS_URL")
         self.dir = tempfile.mkdtemp(prefix="tarsk-redis-")
         self.port = free_port()
         self.proc = subprocess.Popen(
@@ -74,16 +93,25 @@ class Redis:
 
     @property
     def url(self):
-        return f"redis://127.0.0.1:{self.port}/0"
+        return self.external or f"redis://127.0.0.1:{self.port}/0"
 
     def __exit__(self, *exc):
+        if self.external:
+            return
         self.proc.terminate()
         self.proc.wait()
         shutil.rmtree(self.dir, ignore_errors=True)
 
 
 class Postgres:
+    """A private cluster, or TARSK_PG_URL when one is named. See Redis above."""
+
     def __enter__(self):
+        self.external = os.environ.get("TARSK_PG_URL")
+        if self.external:
+            return self
+        if PG_BIN is None:
+            raise SkipTest("no postgres binaries; set TARSK_PG_URL")
         self.dir = tempfile.mkdtemp(prefix="tarsk-pg-")
         self.port = free_port()
         env = {**os.environ, "PATH": f"{PG_BIN}:{os.environ['PATH']}"}
@@ -102,9 +130,11 @@ class Postgres:
 
     @property
     def url(self):
-        return f"postgres://tarsk@127.0.0.1:{self.port}/tarsk"
+        return self.external or f"postgres://tarsk@127.0.0.1:{self.port}/tarsk"
 
     def __exit__(self, *exc):
+        if self.external:
+            return
         subprocess.run([str(PG_BIN / "pg_ctl"), "-D", f"{self.dir}/data", "-w", "-m", "immediate",
                         "stop"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         shutil.rmtree(self.dir, ignore_errors=True)
@@ -185,22 +215,67 @@ def _scrape_once(port: int) -> str:
     return b"".join(chunks).decode()
 
 
-def count_dead(url: str) -> int:
-    """How many jobs the backend has parked in its dead-letter store."""
-    if url.startswith("amqp://"):
-        from tarsk._core import Producer
+def _resp(args) -> bytes:
+    out = f"*{len(args)}\r\n".encode()
+    for arg in args:
+        raw = str(arg).encode()
+        out += b"$%d\r\n%s\r\n" % (len(raw), raw)
+    return out
 
-        return len(Producer(broker_url=url).dead_list("default", 100_000))
-    if url.startswith("redis://"):
-        port = url.rsplit(":", 1)[1].split("/")[0]
-        out = subprocess.run(["redis-cli", "-p", port, "XLEN", "tarsk:default:dead"],
+
+def _redis_xlen(url: str, key: str) -> int:
+    """XLEN, spoken to the server directly.
+
+    Three lines of RESP rather than a redis-cli subprocess: it needs no client
+    installed, and it reads whichever database the URL names — a shared server
+    with the tests on db 4 was counted on db 0 before.
+    """
+    parts = urlsplit(url)
+    commands = []
+    if parts.password:
+        commands.append(("AUTH", *[p for p in (parts.username, parts.password) if p]))
+    commands.append(("SELECT", parts.path.lstrip("/") or "0"))
+    commands.append(("XLEN", key))
+    with socket.create_connection((parts.hostname or "127.0.0.1", parts.port or 6379), 10) as sock:
+        sock.sendall(b"".join(_resp(c) for c in commands))
+        buf = b""
+        while buf.count(b"\r\n") < len(commands):
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+    reply = buf.split(b"\r\n")[len(commands) - 1]
+    assert reply.startswith(b":"), f"XLEN {key} said {reply!r}"
+    return int(reply[1:])
+
+
+_told_you_once: set[str] = set()
+
+
+def count_dead(url: str) -> int:
+    """How many jobs the backend has parked in its dead-letter store.
+
+    Read from the store itself, not through `dead_list`: block 26 asserts one
+    against the other, and a count taken through the code under test would
+    make that assertion true by construction. AMQP has no store to query, and
+    a Postgres needs psql on the machine — where the independent count is not
+    available this says so rather than quietly becoming a tautology.
+    """
+    if scheme_is(url, ("redis://", "rediss://")):
+        return _redis_xlen(url, "tarsk:default:dead")
+    if scheme_is(url, ("postgres://", "postgresql://")) and shutil.which("psql"):
+        # The whole URL: it carries the database, the user and the password,
+        # which a rebuilt host/port pair did not.
+        out = subprocess.run(["psql", url, "-tAc", "select count(*) from tarsk_dead"],
                              capture_output=True, text=True).stdout.strip()
         return int(out or 0)
-    port = url.rsplit(":", 1)[1].split("/")[0]
-    out = subprocess.run(["psql", "-h", "127.0.0.1", "-p", port, "-U", "tarsk", "-d", "tarsk",
-                          "-tAc", "select count(*) from tarsk_dead"],
-                         capture_output=True, text=True).stdout.strip()
-    return int(out or 0)
+    if not scheme_is(url, ("amqp://", "amqps://")) and url not in _told_you_once:
+        _told_you_once.add(url)
+        print("  note: no psql here, so the dead-letter count comes from dead_list "
+              "and block 26 cross-checks it against itself")
+    from tarsk._core import Producer
+
+    return len(Producer(broker_url=url).dead_list("default", 100_000))
 
 
 def _b01_delivery(url, label, skip, app, env, log, producer):
@@ -1246,8 +1321,6 @@ def test_amqp():
 
 
 def test_postgres():
-    if PG_BIN is None:
-        raise SkipTest("no postgres binaries")
     with Postgres() as pg:
         check_broker(pg.url, "postgres")
 

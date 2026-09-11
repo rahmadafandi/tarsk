@@ -104,14 +104,20 @@ jobs:
         with:
           python-version: "3.12"
       - uses: dtolnay/rust-toolchain@stable
-      - name: Build and test
+      - name: Build
         run: |
           python -m venv .venv
           .venv\Scripts\pip install -q maturin msgpack
           .venv\Scripts\maturin develop --release
-          .venv\Scripts\python tests/rss_probe.py
-          .venv\Scripts\python tests/test_ipc.py
-          .venv\Scripts\python tests/test_recycle.py
+
+      # One step per script, because pwsh only hands the job the exit code of
+      # the *last* line of a run block. Held together, rss_probe could print
+      # FAIL and test_ipc could die outright and the run would still be graded
+      # on test_recycle alone — which is how the probe failed unnoticed while
+      # this job was green. Bash gets this right with -e; pwsh does not.
+      - run: .venv\Scripts\python tests/rss_probe.py
+      - run: .venv\Scripts\python tests/test_ipc.py
+      - run: .venv\Scripts\python tests/test_recycle.py
 
   distributions:
     # The four PyPI distributions, each built and then made to run a task from

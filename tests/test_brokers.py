@@ -19,6 +19,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from unittest import SkipTest
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -53,6 +54,10 @@ def free_port() -> int:
 
 class Redis:
     def __enter__(self):
+        # Here rather than in the tests: two of them need a server, and a
+        # missing binary has to skip both instead of crashing the second.
+        if not shutil.which("redis-server"):
+            raise SkipTest("no redis-server")
         self.dir = tempfile.mkdtemp(prefix="tarsk-redis-")
         self.port = free_port()
         self.proc = subprocess.Popen(
@@ -1155,9 +1160,6 @@ def test_memory():
 
 
 def test_redis():
-    if not shutil.which("redis-server"):
-        print("skip test_redis (no redis-server)")
-        return
     with Redis() as redis:
         check_broker(redis.url, "redis")
 
@@ -1233,8 +1235,7 @@ def _amqp_url() -> str | None:
 def test_amqp():
     url = _amqp_url()
     if url is None:
-        print("skip test_amqp (no rabbitmq listening; set TARSK_AMQP_URL)")
-        return
+        raise SkipTest("no rabbitmq listening; set TARSK_AMQP_URL")
     check_broker(url, "amqp", skip=frozenset({
         # All one root cause: AMQP moves messages and holds no shared state,
         # so anything needing a store every worker can read is per-worker
@@ -1246,8 +1247,7 @@ def test_amqp():
 
 def test_postgres():
     if PG_BIN is None:
-        print("skip test_postgres (no postgres binaries)")
-        return
+        raise SkipTest("no postgres binaries")
     with Postgres() as pg:
         check_broker(pg.url, "postgres")
 
@@ -1296,8 +1296,19 @@ def test_tls_is_compiled_in():
 if __name__ == "__main__":
     # memory first: it needs no server, so a broken build says so in seconds
     # rather than after Postgres has finished initdb.
+    ran, skipped = [], []
     for check in (test_memory, test_redis, test_cli_broker_from_env_and_dotenv,
                   test_amqp, test_postgres, test_tls_is_compiled_in,
                   test_postgres_tls_is_compiled_in):
-        check()
-        print("ok", check.__name__)
+        try:
+            check()
+        except SkipTest as why:
+            # Never "ok": a backend whose server is missing did not run, and
+            # printing a pass for it is how a broken backend hides in CI.
+            skipped.append(check.__name__)
+            print(f"skip {check.__name__} ({why})")
+        else:
+            ran.append(check.__name__)
+            print("ok", check.__name__)
+    print(f"\n{len(ran)} ran, {len(skipped)} skipped"
+          + (f": {', '.join(skipped)}" if skipped else ""))

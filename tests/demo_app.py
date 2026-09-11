@@ -80,6 +80,17 @@ def flaky(marker):
     return attempts + 1
 
 
+@app.task(name="records_attempts", retries=2, backoff="none")
+def records_attempts(marker, ctx=Depends(Context)):
+    """Writes ctx.attempt on every run, so a test can read the sequence.
+
+    Fails every time: the point is the three numbers, not the outcome.
+    """
+    with open(marker, "a", buffering=1) as fh:
+        fh.write(f"{ctx.attempt}\n")
+    raise RuntimeError("never works, by design")
+
+
 @app.task(name="glutton", retries=1)
 def glutton(megabytes):
     """Allocates past any sane ceiling and then lingers, so the hard limit has

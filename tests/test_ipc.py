@@ -25,6 +25,7 @@ JOBS = [
     ("tests.demo_app.missing", (), {}),
 ]
 FLAKY_MARKER = Path(tempfile.gettempdir()) / "tarsk-flaky-marker"
+ATTEMPT_MARKER = Path(tempfile.gettempdir()) / "tarsk-attempt-marker"
 
 
 def test_registry_hash():
@@ -209,10 +210,29 @@ def test_retry_hands_the_job_back():
         marker.unlink(missing_ok=True)
 
 
+def test_attempt_counts_up_across_retries():
+    """ctx.attempt must be the broker's attempt number, not a constant 1.
+
+    The retry *count* was already asserted elsewhere and stayed right while
+    this was wrong: the number the supervisor uses for backoff and for the
+    dead-letter decision never crossed the IPC boundary, so a handler
+    branching on ctx.attempt saw 1 on every attempt.
+    """
+    ATTEMPT_MARKER.unlink(missing_ok=True)
+    sup = Supervisor("tests.demo_app:app", children=1)
+    try:
+        sup.run([("records_attempts", (str(ATTEMPT_MARKER),), {})])
+        seen = ATTEMPT_MARKER.read_text().split()
+        assert seen == ["1", "2", "3"], f"ctx.attempt across a retry run: {seen}"
+    finally:
+        ATTEMPT_MARKER.unlink(missing_ok=True)
+
+
 if __name__ == "__main__":
     for check in (test_slots_overlap_inside_one_child, test_slots_overlap_sync_handlers_too, test_registry_hash, test_timeout_cap, test_end_to_end,
                   test_retry_then_succeed, test_retries_run_out,
                   test_reject_skips_the_remaining_retries, test_retry_hands_the_job_back,
-                  test_a_duplicate_ack_is_not_counted):
+                  test_a_duplicate_ack_is_not_counted,
+                  test_attempt_counts_up_across_retries):
         check()
         print("ok", check.__name__)

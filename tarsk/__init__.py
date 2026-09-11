@@ -25,6 +25,46 @@ __all__ = [
     "chain", "group", "load_app",
 ]
 
+# The four PyPI distributions — tarsk, tarsk-redis, tarsk-postgres, tarsk-amqp
+# — are the same code with a different broker compiled in, so they all install
+# this package and this tarsk._core. dist-info spelling, hence the underscores.
+_DISTRIBUTIONS = {"tarsk", "tarsk_redis", "tarsk_postgres", "tarsk_amqp"}
+
+
+def _one_distribution_only() -> None:
+    """Refuse to import when two of the four are installed side by side.
+
+    pip has no way to express that they conflict, so it installs the second
+    over the first: same file paths, last one wins, and the backends the
+    overwritten wheel had are silently gone — `redis://` starts refusing on a
+    machine where `pip list` still shows tarsk-redis. One listdir of
+    site-packages is worth paying on every import to make that say so.
+    """
+    site = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    try:
+        names = os.listdir(site)
+    except OSError:  # zipimport, a frozen build: nothing to check against
+        return
+    found = sorted(
+        name.partition("-")[0]
+        for name in names
+        if name.endswith(".dist-info") and name.partition("-")[0] in _DISTRIBUTIONS
+    )
+    if len(found) > 1:
+        installed = [name.replace("_", "-") for name in found]
+        raise ImportError(
+            f"{len(installed)} tarsk distributions are installed: "
+            + ", ".join(installed)
+            + ". They all provide the tarsk package and tarsk._core, so the one "
+            "pip unpacked last is the one running and the others' broker "
+            "backends are gone. Keep exactly one:\n"
+            f"    pip uninstall -y {' '.join(installed)}\n"
+            f"    pip install {installed[-1]}"
+        )
+
+
+_one_distribution_only()
+
 DEFAULT_TIMEOUT = 300.0  # seconds — spec §9, doubles as the hard cap
 
 

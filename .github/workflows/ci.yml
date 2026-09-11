@@ -34,7 +34,10 @@ jobs:
       # which is where the tests add ROOT to sys.path expects to find it.
       - run: python -m venv .venv
       - run: .venv/bin/pip install --upgrade pip maturin msgpack
-      - run: .venv/bin/maturin develop --release
+      # -F: pyproject.toml is the `tarsk` distribution now, which is memory
+      # only. The source tree is where every backend is tested, so it gets all
+      # of them — the per-distribution wheels are built in `distributions`.
+      - run: .venv/bin/maturin develop --release -F redis,postgres,amqp
 
       - run: .venv/bin/python tests/test_ipc.py
       - run: .venv/bin/python tests/test_recycle.py
@@ -83,7 +86,7 @@ jobs:
         run: |
           python -m venv .venv
           .venv/bin/pip install -q maturin msgpack
-          .venv/bin/maturin develop --release
+          .venv/bin/maturin develop --release -F redis,postgres,amqp
           .venv/bin/python tests/rss_probe.py
           .venv/bin/python tests/test_ipc.py
           .venv/bin/python tests/test_recycle.py
@@ -110,27 +113,123 @@ jobs:
           .venv\Scripts\python tests/test_ipc.py
           .venv\Scripts\python tests/test_recycle.py
 
+  distributions:
+    # The four PyPI distributions, each built and then made to run a task from
+    # a venv that holds nothing else. The failure this split introduces is a
+    # wheel that installs perfectly and has no broker inside it, and no build
+    # log catches that — packaging/smoke.py asks the binary.
+    #
+    # One job with a loop rather than a matrix: the toolchain and the cargo
+    # cache are set up once, the three brokers start once, and every variant
+    # still reports for itself because the loop collects failures instead of
+    # stopping at the first.
+    runs-on: ubuntu-24.04
+    services:
+      redis:
+        image: redis:8
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s
+          --health-timeout 5s --health-retries 10
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: tarsk
+          POSTGRES_PASSWORD: tarsk
+          POSTGRES_DB: tarsk
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 5s
+          --health-timeout 5s --health-retries 10
+      rabbitmq:
+        image: rabbitmq:4
+        ports: ["5672:5672"]
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping" --health-interval 5s
+          --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: pip install maturin
+
+      - name: Build each distribution and run a task through it
+        run: |
+          set -u
+          broken=""
+          for backend in memory redis postgres amqp; do
+            echo "::group::$backend"
+            python packaging/variant.py "$backend"
+            maturin build --release --out "dist/$backend"
+            python packaging/variant.py memory
+            case $backend in
+              memory)   url=memory:// ;;
+              redis)    url=redis://127.0.0.1:6379/0 ;;
+              postgres) url=postgres://tarsk:tarsk@127.0.0.1:5432/tarsk ;;
+              amqp)     url=amqp://guest:guest@127.0.0.1:5672/%2f ;;
+            esac
+            python -m venv "/tmp/venv-$backend"
+            "/tmp/venv-$backend/bin/pip" install --quiet "dist/$backend"/*.whl
+            # From /tmp: at the repository root `import tarsk` would find the
+            # source tree and test nothing about the wheel.
+            ( cd /tmp && TARSK_SMOKE_BACKEND=$backend TARSK_SMOKE_URL=$url \
+                "/tmp/venv-$backend/bin/python" "$GITHUB_WORKSPACE/packaging/smoke.py" ) \
+              || broken="$broken $backend"
+            echo "::endgroup::"
+          done
+          if [ -n "$broken" ]; then
+            echo "::error::these distributions do not work:$broken"
+            exit 1
+          fi
+
+      - name: Two of them installed at once must refuse to import
+        run: |
+          /tmp/venv-redis/bin/pip install --quiet dist/memory/*.whl
+          if ( cd /tmp && /tmp/venv-redis/bin/python -c "import tarsk" ) 2>/tmp/clash.log; then
+            echo "::error::tarsk imported with two distributions installed"
+            exit 1
+          fi
+          cat /tmp/clash.log
+          grep -q "tarsk distributions are installed" /tmp/clash.log
+
+      # The build must leave pyproject.toml on the committed `tarsk` form; a
+      # variant left behind is how the wrong name reaches PyPI.
+      - run: python packaging/variant.py --check
+
   wheels:
     # Proves the matrix builds; publishing is a separate, deliberate step.
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        # Two of the four distributions per target, not all four: `tarsk` has
+        # no TLS stack at all and `tarsk-redis` has the one that breaks per
+        # target — rustls, ring, and ring's ARM assembly. Postgres and AMQP
+        # differ from redis in the pure-Rust driver above that, which the
+        # `distributions` job builds on every push and release.yml builds for
+        # every target. Eight cross-compiles a push is the sane end of this.
+        variant: [memory, redis]
+        target: [x86_64, aarch64, universal2-apple-darwin, x64]
         include:
-          - { os: ubuntu-24.04, target: x86_64 }
+          - { target: x86_64, os: ubuntu-24.04 }
           # aarch64 cross-compiles through zig rather than the manylinux
           # container's toolchain. rustls pulls in ring, whose ARM assembly the
           # container's assembler rejects with `#error "ARM assembler must
           # define __ARM_ARCH"`. zig cc gets the target flags right; verified by
           # building this wheel on an x86_64 host before it was written here.
-          - { os: ubuntu-24.04, target: aarch64, zig: true }
-          - { os: macos-14, target: universal2-apple-darwin }
-          - { os: windows-latest, target: x64 }
+          - { target: aarch64, os: ubuntu-24.04, zig: true }
+          - { target: universal2-apple-darwin, os: macos-14 }
+          - { target: x64, os: windows-latest }
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
+      - name: Name the distribution
+        run: python packaging/variant.py ${{ matrix.variant }}
       - name: Provide zig
         if: matrix.zig
         # maturin looks for a `zig` binary on PATH; the pip package is a Python
@@ -151,5 +250,5 @@ jobs:
           manylinux: auto
       - uses: actions/upload-artifact@v7
         with:
-          name: wheels-${{ matrix.os }}-${{ matrix.target }}
+          name: wheels-${{ matrix.variant }}-${{ matrix.os }}-${{ matrix.target }}
           path: dist

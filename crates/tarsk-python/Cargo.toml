@@ -10,8 +10,18 @@ edition.workspace = true
 name = "_core"
 crate-type = ["cdylib"]
 
+[features]
+# Forwarded so a wheel can be built per backend. The default matches
+# tarsk-core's: memory only. The published wheel asks for the rest explicitly,
+# see [tool.maturin] features in pyproject.toml.
+default = ["memory"]
+memory = ["tarsk-core/memory"]
+redis = ["tarsk-core/redis", "dep:rustls"]
+postgres = ["tarsk-core/postgres", "dep:rustls"]
+amqp = ["tarsk-core/amqp", "dep:rustls"]
+
 [dependencies]
-tarsk-core = { path = "../tarsk-core" }
+tarsk-core = { path = "../tarsk-core", default-features = false }
 # abi3-py311 matches requires-python: one wheel per platform instead of one
 # per Python minor (spec §8). On a free-threaded interpreter pyo3 falls back
 # to a version-specific build on its own, which is the cp314t wheel we want.
@@ -19,6 +29,6 @@ pyo3 = { version = "0.29.2", features = ["extension-module", "abi3-py311"] }
 # Not used directly — present to pick rustls's crypto provider, which redis
 # leaves unselected. ring over aws-lc-rs: the latter wants cmake and a C
 # compiler, which a manylinux wheel build should not need.
-rustls = { version = "0.23", default-features = false, features = ["ring"] }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring"] }
 sysinfo = "0.38.4"
 tokio = { version = "1.53.1", features = ["rt-multi-thread"] }

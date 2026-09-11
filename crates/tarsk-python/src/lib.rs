@@ -401,6 +401,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // guess and panics at the first handshake instead. Choosing here, once,
     // makes every broker's TLS deterministic regardless of what the graph
     // grows next.
+    #[cfg(any(feature = "redis", feature = "postgres", feature = "amqp"))]
     let _ = rustls::crypto::ring::default_provider().install_default();
     m.add_function(wrap_pyfunction!(run, m)?)?;
     m.add_function(wrap_pyfunction!(work, m)?)?;

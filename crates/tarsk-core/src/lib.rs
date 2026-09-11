@@ -621,6 +621,10 @@ impl Shared {
         // the attempt. Real brokers record nothing, so a counter is enough.
         let task_id = match &delivery.receipt {
             Receipt::Memory { id } => *id,
+            // Allowed rather than #[cfg]-ed away: with only the memory broker
+            // compiled in every receipt is a Memory one and this arm cannot be
+            // reached, but it is the only reader of `next_task_id`.
+            #[allow(unreachable_patterns)]
             _ => self.next_task_id.fetch_add(1, Ordering::SeqCst),
         };
         Job {

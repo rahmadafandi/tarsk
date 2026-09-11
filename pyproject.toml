@@ -46,5 +46,10 @@ build-backend = "maturin"
 manifest-path = "crates/tarsk-python/Cargo.toml"
 module-name = "tarsk._core"
 python-source = "."
-features = ["pyo3/extension-module"]
+# Every backend, deliberately overriding tarsk-python's memory-only default:
+# `pip install tarsk` has shipped Redis, Postgres and AMQP since 0.1, and
+# slimming the wheel before tarsk-redis / tarsk-postgres / tarsk-amqp exist
+# would strand those users. Drop the three backends from this line in the same
+# release that publishes them — not before, and not as a tidy-up.
+features = ["pyo3/extension-module", "redis", "postgres", "amqp"]
 include = [{ path = "tarsk/py.typed", format = "sdist" }]

@@ -24,7 +24,72 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Every backend's URL schemes, listed whether or not that backend was
+/// compiled in: a scheme this build cannot serve is a different problem from a
+/// scheme nothing serves, and the error has to tell them apart.
+const REDIS_SCHEMES: &[&str] = &["redis://", "rediss://"];
+const POSTGRES_SCHEMES: &[&str] = &["postgres://", "postgresql://"];
+const AMQP_SCHEMES: &[&str] = &["amqp://", "amqps://"];
+
+fn scheme_is(url: &str, schemes: &[&str]) -> bool {
+    schemes.iter().any(|s| url.starts_with(s))
+}
+
+fn compiled_backends() -> String {
+    let mut names = vec!["memory"];
+    for (name, on) in [
+        ("redis", cfg!(feature = "redis")),
+        ("postgres", cfg!(feature = "postgres")),
+        ("amqp", cfg!(feature = "amqp")),
+    ] {
+        if on {
+            names.push(name);
+        }
+    }
+    names.join(", ")
+}
+
+/// Why no compiled-in backend would take this URL.
+///
+/// "unsupported broker url" was a lie once the backends became optional:
+/// `redis://` is supported, it just was not built. Naming what is here and what
+/// would have to be added turns a dead end into an instruction.
+fn unsupported(url: &str) -> String {
+    let gated = [
+        ("redis", REDIS_SCHEMES, cfg!(feature = "redis")),
+        ("postgres", POSTGRES_SCHEMES, cfg!(feature = "postgres")),
+        ("amqp", AMQP_SCHEMES, cfg!(feature = "amqp")),
+    ]
+    .into_iter()
+    .find(|(_, schemes, on)| !on && scheme_is(url, schemes));
+    match gated {
+        Some((name, _, _)) => format!(
+            "broker url {url} needs the {name} backend, which this build does not have \
+             (compiled in: {}) — add the \"{name}\" feature to the tarsk-core dependency",
+            compiled_backends()
+        ),
+        None => format!(
+            "unsupported broker url: {url} (compiled in: {})",
+            compiled_backends()
+        ),
+    }
+}
+
+/// Queue key. Shared rather than Redis-only: the AMQP broker names its
+/// queues with it too, so gating it with the Redis driver takes AMQP down.
+#[cfg(any(feature = "redis", feature = "amqp"))]
+fn stream_key(queue: &str) -> String {
+    format!("tarsk:{queue}")
+}
+
+/// Result key, shared with AMQP for the same reason as `stream_key`.
+#[cfg(any(feature = "redis", feature = "amqp"))]
+fn result_key(id: &str) -> String {
+    format!("tarsk:result:{id}")
+}
+
 /// Group and consumer names are fixed: one logical worker pool per broker.
+#[cfg(feature = "redis")]
 const REDIS_GROUP: &str = "tarsk";
 /// Fallback ceiling on a batched read, replaced by the worker's child count.
 ///
@@ -32,6 +97,7 @@ const REDIS_GROUP: &str = "tarsk";
 /// median of 0.96s, four gives 0.65s, sixty-four gives 1.18s. Fetching enough
 /// to keep every child fed helps; fetching more than that means parsing a burst
 /// on a single-threaded runtime while the children it was meant to feed wait.
+#[cfg(feature = "redis")]
 const DEFAULT_PREFETCH_CAP: u64 = 4;
 
 #[derive(Clone, Debug)]
@@ -64,6 +130,10 @@ pub struct NewJob {
 
 /// What has to be handed back to settle a delivery.
 #[derive(Clone, Debug)]
+// The AMQP receipt carries the record to republish and so dwarfs the others.
+// Only visible as a lint when the mid-sized Redis and Postgres variants are
+// gated out; boxing it to quiet a build nobody ships is not worth the churn.
+#[allow(clippy::large_enum_variant)]
 pub enum Receipt {
     Memory {
         id: u64,
@@ -72,11 +142,13 @@ pub enum Receipt {
     /// nothing left to requeue, so the receipt itself carries the record a
     /// retry or a dead-letter would republish. Redis and Postgres keep the
     /// record server-side and their receipts are just keys.
+    #[cfg(feature = "amqp")]
     Amqp {
         queue: String,
         acker: lapin::Acker,
         record: AmqpRecord,
     },
+    #[cfg(feature = "redis")]
     Redis {
         queue: String,
         id: String,
@@ -84,6 +156,7 @@ pub enum Receipt {
     /// `run_lease` is the guard: a worker that lost its lease and comes back to
     /// ack finds the counter moved on and its ack lands on nothing. Without it
     /// a slow worker can settle a job somebody else has already re-run.
+    #[cfg(feature = "postgres")]
     Postgres {
         row: i64,
         run_lease: i64,
@@ -163,32 +236,54 @@ pub struct Dead {
     pub died_at_ms: u64,
 }
 
+// Already boxed where it mattered, see the Amqp variant. The lint only fires
+// in feature sets where the middle variants are compiled out.
+#[allow(clippy::large_enum_variant)]
 pub enum Broker {
     Memory(MemoryBroker),
+    #[cfg(feature = "redis")]
     Redis(RedisBroker),
+    #[cfg(feature = "postgres")]
     Postgres(PgBroker),
     // Boxed for size only: lapin's connection state makes this variant dwarf
     // the others, and one Broker exists per process — the indirection costs
     // nothing anyone can measure.
+    #[cfg(feature = "amqp")]
     Amqp(Box<AmqpBroker>),
 }
 
+/// With a backend compiled out, the arguments only that backend reads go
+/// unused. Allowed here rather than underscored per method, because which
+/// argument is dead depends on the feature set and the full build still gets
+/// the lint.
+#[cfg_attr(
+    not(all(feature = "redis", feature = "postgres", feature = "amqp")),
+    allow(unused_variables)
+)]
 impl Broker {
-    /// `memory://`, `redis://…`, `postgres://…`
+    /// `memory://`, `redis://…`, `postgres://…`, `amqp://…`
+    ///
+    /// Early returns rather than an if/else-if chain: an else-if branch cannot
+    /// carry a `#[cfg]`, and each scheme here is one.
     pub async fn connect(url: &str, queues: Vec<String>) -> Res<Broker> {
         if url == "memory://" || url.is_empty() {
-            Ok(Broker::Memory(MemoryBroker::default()))
-        } else if url.starts_with("redis://") || url.starts_with("rediss://") {
-            Ok(Broker::Redis(RedisBroker::connect(url, queues).await?))
-        } else if url.starts_with("postgres://") || url.starts_with("postgresql://") {
-            Ok(Broker::Postgres(PgBroker::connect(url, queues).await?))
-        } else if url.starts_with("amqp://") || url.starts_with("amqps://") {
-            Ok(Broker::Amqp(Box::new(
-                AmqpBroker::connect(url, queues).await?,
-            )))
-        } else {
-            Err(format!("unsupported broker url: {url}").into())
+            return Ok(Broker::Memory(MemoryBroker::default()));
         }
+        #[cfg(feature = "redis")]
+        if scheme_is(url, REDIS_SCHEMES) {
+            return Ok(Broker::Redis(RedisBroker::connect(url, queues).await?));
+        }
+        #[cfg(feature = "postgres")]
+        if scheme_is(url, POSTGRES_SCHEMES) {
+            return Ok(Broker::Postgres(PgBroker::connect(url, queues).await?));
+        }
+        #[cfg(feature = "amqp")]
+        if scheme_is(url, AMQP_SCHEMES) {
+            return Ok(Broker::Amqp(Box::new(
+                AmqpBroker::connect(url, queues).await?,
+            )));
+        }
+        Err(unsupported(url).into())
     }
 
     /// True when running out of jobs means the run is over, rather than idle.
@@ -200,8 +295,11 @@ impl Broker {
     pub async fn push(&self, job: NewJob, delay: Duration) -> Res<()> {
         match self {
             Broker::Memory(b) => b.push(job, delay),
+            #[cfg(feature = "redis")]
             Broker::Redis(b) => b.push(job, delay).await,
+            #[cfg(feature = "postgres")]
             Broker::Postgres(b) => b.push(job, delay).await,
+            #[cfg(feature = "amqp")]
             Broker::Amqp(b) => b.push(job, delay).await,
         }
     }
@@ -212,10 +310,13 @@ impl Broker {
     pub async fn claim(&self, grace: Duration, block: Duration) -> Res<Option<Delivery>> {
         match self {
             Broker::Memory(b) => Ok(b.claim()),
+            #[cfg(feature = "redis")]
             Broker::Redis(b) => b.claim(block).await,
+            #[cfg(feature = "postgres")]
             Broker::Postgres(b) => b.claim(grace, block).await,
             // `grace` is the lease slack, and AMQP needs none: an unacked
             // delivery returns the instant its connection dies.
+            #[cfg(feature = "amqp")]
             Broker::Amqp(b) => b.claim(block).await,
         }
     }
@@ -224,14 +325,18 @@ impl Broker {
     pub async fn ack(&self, receipt: &Receipt) -> Res<()> {
         match (self, receipt) {
             (Broker::Memory(b), Receipt::Memory { id }) => b.settle(*id),
+            #[cfg(feature = "redis")]
             (Broker::Redis(b), r) => b.ack(r).await,
+            #[cfg(feature = "postgres")]
             (Broker::Postgres(b), r) => b.ack(r).await,
+            #[cfg(feature = "amqp")]
             (Broker::Amqp(_), Receipt::Amqp { acker, .. }) => {
                 acker
                     .ack(lapin::options::BasicAckOptions::default())
                     .await?;
                 Ok(())
             }
+            #[cfg(any(feature = "redis", feature = "postgres", feature = "amqp"))]
             _ => Err("receipt does not belong to this broker".into()),
         }
     }
@@ -241,9 +346,13 @@ impl Broker {
     pub async fn retry(&self, receipt: &Receipt, delay: Duration) -> Res<()> {
         match (self, receipt) {
             (Broker::Memory(b), Receipt::Memory { id }) => b.requeue(*id, delay),
+            #[cfg(feature = "redis")]
             (Broker::Redis(b), r) => b.requeue(r, delay).await,
+            #[cfg(feature = "postgres")]
             (Broker::Postgres(b), r) => b.requeue(r, delay).await,
+            #[cfg(feature = "amqp")]
             (Broker::Amqp(b), r @ Receipt::Amqp { .. }) => b.retry(r, delay).await,
+            #[cfg(any(feature = "redis", feature = "postgres", feature = "amqp"))]
             _ => Err("receipt does not belong to this broker".into()),
         }
     }
@@ -264,8 +373,11 @@ impl Broker {
     ) -> Res<bool> {
         match self {
             Broker::Memory(b) => Ok(b.local.acquire_slot(task, job_id, max, lease_ms)),
+            #[cfg(feature = "redis")]
             Broker::Redis(b) => b.acquire_slot(task, job_id, max, lease_ms).await,
+            #[cfg(feature = "postgres")]
             Broker::Postgres(b) => b.acquire_slot(task, job_id, max, lease_ms).await,
+            #[cfg(feature = "amqp")]
             Broker::Amqp(b) => Ok(b.local.acquire_slot(task, job_id, max, lease_ms)),
         }
     }
@@ -277,8 +389,11 @@ impl Broker {
                 b.local.release_slot(task, job_id);
                 Ok(())
             }
+            #[cfg(feature = "redis")]
             Broker::Redis(b) => b.release_slot(task, job_id).await,
+            #[cfg(feature = "postgres")]
             Broker::Postgres(b) => b.release_slot(task, job_id).await,
+            #[cfg(feature = "amqp")]
             Broker::Amqp(b) => {
                 b.local.release_slot(task, job_id);
                 Ok(())
@@ -295,8 +410,11 @@ impl Broker {
     pub async fn take_token(&self, task: &str, per_sec: f64, burst: u32) -> Res<u64> {
         match self {
             Broker::Memory(b) => Ok(b.local.take_token(task, per_sec, burst)),
+            #[cfg(feature = "redis")]
             Broker::Redis(b) => b.take_token(task, per_sec, burst).await,
+            #[cfg(feature = "postgres")]
             Broker::Postgres(b) => b.take_token(task, per_sec, burst).await,
+            #[cfg(feature = "amqp")]
             Broker::Amqp(b) => Ok(b.local.take_token(task, per_sec, burst)),
         }
     }
@@ -309,10 +427,13 @@ impl Broker {
     pub async fn revoke(&self, queue: &str, id: &str, ttl_ms: u64) -> Res<()> {
         match self {
             Broker::Memory(b) => b.revoke(id, ttl_ms),
+            #[cfg(feature = "redis")]
             Broker::Redis(b) => b.revoke(queue, id, ttl_ms).await,
+            #[cfg(feature = "postgres")]
             Broker::Postgres(b) => b.revoke(queue, id, ttl_ms).await,
             // Not faked with a local set: a cancel the producer records and no
             // worker can see would report success and change nothing.
+            #[cfg(feature = "amqp")]
             Broker::Amqp(_) => Err(
                 "cancellation needs state every worker can read, and AMQP has no \
                  shared store to hold it — use the Redis or Postgres broker if you \
@@ -331,6 +452,7 @@ impl Broker {
     pub async fn revoked_all(&self) -> Res<Vec<String>> {
         match self {
             Broker::Memory(b) => Ok(b.revoked()),
+            #[cfg(feature = "redis")]
             Broker::Redis(b) => {
                 let mut out = Vec::new();
                 for queue in &b.queues {
@@ -338,7 +460,9 @@ impl Broker {
                 }
                 Ok(out)
             }
+            #[cfg(feature = "postgres")]
             Broker::Postgres(b) => b.revoked_all().await,
+            #[cfg(feature = "amqp")]
             Broker::Amqp(_) => Ok(Vec::new()),
         }
     }
@@ -348,8 +472,11 @@ impl Broker {
     pub async fn depth(&self) -> Res<Vec<Depth>> {
         match self {
             Broker::Memory(_) => Ok(Vec::new()),
+            #[cfg(feature = "redis")]
             Broker::Redis(b) => b.depth(&b.queues).await,
+            #[cfg(feature = "postgres")]
             Broker::Postgres(b) => b.depth(&b.queues).await,
+            #[cfg(feature = "amqp")]
             Broker::Amqp(b) => b.depth(&b.queues).await,
         }
     }
@@ -359,8 +486,11 @@ impl Broker {
     pub async fn depth_of(&self, queues: &[String]) -> Res<Vec<Depth>> {
         match self {
             Broker::Memory(_) => Ok(Vec::new()),
+            #[cfg(feature = "redis")]
             Broker::Redis(b) => b.depth(queues).await,
+            #[cfg(feature = "postgres")]
             Broker::Postgres(b) => b.depth(queues).await,
+            #[cfg(feature = "amqp")]
             Broker::Amqp(b) => b.depth(queues).await,
         }
     }
@@ -370,8 +500,11 @@ impl Broker {
     pub fn queue_names(&self) -> Vec<String> {
         match self {
             Broker::Memory(_) => Vec::new(),
+            #[cfg(feature = "redis")]
             Broker::Redis(b) => b.queues.clone(),
+            #[cfg(feature = "postgres")]
             Broker::Postgres(b) => b.queues.clone(),
+            #[cfg(feature = "amqp")]
             Broker::Amqp(b) => b.queues.clone(),
         }
     }
@@ -380,8 +513,11 @@ impl Broker {
     pub async fn jobs(&self, queues: &[String], limit: usize) -> Res<Vec<Listed>> {
         let mut rows = match self {
             Broker::Memory(_) => Vec::new(),
+            #[cfg(feature = "redis")]
             Broker::Redis(b) => b.jobs(queues, limit).await?,
+            #[cfg(feature = "postgres")]
             Broker::Postgres(b) => b.jobs(queues, limit).await?,
+            #[cfg(feature = "amqp")]
             Broker::Amqp(b) => b.jobs(queues, limit).await?,
         };
         // The Redis side reads the stream and the delayed set separately, so
@@ -397,9 +533,12 @@ impl Broker {
     /// it, which made it a place work went to be forgotten rather than found.
     pub async fn dead_list(&self, queue: &str, limit: usize) -> Res<Vec<Dead>> {
         match self {
+            #[cfg(feature = "redis")]
             Broker::Redis(b) => b.dead_list(queue, limit).await,
+            #[cfg(feature = "postgres")]
             Broker::Postgres(b) => b.dead_list(queue, limit).await,
             Broker::Memory(_) => Ok(Vec::new()),
+            #[cfg(feature = "amqp")]
             Broker::Amqp(b) => b.dead_list(queue, limit).await,
         }
     }
@@ -412,9 +551,12 @@ impl Broker {
     /// attempt on the last failure's budget.
     pub async fn dead_replay(&self, queue: &str, ids: &[String]) -> Res<usize> {
         match self {
+            #[cfg(feature = "redis")]
             Broker::Redis(b) => b.dead_replay(queue, ids).await,
+            #[cfg(feature = "postgres")]
             Broker::Postgres(b) => b.dead_replay(queue, ids).await,
             Broker::Memory(_) => Ok(0),
+            #[cfg(feature = "amqp")]
             Broker::Amqp(b) => b.dead_drain(queue, ids, true).await,
         }
     }
@@ -422,9 +564,12 @@ impl Broker {
     /// Drop dead letters. Empty `ids` means all of them.
     pub async fn dead_purge(&self, queue: &str, ids: &[String]) -> Res<usize> {
         match self {
+            #[cfg(feature = "redis")]
             Broker::Redis(b) => b.dead_purge(queue, ids).await,
+            #[cfg(feature = "postgres")]
             Broker::Postgres(b) => b.dead_purge(queue, ids).await,
             Broker::Memory(_) => Ok(0),
+            #[cfg(feature = "amqp")]
             Broker::Amqp(b) => b.dead_drain(queue, ids, false).await,
         }
     }
@@ -454,11 +599,15 @@ impl Broker {
     ) -> Res<()> {
         match (self, receipt) {
             (Broker::Memory(b), Receipt::Memory { id }) => b.settle(*id),
+            #[cfg(feature = "redis")]
             (Broker::Redis(b), r) => b.dead_letter(r, error, traceback, keep).await,
+            #[cfg(feature = "postgres")]
             (Broker::Postgres(b), r) => b.dead_letter(r, error, traceback, keep).await,
+            #[cfg(feature = "amqp")]
             (Broker::Amqp(b), r @ Receipt::Amqp { .. }) => {
                 b.dead_letter(r, error, traceback, keep).await
             }
+            #[cfg(any(feature = "redis", feature = "postgres", feature = "amqp"))]
             _ => Err("receipt does not belong to this broker".into()),
         }
     }
@@ -475,6 +624,7 @@ impl Broker {
     /// batch parsed in one burst blocked every other command. That mutex is
     /// gone, and the effect went with it.
     pub fn set_prefetch_cap(&self, children: usize) {
+        #[cfg(feature = "redis")]
         if let Broker::Redis(b) = self {
             b.prefetch_cap
                 .store((children as u64).max(1), Ordering::Relaxed);
@@ -487,6 +637,7 @@ impl Broker {
     /// learning it from jobs already claimed makes it depend on what this
     /// process happens to have run. The registry knows it up front.
     pub fn observe_min_timeout(&self, timeout_ms: u64) {
+        #[cfg(feature = "redis")]
         if let Broker::Redis(b) = self {
             b.min_timeout_ms.fetch_min(timeout_ms, Ordering::Relaxed);
         }
@@ -498,8 +649,11 @@ impl Broker {
     pub async fn claim_tick(&self, name: &str, minute: i64) -> Res<bool> {
         match self {
             Broker::Memory(b) => Ok(b.local.claim_tick(name, minute)),
+            #[cfg(feature = "redis")]
             Broker::Redis(b) => b.claim_tick(name, minute).await,
+            #[cfg(feature = "postgres")]
             Broker::Postgres(b) => b.claim_tick(name, minute).await,
+            #[cfg(feature = "amqp")]
             Broker::Amqp(b) => Ok(b.local.claim_tick(name, minute)),
         }
     }
@@ -513,11 +667,14 @@ impl Broker {
     pub async fn claim_dedup(&self, key: &str, job_id: &str, ttl_ms: u64) -> Res<Option<String>> {
         match self {
             Broker::Memory(_) => Ok(None),
+            #[cfg(feature = "redis")]
             Broker::Redis(b) => b.claim_dedup(key, job_id, ttl_ms).await,
+            #[cfg(feature = "postgres")]
             Broker::Postgres(b) => b.claim_dedup(key, job_id, ttl_ms).await,
             // None means "not a duplicate, go ahead": with no shared store two
             // producers cannot see each other's sends, so dedup on AMQP only
             // holds within one producer process. The docs say so.
+            #[cfg(feature = "amqp")]
             Broker::Amqp(_) => Ok(None),
         }
     }
@@ -528,8 +685,11 @@ impl Broker {
     pub async fn store_result(&self, id: &str, blob: Vec<u8>, ttl: Duration) -> Res<()> {
         match self {
             Broker::Memory(b) => b.store_result(id, blob, ttl),
+            #[cfg(feature = "redis")]
             Broker::Redis(b) => b.store_result(id, blob, ttl).await,
+            #[cfg(feature = "postgres")]
             Broker::Postgres(b) => b.store_result(id, blob, ttl).await,
+            #[cfg(feature = "amqp")]
             Broker::Amqp(b) => b.store_result(id, blob, ttl).await,
         }
     }
@@ -537,8 +697,11 @@ impl Broker {
     pub async fn get_result(&self, id: &str) -> Res<Option<Vec<u8>>> {
         match self {
             Broker::Memory(b) => Ok(b.get_result(id)),
+            #[cfg(feature = "redis")]
             Broker::Redis(b) => b.get_result(id).await,
+            #[cfg(feature = "postgres")]
             Broker::Postgres(b) => b.get_result(id).await,
+            #[cfg(feature = "amqp")]
             Broker::Amqp(b) => b.get_result(id).await,
         }
     }
@@ -546,16 +709,15 @@ impl Broker {
     /// Return jobs whose lease has expired. Postgres does this inside `claim`,
     /// so only Redis needs a sweep.
     pub async fn reclaim_expired(&self, grace: Duration) -> Res<usize> {
-        match self {
-            Broker::Redis(b) => {
-                let promoted = b.promote_due().await?;
-                Ok(b.reclaim_expired(grace).await? + promoted)
-            }
-            // On AMQP the server does this itself: an unacked delivery
-            // requeues the moment its connection dies, and TTL queues promote
-            // on their own. Memory and Postgres reclaim inside claim.
-            _ => Ok(0),
+        #[cfg(feature = "redis")]
+        if let Broker::Redis(b) = self {
+            let promoted = b.promote_due().await?;
+            return Ok(b.reclaim_expired(grace).await? + promoted);
         }
+        // On AMQP the server does this itself: an unacked delivery requeues
+        // the moment its connection dies, and TTL queues promote on their own.
+        // Memory and Postgres reclaim inside claim.
+        Ok(0)
     }
 }
 
@@ -730,6 +892,7 @@ impl MemoryBroker {
 /// ack the server holds nothing to requeue, so a retry is a fresh publish of
 /// this record with the attempt bumped.
 #[derive(Clone, Debug)]
+#[cfg(feature = "amqp")]
 pub struct AmqpRecord {
     pub id: String,
     pub name: String,
@@ -756,6 +919,7 @@ pub struct AmqpRecord {
 /// held in this process instead — correct with one worker, per-worker across
 /// many, which is exactly the shape Celery has always had on RabbitMQ.
 /// Cancellation and send-dedup are refused outright rather than faked.
+#[cfg(feature = "amqp")]
 pub struct AmqpBroker {
     channel: lapin::Channel,
     conn: lapin::Connection,
@@ -769,10 +933,12 @@ pub struct AmqpBroker {
     local: LocalCoordination,
 }
 
+#[cfg(feature = "amqp")]
 fn dead_key(queue: &str) -> String {
     format!("{}:dead", stream_key(queue))
 }
 
+#[cfg(feature = "amqp")]
 fn amqp_header_str(headers: &lapin::types::FieldTable, key: &str) -> String {
     match headers.inner().get(key) {
         Some(lapin::types::AMQPValue::LongString(v)) => {
@@ -782,6 +948,7 @@ fn amqp_header_str(headers: &lapin::types::FieldTable, key: &str) -> String {
     }
 }
 
+#[cfg(feature = "amqp")]
 fn amqp_header_u64(headers: &lapin::types::FieldTable, key: &str) -> u64 {
     match headers.inner().get(key) {
         Some(lapin::types::AMQPValue::LongLongInt(v)) => (*v).max(0) as u64,
@@ -789,6 +956,7 @@ fn amqp_header_u64(headers: &lapin::types::FieldTable, key: &str) -> u64 {
     }
 }
 
+#[cfg(feature = "amqp")]
 fn amqp_header_bytes(headers: &lapin::types::FieldTable, key: &str) -> Vec<u8> {
     match headers.inner().get(key) {
         Some(lapin::types::AMQPValue::ByteArray(v)) => v.as_slice().to_vec(),
@@ -797,6 +965,7 @@ fn amqp_header_bytes(headers: &lapin::types::FieldTable, key: &str) -> Vec<u8> {
 }
 
 /// The record, read back off the headers `encode` wrote.
+#[cfg(feature = "amqp")]
 fn amqp_record_from(headers: &lapin::types::FieldTable, data: &[u8]) -> AmqpRecord {
     AmqpRecord {
         id: amqp_header_str(headers, "tarsk-id"),
@@ -810,6 +979,7 @@ fn amqp_record_from(headers: &lapin::types::FieldTable, data: &[u8]) -> AmqpReco
     }
 }
 
+#[cfg(feature = "amqp")]
 impl AmqpBroker {
     async fn connect(url: &str, queues: Vec<String>) -> Res<AmqpBroker> {
         let conn = lapin::Connection::connect(url, lapin::ConnectionProperties::default()).await?;
@@ -1366,6 +1536,7 @@ impl AmqpBroker {
     }
 }
 
+#[cfg(feature = "redis")]
 pub struct RedisBroker {
     /// Cloned per command rather than locked. A MultiplexedConnection is built
     /// to be used concurrently — putting a mutex round it made every command
@@ -1410,10 +1581,7 @@ pub struct RedisBroker {
     prefetch_cap: AtomicU64,
 }
 
-fn stream_key(queue: &str) -> String {
-    format!("tarsk:{queue}")
-}
-
+#[cfg(feature = "redis")]
 fn delayed_key(queue: &str) -> String {
     format!("tarsk:{queue}:delayed")
 }
@@ -1430,6 +1598,7 @@ fn delayed_key(queue: &str) -> String {
 /// ponytail: the per-job hash key is derived inside the script rather than
 /// declared in KEYS, which Redis Cluster forbids. Single-node only until
 /// someone needs otherwise; a hash tag on both keys is the fix.
+#[cfg(feature = "redis")]
 const PROMOTE_DUE: &str = r"
 local due = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, tonumber(ARGV[2]))
 local moved = 0
@@ -1445,6 +1614,7 @@ end
 return moved
 ";
 
+#[cfg(feature = "redis")]
 fn entry_fields(entry: &redis::streams::StreamId) -> (String, Vec<u8>, u64) {
     (
         entry.get("n").unwrap_or_default(),
@@ -1455,15 +1625,18 @@ fn entry_fields(entry: &redis::streams::StreamId) -> (String, Vec<u8>, u64) {
 
 /// Absent on jobs written before this field existed, which reads as zero and
 /// means the registration decides — the behaviour those jobs were queued with.
+#[cfg(feature = "redis")]
 fn entry_expires(entry: &redis::streams::StreamId) -> u64 {
     entry.get("x").unwrap_or(0)
 }
 
+#[cfg(feature = "redis")]
 fn entry_id(entry: &redis::streams::StreamId) -> String {
     entry.get("i").unwrap_or_default()
 }
 
 /// The millisecond in a Redis stream id, which is `<millis>-<seq>`.
+#[cfg(feature = "redis")]
 fn stream_id_ms(id: &str) -> u64 {
     id.split('-')
         .next()
@@ -1471,22 +1644,22 @@ fn stream_id_ms(id: &str) -> u64 {
         .unwrap_or(0)
 }
 
+#[cfg(feature = "redis")]
 fn dedup_key(key: &str) -> String {
     format!("tarsk:dedup:{key}")
 }
 
+#[cfg(feature = "redis")]
 fn slots_key(task: &str) -> String {
     format!("tarsk:slots:{task}")
 }
 
+#[cfg(feature = "redis")]
 fn revoked_key(queue: &str) -> String {
     format!("{}:revoked", stream_key(queue))
 }
 
-fn result_key(id: &str) -> String {
-    format!("tarsk:result:{id}")
-}
-
+#[cfg(feature = "redis")]
 impl RedisBroker {
     async fn connect(url: &str, queues: Vec<String>) -> Res<RedisBroker> {
         let client = redis::Client::open(url)?;
@@ -2399,6 +2572,7 @@ impl RedisBroker {
 /// never needs renewing. `awa` splits ready / deferred / lease / tombstone
 /// tables to support heartbeats and mutable attempt state; none of that is
 /// reachable when a lease cannot outlive a known ceiling.
+#[cfg(feature = "postgres")]
 const PG_SCHEMA: &str = "
 create table if not exists tarsk_jobs (
     id          bigserial primary key,
@@ -2477,6 +2651,7 @@ alter table tarsk_dead add column if not exists timeout_ms integer not null defa
 
 /// Claiming and reclaiming are the same statement: a lease that has run out is
 /// indistinguishable from one that was never taken, so expiry needs no sweep.
+#[cfg(feature = "postgres")]
 const PG_CLAIM: &str = "
 with picked as (
     select id,
@@ -2505,6 +2680,7 @@ returning tarsk_jobs.id, name, payload, attempt, run_lease, job_id, picked.ready
           chain, meta, expires_ms
 ";
 
+#[cfg(feature = "postgres")]
 pub struct PgBroker {
     client: tokio_postgres::Client,
     queues: Vec<String>,
@@ -2514,6 +2690,7 @@ pub struct PgBroker {
     consumer: String,
 }
 
+#[cfg(feature = "postgres")]
 impl PgBroker {
     async fn connect(url: &str, queues: Vec<String>) -> Res<PgBroker> {
         // A TLS connector is always supplied, which is not the same as always
@@ -3032,5 +3209,31 @@ impl PgBroker {
                 .await?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_gated_out_backend_is_not_reported_as_an_unsupported_url() {
+        let msg = unsupported("redis://localhost/0");
+        assert!(
+            msg.contains("memory"),
+            "should name what is compiled in: {msg}"
+        );
+        if cfg!(feature = "redis") {
+            assert!(msg.starts_with("unsupported broker url"), "{msg}");
+        } else {
+            assert!(msg.contains("redis backend"), "{msg}");
+            assert!(msg.contains("tarsk-core"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn a_scheme_no_backend_serves_is_still_unsupported() {
+        let msg = unsupported("kafka://broker:9092");
+        assert!(msg.starts_with("unsupported broker url"), "{msg}");
     }
 }

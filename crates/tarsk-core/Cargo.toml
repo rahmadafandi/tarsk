@@ -47,3 +47,8 @@ tokio-postgres-rustls = { version = "0.14.0", optional = true, default-features 
 # with NoDefaultRuntime. ring + native certs to match the rustls posture the
 # redis and postgres sides already ship.
 lapin = { version = "4.10.0", optional = true, default-features = false, features = ["tokio", "rustls--ring", "rustls-native-certs"] }
+
+[dev-dependencies]
+# For the doctest on supervise_until, which is the point of the crate and
+# should not be allowed to rot into prose.
+tokio = { version = "1.53.1", features = ["rt", "sync", "macros"] }

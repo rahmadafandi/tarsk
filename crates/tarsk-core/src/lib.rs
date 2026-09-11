@@ -14,7 +14,8 @@ mod cron;
 mod metrics;
 pub mod transport;
 
-use broker::{Broker, Delivery, NewJob, Receipt};
+pub use broker::Broker;
+use broker::{Delivery, NewJob, Receipt};
 use metrics::Metrics;
 
 use std::collections::HashMap;
@@ -161,34 +162,40 @@ impl Outcome {
 }
 
 pub struct Cfg {
-    app_spec: String,
-    python: String,
-    socket: String,
-    max_rss: u64,
-    max_tasks: u64,
-    max_lifetime: Option<Duration>,
-    poll: Duration,
-    drain_timeout: Duration,
-    term_grace: Duration,
-    connect_timeout: Duration,
-    spawn_cap: u64,
+    pub app_spec: String,
+    pub python: String,
+    /// Interpreter arguments that start a child, before the socket path, app
+    /// spec, child id and slot count the supervisor appends.
+    ///
+    /// `-m tarsk._child` is the CLI's child. An embedder running the engine
+    /// under its own package points this at its own entry point.
+    pub child_argv: Vec<String>,
+    pub socket: String,
+    pub max_rss: u64,
+    pub max_tasks: u64,
+    pub max_lifetime: Option<Duration>,
+    pub poll: Duration,
+    pub drain_timeout: Duration,
+    pub term_grace: Duration,
+    pub connect_timeout: Duration,
+    pub spawn_cap: u64,
     /// Start the replacement once the trigger is this many spawn-durations away.
-    warm_multiple: u32,
+    pub warm_multiple: u32,
     /// Retire a pre-warmed child that was never needed after this long.
-    spare_idle: Duration,
+    pub spare_idle: Duration,
     /// host:port for the Prometheus endpoint, when one is wanted.
-    metrics_addr: Option<String>,
+    pub metrics_addr: Option<String>,
     /// Kill a child that reaches this, mid-task, rather than let it keep
     /// growing. Zero disables it, which is the default: the soft ceiling never
     /// loses work, and this one trades a task to protect the box.
-    hard_max_rss: u64,
+    pub hard_max_rss: u64,
     /// Slack added to a job's own timeout before its lease counts as dead.
-    lease_grace: Duration,
+    pub lease_grace: Duration,
     /// How long a claim may wait for work before returning empty-handed.
-    claim_block: Duration,
+    pub claim_block: Duration,
     /// Dead letters a queue may keep before the oldest are dropped. Zero keeps
     /// everything, which is safe for the record and unbounded for the store.
-    max_dead: u64,
+    pub max_dead: u64,
     /// Tasks a single child may have in flight at once.
     ///
     /// One is the default and the reason the ceiling is precise: a child with
@@ -196,7 +203,36 @@ pub struct Cfg {
     /// overshoot to a single task's peak. Raising this trades that precision
     /// for concurrency, and is worth it only when handlers wait rather than
     /// allocate — see the io table in the published benchmarks.
-    slots: usize,
+    pub slots: usize,
+}
+
+impl Default for Cfg {
+    /// The values `build_cfg` used to bake in, so an embedder can name only
+    /// what it cares about: `Cfg { app_spec, socket, ..Cfg::default() }`.
+    fn default() -> Self {
+        Cfg {
+            app_spec: String::new(),
+            python: "python3".to_string(),
+            child_argv: vec!["-m".to_string(), "tarsk._child".to_string()],
+            socket: String::new(),
+            max_rss: 0,
+            max_tasks: 0,
+            max_lifetime: None,
+            poll: Duration::from_millis(100),
+            drain_timeout: Duration::from_secs(30),
+            term_grace: Duration::from_secs(5),
+            connect_timeout: Duration::from_secs(30),
+            spawn_cap: u64::MAX / 2,
+            warm_multiple: 3,
+            spare_idle: Duration::from_secs(30),
+            metrics_addr: None,
+            hard_max_rss: 0,
+            lease_grace: Duration::from_secs(30),
+            claim_block: Duration::from_millis(250),
+            max_dead: 1_000,
+            slots: 1,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -897,8 +933,7 @@ async fn spawn_child(shared: &Arc<Shared>, cfg: &Cfg) -> Option<ChildHandle> {
     shared.conns.lock().unwrap().insert(child_id, tx);
 
     let mut proc = tokio::process::Command::new(&cfg.python)
-        .arg("-m")
-        .arg("tarsk._child")
+        .args(&cfg.child_argv)
         .arg(&cfg.socket)
         .arg(&cfg.app_spec)
         .arg(child_id.to_string())
@@ -1100,7 +1135,13 @@ fn pressure(
             worst = (ratio, "max_lifetime");
         }
     }
-    if pid != 0 {
+    // Only with a ceiling that could act on it. The read is a per-process
+    // /proc walk paid once per completed task, and with neither max_rss nor
+    // hard_max_rss set nothing consumes the number: measured at 2-12% of
+    // throughput, and a 3-5x worse tail for anything sharing the runtime.
+    // What it costs is tarsk_child_rss_bytes and child_rss_peak staying empty
+    // on a run that set no ceiling — the run that was not watching them.
+    if pid != 0 && (cfg.max_rss > 0 || cfg.hard_max_rss > 0) {
         // RSS is read by the parent (spec §4.4) — a thrashing child is the
         // least reliable reporter of its own state.
         if let Some(bytes) = transport::child_rss_with(sys, pid) {
@@ -1788,17 +1829,89 @@ async fn slot(shared: Arc<Shared>, cfg: Arc<Cfg>) {
     }
 }
 
+/// Outcomes, counters, every child exit code, and the fatal error if there
+/// was one.
+pub type Report = (
+    Vec<(u64, Outcome)>,
+    HashMap<String, u64>,
+    Vec<i32>,
+    Option<String>,
+);
+
+/// Wait for what stops a CLI worker: ctrl-C anywhere, SIGTERM as well where it
+/// exists, because that is what an orchestrator sends when it stops a pod.
+pub async fn shutdown_on_signal() {
+    #[cfg(unix)]
+    {
+        let mut term =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(term) => term,
+                Err(_) => return,
+            };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// Run the supervisor to completion. Stops on SIGTERM or ctrl-C, which is what
+/// the CLI wants and what this has always done.
 pub async fn supervise(
     broker: Broker,
     total: usize,
     children: usize,
     cfg: Cfg,
-) -> io::Result<(
-    Vec<(u64, Outcome)>,
-    HashMap<String, u64>,
-    Vec<i32>,
-    Option<String>,
-)> {
+) -> io::Result<Report> {
+    // Batch mode ends when its jobs do, and has never watched for a signal.
+    let batch = broker.drains_when_empty();
+    let shutdown = async move {
+        if batch {
+            std::future::pending::<()>().await
+        } else {
+            shutdown_on_signal().await
+        }
+    };
+    supervise_until(broker, total, children, cfg, shutdown).await
+}
+
+/// The same, on the caller's runtime and the caller's shutdown.
+///
+/// Builds no runtime and installs no signal handler: an embedder that handles
+/// signals itself would otherwise get two shutdown sequences racing, and the
+/// host runtime can be dropped while this one is still draining children it
+/// was gracefully retiring. `tokio::spawn` this and resolve `shutdown` when
+/// you want it to drain.
+///
+/// ```no_run
+/// # async fn embed(broker: tarsk_core::Broker, socket: String) {
+/// let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+/// let cfg = tarsk_core::Cfg {
+///     app_spec: "myapp.tasks:app".into(),
+///     python: "python3".into(),
+///     child_argv: vec!["-m".into(), "myapp.worker".into()],
+///     socket,
+///     ..Default::default()
+/// };
+/// let run = tokio::spawn(tarsk_core::supervise_until(broker, 0, 2, cfg, async move {
+///     let _ = stopped.await;
+/// }));
+/// // … later, on the host's own shutdown path:
+/// let _ = stop.send(());
+/// let _ = run.await;
+/// # }
+/// ```
+pub async fn supervise_until(
+    broker: Broker,
+    total: usize,
+    children: usize,
+    cfg: Cfg,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> io::Result<Report> {
     broker.set_prefetch_cap(children);
     let batch = broker.drains_when_empty();
     let shared = new_shared(broker, total, batch);
@@ -1813,35 +1926,17 @@ pub async fn supervise(
     let cfg = Arc::new(cfg);
     let acceptor = tokio::spawn(accept_loop(listener, shared.clone()));
 
-    // A worker against a real broker has no natural end, so a signal is the
+    // A worker against a real broker has no natural end, so `shutdown` is the
     // only thing that stops it — and it has to stop the way a recycle does,
     // draining children rather than dropping their work.
-    let signals = (!batch).then(|| {
+    let stopper = {
         let shared = shared.clone();
         tokio::spawn(async move {
-            // Ctrl-C on both; SIGTERM as well where it exists, because that is
-            // what an orchestrator sends when it stops a pod.
-            #[cfg(unix)]
-            {
-                let mut term =
-                    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                    {
-                        Ok(term) => term,
-                        Err(_) => return,
-                    };
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {}
-                    _ = term.recv() => {}
-                }
-            }
-            #[cfg(windows)]
-            {
-                let _ = tokio::signal::ctrl_c().await;
-            }
+            shutdown.await;
             shared.done.store(true, Ordering::SeqCst);
             shared.work.notify_waiters();
         })
-    });
+    };
 
     // Cancellations are pulled as a set on a timer, not asked about per job.
     // A second of latency on a cancel is nothing next to a broker round trip
@@ -1994,9 +2089,7 @@ pub async fn supervise(
         let _ = handle.await;
     }
     acceptor.abort();
-    if let Some(handle) = signals {
-        handle.abort();
-    }
+    stopper.abort();
     if let Some(handle) = sweeper {
         handle.abort();
     }
@@ -2135,20 +2228,14 @@ pub fn build_cfg(
         max_rss,
         max_tasks,
         max_lifetime: (max_lifetime > 0.0).then(|| Duration::from_secs_f64(max_lifetime)),
-        poll: Duration::from_millis(100),
-        drain_timeout: Duration::from_secs(30),
-        term_grace: Duration::from_secs(5),
-        connect_timeout: Duration::from_secs(30),
         spawn_cap: 8 * children as u64 + spawn_slack + 8,
-        warm_multiple: 3,
-        spare_idle: Duration::from_secs(30),
         // Each job leases for its own timeout; this is only the slack on top.
         lease_grace: Duration::from_secs_f64(lease_grace.max(0.0)),
         metrics_addr,
         hard_max_rss,
-        claim_block: Duration::from_millis(250),
         slots: slots.max(1),
         max_dead,
+        ..Cfg::default()
     }
 }
 

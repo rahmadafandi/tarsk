@@ -10,8 +10,17 @@ A Python task queue whose workers hold a memory ceiling you set — without losi
 child supervision are Rust; the only Python in the hot path is your handler.
 
 ```bash
-pip install tarsk
+pip install tarsk            # memory broker only
+pip install tarsk-redis      # + Redis Streams
+pip install tarsk-postgres   # + Postgres
+pip install tarsk-amqp       # + RabbitMQ
 ```
+
+**Pick one.** Same tarsk, same `tarsk` package, one broker compiled into each — installing
+two leaves you running whichever pip unpacked last, so tarsk refuses to import when it
+finds more than one. Upgrading from 0.1.x, where `pip install tarsk` carried all of them,
+is a breaking change: see the
+[changelog](https://github.com/rahmadafandi/tarsk/blob/main/CHANGELOG.md).
 
 ```python
 from tarsk import App

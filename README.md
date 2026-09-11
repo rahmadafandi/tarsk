@@ -10,8 +10,22 @@ child supervision are Rust; the only Python in the hot path is your handler.
 [![License](https://img.shields.io/pypi/l/tarsk)](LICENSE)
 
 ```bash
-pip install tarsk
+pip install tarsk            # memory broker only
+pip install tarsk-redis      # + Redis Streams
+pip install tarsk-postgres   # + Postgres
+pip install tarsk-amqp       # + RabbitMQ
 ```
+
+**Pick one.** All four are the same tarsk with a different broker compiled in — same
+import, same API, same `tarsk` package — so installing two of them leaves you running
+whichever one pip unpacked last. tarsk refuses to import when it finds more than one, and
+a build without the backend your URL asks for names the package you want.
+
+> **Upgrading from 0.1.x: this is a breaking change.** `pip install tarsk` has shipped
+> Redis, Postgres and AMQP since 0.1. From 0.2.0 it ships none of them — it is the
+> memory-broker build. If your broker URL is anything but `memory://`,
+> `pip uninstall tarsk` and install the package for your broker. Nothing in your code
+> changes. See [CHANGELOG.md](CHANGELOG.md).
 
 > **Status: early.** The version badge above reads live from PyPI — a number written here
 > went stale twice before this sentence replaced it. Wheels for Linux (glibc and musl,
@@ -26,6 +40,7 @@ there: [how it works](https://rahmadafandi.github.io/tarsk/how-it-works),
 [benchmarks](https://rahmadafandi.github.io/tarsk/benchmarks).
 
 ```python
+# pip install tarsk-redis
 from tarsk import App
 
 app = App(broker="redis://localhost:6379/0")
@@ -112,7 +127,9 @@ Without it, any Python 3.11+ and a recent stable Rust will build: the wheel is a
 
 ```bash
 python -m venv .venv && .venv/bin/pip install maturin msgpack
-.venv/bin/maturin develop --release
+# Every backend in one build: the published wheels take one each, the source
+# tree is where all four are tested.
+.venv/bin/maturin develop --release -F redis,postgres,amqp
 
 .venv/bin/python tests/test_ipc.py       # protocol, timeouts, retries
 .venv/bin/python tests/test_recycle.py   # the ceiling, soft timeouts, middleware
@@ -121,8 +138,10 @@ cargo test --lib                         # cron, console, socket permissions
 ```
 
 The broker tests start their own `redis-server` and Postgres cluster, use any RabbitMQ
-answering on the conventional ports (or `TARSK_AMQP_URL`), and skip whichever is missing —
-loudly, so a skip cannot pass for a pass. `python demo/run.py --minutes 1 --ceiling 150MB --rate 30` is the definition of done
+answering on the conventional ports, and skip whichever is missing — loudly, so a skip
+cannot pass for a pass. `TARSK_REDIS_URL`, `TARSK_PG_URL` and `TARSK_AMQP_URL` point them
+at servers you already have instead, which is how a machine without the server binaries
+still tests those backends. Give each one a database of its own. `python demo/run.py --minutes 1 --ceiling 150MB --rate 30` is the definition of done
 in miniature: it exits non-zero if a task goes missing or the supervisor drifts.
 
 ## License

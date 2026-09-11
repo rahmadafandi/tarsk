@@ -393,6 +393,16 @@ fn rss_of(pid: u32) -> u64 {
     transport::child_rss_with(&mut sys, pid).unwrap_or(0)
 }
 
+/// Which brokers this wheel was built with.
+///
+/// `tarsk`, `tarsk-redis`, `tarsk-postgres` and `tarsk-amqp` are the same
+/// code with different cargo features, and they all install `tarsk._core`.
+/// This is how you tell which one you actually have.
+#[pyfunction]
+fn backends() -> Vec<&'static str> {
+    tarsk_core::broker::backends()
+}
+
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Pin the process-wide rustls crypto provider before any TLS connector
@@ -407,5 +417,6 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(work, m)?)?;
     m.add_function(wrap_pyfunction!(rss_of, m)?)?;
     m.add_function(wrap_pyfunction!(console_only, m)?)?;
+    m.add_function(wrap_pyfunction!(backends, m)?)?;
     m.add_class::<Producer>()
 }

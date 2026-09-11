@@ -35,7 +35,13 @@ fn scheme_is(url: &str, schemes: &[&str]) -> bool {
     schemes.iter().any(|s| url.starts_with(s))
 }
 
-fn compiled_backends() -> String {
+/// Backends this build can actually connect to.
+///
+/// Public, and exposed to Python as `tarsk._core.backends()`: each PyPI
+/// distribution compiles a different set, and a wheel that quietly lacks the
+/// backend you installed it for is the one failure this split can introduce.
+/// Asking the binary beats reading the build log.
+pub fn backends() -> Vec<&'static str> {
     let mut names = vec!["memory"];
     for (name, on) in [
         ("redis", cfg!(feature = "redis")),
@@ -46,14 +52,28 @@ fn compiled_backends() -> String {
             names.push(name);
         }
     }
-    names.join(", ")
+    names
+}
+
+fn compiled_backends() -> String {
+    backends().join(", ")
+}
+
+/// Everything up to and including `://`, or the whole string if there is no
+/// scheme. A broker URL carries a password, and this ends up in logs.
+fn scheme_of(url: &str) -> &str {
+    match url.find("://") {
+        Some(at) => &url[..at + 3],
+        None => url,
+    }
 }
 
 /// Why no compiled-in backend would take this URL.
 ///
 /// "unsupported broker url" was a lie once the backends became optional:
-/// `redis://` is supported, it just was not built. Naming what is here and what
-/// would have to be added turns a dead end into an instruction.
+/// `redis://` is supported, it just was not built. Since 0.2.0 the fix is a
+/// different PyPI package rather than a cargo feature, so the message names
+/// the package — the user of a wheel has no Cargo.toml to edit.
 fn unsupported(url: &str) -> String {
     let gated = [
         ("redis", REDIS_SCHEMES, cfg!(feature = "redis")),
@@ -63,13 +83,15 @@ fn unsupported(url: &str) -> String {
     .into_iter()
     .find(|(_, schemes, on)| !on && scheme_is(url, schemes));
     match gated {
-        Some((name, _, _)) => format!(
-            "broker url {url} needs the {name} backend, which this build does not have \
-             (compiled in: {}) — add the \"{name}\" feature to the tarsk-core dependency",
+        Some((name, schemes, _)) => format!(
+            "{} is not available in this build — install tarsk-{name} \
+             (pip install tarsk-{name}). This build has: {}",
+            schemes[0],
             compiled_backends()
         ),
         None => format!(
-            "unsupported broker url: {url} (compiled in: {})",
+            "unsupported broker url: {} (this build has: {})",
+            scheme_of(url),
             compiled_backends()
         ),
     }
@@ -3226,14 +3248,19 @@ mod tests {
         if cfg!(feature = "redis") {
             assert!(msg.starts_with("unsupported broker url"), "{msg}");
         } else {
-            assert!(msg.contains("redis backend"), "{msg}");
-            assert!(msg.contains("tarsk-core"), "{msg}");
+            // The package, not the cargo feature: whoever sees this installed
+            // a wheel and has no Cargo.toml to add a feature to.
+            assert!(msg.starts_with("redis:// is not available"), "{msg}");
+            assert!(msg.contains("tarsk-redis"), "{msg}");
+            assert!(!msg.contains("tarsk-core"), "{msg}");
         }
     }
 
     #[test]
     fn a_scheme_no_backend_serves_is_still_unsupported() {
-        let msg = unsupported("kafka://broker:9092");
+        let msg = unsupported("kafka://user:hunter2@broker:9092");
         assert!(msg.starts_with("unsupported broker url"), "{msg}");
+        // The URL is echoed into logs, so only the scheme is.
+        assert!(!msg.contains("hunter2"), "{msg}");
     }
 }

@@ -16,6 +16,10 @@ writes a shim that drops the `-m` pair and runs this file instead.
 
 `acks` is the one knob so far, because one defect needed it. Another misbehaviour
 belongs here as another argument, not as another file.
+
+Unix only. Both halves of the trick are Unix: the shim is a `#!/bin/sh` script
+marked executable, and the client speaks AF_UNIX. `launcher` says so by raising
+SkipTest rather than letting the supervisor find out as forty dead slots.
 """
 
 from __future__ import annotations
@@ -24,6 +28,7 @@ import asyncio
 import stat
 import sys
 from pathlib import Path
+from unittest import SkipTest
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -36,7 +41,15 @@ def launcher(directory, acks: int = 1) -> str:
 
     `$1 $2` are the `-m tarsk._child` the supervisor always passes; the rest is
     socket, app, child id, slots.
+
+    Raises SkipTest where the shim cannot be an interpreter. Every caller comes
+    through here, so this is the only place that has to know.
     """
+    if sys.platform == "win32":
+        raise SkipTest(
+            "the scripted child is a /bin/sh shim speaking AF_UNIX: Windows runs "
+            "neither, and the supervisor's transport there is a named pipe"
+        )
     shim = Path(directory) / "scripted-python"
     shim.write_text(
         f'#!/bin/sh\nexec "{sys.executable}" "{__file__}" "$3" "$4" "$5" "$6" {acks}\n'

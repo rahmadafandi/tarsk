@@ -7,6 +7,7 @@ import os
 import sys
 import tempfile
 from pathlib import Path
+from unittest import SkipTest
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -229,10 +230,20 @@ def test_attempt_counts_up_across_retries():
 
 
 if __name__ == "__main__":
+    ran, skipped = [], []
     for check in (test_slots_overlap_inside_one_child, test_slots_overlap_sync_handlers_too, test_registry_hash, test_timeout_cap, test_end_to_end,
                   test_retry_then_succeed, test_retries_run_out,
                   test_reject_skips_the_remaining_retries, test_retry_hands_the_job_back,
                   test_a_duplicate_ack_is_not_counted,
                   test_attempt_counts_up_across_retries):
-        check()
-        print("ok", check.__name__)
+        try:
+            check()
+        except SkipTest as why:
+            # Never "ok": a check that did not run must not print like one.
+            skipped.append(check.__name__)
+            print(f"skip {check.__name__} ({why})")
+        else:
+            ran.append(check.__name__)
+            print("ok", check.__name__)
+    print(f"\n{len(ran)} ran, {len(skipped)} skipped"
+          + (f": {', '.join(skipped)}" if skipped else ""))

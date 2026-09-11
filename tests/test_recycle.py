@@ -9,6 +9,7 @@ Run: python tests/test_recycle.py
 import os
 import sys
 from pathlib import Path
+from unittest import SkipTest
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -351,6 +352,7 @@ def test_memory_broker_carries_the_full_record():
 
 
 if __name__ == "__main__":
+    ran, skipped = [], []
     for check in (test_leaky_handler_is_bounded, test_recycling_is_overlapped,
                   test_a_recycled_child_loses_no_acks,
                   test_baseline_above_ceiling_is_refused,
@@ -362,5 +364,14 @@ if __name__ == "__main__":
                   test_soft_timeout_asks_before_it_takes,
                   test_soft_timeout_is_refused_where_it_cannot_work,
                   test_memory_broker_carries_the_full_record):
-        check()
-        print("ok", check.__name__)
+        try:
+            check()
+        except SkipTest as why:
+            # Never "ok": a check that did not run must not print like one.
+            skipped.append(check.__name__)
+            print(f"skip {check.__name__} ({why})")
+        else:
+            ran.append(check.__name__)
+            print("ok", check.__name__)
+    print(f"\n{len(ran)} ran, {len(skipped)} skipped"
+          + (f": {', '.join(skipped)}" if skipped else ""))

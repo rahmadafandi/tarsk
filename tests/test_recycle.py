@@ -83,6 +83,37 @@ def test_recycling_is_overlapped():
     assert sup.stats["children_spawned"] == recycles + 1, f"redundant spawns: {sup.stats}"
 
 
+def test_a_recycled_child_loses_no_acks():
+    """Settling runs off the frame loop; recycling under it must lose nothing.
+
+    Eight slots, a five-task limit and a child that acks the instant it is
+    dispatched: eight recycles, each with the settle queue in use. Every job
+    still has to come back.
+
+    It cannot prove the drain on its own. The in-memory broker settles faster
+    than the child can ack, so nothing is ever outstanding when a child retires
+    and this passes with the drain removed. What proves that is
+    `settle_tests::a_retiring_child_settles_everything_it_queued`, which can
+    hold the consumer still. This is the end-to-end half: real children, real
+    recycles, no answer missing.
+    """
+    import tempfile
+
+    from tests import scripted_child
+
+    jobs = [("add", (i, 1), {}) for i in range(40)]
+    with tempfile.TemporaryDirectory() as tmp:
+        sup = Supervisor("tests.demo_app:app", children=1, slots=8, max_tasks=5,
+                         python=scripted_child.launcher(tmp))
+        results = sup.run(jobs)
+
+    assert len(results) == len(jobs), f"lost acks across recycles: {results}"
+    assert all(kind == "ack" for kind, _ in results.values()), results
+    # The point is the recycles: without several of them this asserts nothing
+    # about what a retiring child owes.
+    assert sup.stats.get("recycle_max_tasks", 0) >= 3, sup.stats
+
+
 def test_baseline_above_ceiling_is_refused():
     """A ceiling below the interpreter itself is a config error, not a leak.
 
@@ -321,6 +352,7 @@ def test_memory_broker_carries_the_full_record():
 
 if __name__ == "__main__":
     for check in (test_leaky_handler_is_bounded, test_recycling_is_overlapped,
+                  test_a_recycled_child_loses_no_acks,
                   test_baseline_above_ceiling_is_refused,
                   test_hard_ceiling_kills_and_dead_letters,
                   test_hard_ceiling_must_exceed_the_soft_one,

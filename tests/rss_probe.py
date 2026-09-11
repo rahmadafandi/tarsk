@@ -6,6 +6,8 @@ which is indistinguishable from a working reading and a broken trigger unless
 you look at the reading itself.
 """
 
+import os
+import signal
 import subprocess
 import sys
 import time
@@ -52,22 +54,39 @@ def main() -> int:
         [sys.executable, "-c", CHILD], stdout=subprocess.PIPE, text=True
     )
     readings = []
-    reported_pid = ""
+    watched = child.pid
     try:
+        # The child names its own pid before it allocates anything, and it is
+        # the authority on which process holds the memory. A venv's python.exe
+        # on Windows can be a launcher that re-execs the real interpreter: the
+        # pid Popen returned is then a stub that has already gone, and every
+        # allocation is in a process it never named — which is exactly what CI
+        # saw, 0.0MB against an "os says unavailable" for a child holding 300.
+        # Measure the interpreter, not the launcher. Elsewhere the two pids are
+        # the same and this costs one readline.
+        said_pid = (child.stdout.readline() if child.stdout else "").split()
+        reported = int(said_pid[-1]) if said_pid else watched
+        if reported != watched:
+            print(f"  WARNING: spawned pid {watched} is a launcher stub "
+                  f"(os says {second_opinion(watched)}); anything watching it "
+                  f"measures the stub, not the interpreter")
+            watched = reported
+        print(f"  watching pid {watched}; the child reports {reported}")
+
         for _ in range(8):
             time.sleep(0.5)
-            mb = rss_of(child.pid) / 1e6
+            mb = rss_of(watched) / 1e6
             readings.append(mb)
-            print(f"  child rss {mb:7.1f} MB   (os says {second_opinion(child.pid)})")
-            if not reported_pid:
-                # A venv's python.exe on Windows can be a launcher that re-execs
-                # the real interpreter, in which case the pid we hold belongs to
-                # a 4MB stub and the memory is in a grandchild we never see.
-                line = child.stdout.readline() if child.stdout else ""
-                reported_pid = line.strip()
-                print(f"  we are watching pid {child.pid}; the child says {reported_pid!r}")
+            print(f"  child rss {mb:7.1f} MB   (os says {second_opinion(watched)})")
     finally:
         child.kill()
+        if watched != child.pid:
+            # Killing the launcher leaves the interpreter holding the pipe, and
+            # the read below would wait on it forever.
+            try:
+                os.kill(watched, signal.SIGTERM)
+            except OSError:
+                pass
         said = child.stdout.read() if child.stdout else ""
         child.wait()
 

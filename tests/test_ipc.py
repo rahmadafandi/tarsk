@@ -185,17 +185,31 @@ def test_a_duplicate_ack_is_not_counted():
     from tests import scripted_child
 
     jobs = [("add", (1, 1), {}), ("add", (2, 2), {})]
+
+    def ran_the_jobs(sup, results):
+        """A child that never started recycles nothing, which is not the point.
+
+        `recycle_max_tasks == 0` is what a working supervisor and a dead
+        harness both produce, so it has to be read alongside proof that two
+        tasks were actually dispatched and answered.
+        """
+        assert len(results) == len(jobs), f"the scripted child never ran: {results}"
+        assert all(kind == "ack" for kind, _ in results.values()), (
+            f"nothing below counts anything if the child did not run: {results}"
+        )
+        assert sup.stats["children_spawned"] >= 1, sup.stats
+
     with tempfile.TemporaryDirectory() as tmp:
         # The control: four is genuinely out of reach for two tasks, so the
         # assertion below is about the duplicate and not about the limit.
         honest = Supervisor("tests.demo_app:app", children=1, max_tasks=4,
                             python=scripted_child.launcher(tmp, acks=1))
-        honest.run(jobs)
+        ran_the_jobs(honest, honest.run(jobs))
         assert honest.stats.get("recycle_max_tasks", 0) == 0, honest.stats
 
         liar = Supervisor("tests.demo_app:app", children=1, max_tasks=4,
                           python=scripted_child.launcher(tmp, acks=2))
-        liar.run(jobs)
+        ran_the_jobs(liar, liar.run(jobs))
         assert liar.stats.get("recycle_max_tasks", 0) == 0, liar.stats
 
 

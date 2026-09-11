@@ -100,21 +100,82 @@ mod windows {
 
 /// Resident memory of a worker, in bytes.
 ///
-/// On Unix that is one process. On Windows a venv's `python.exe` can be a
-/// launcher that starts the real interpreter as a child, so the pid the
+/// On Unix that is one process. On Windows a venv's `python.exe` is a launcher
+/// that starts the real interpreter as a child and waits for it, so the pid the
 /// supervisor holds belongs to a four-megabyte stub while every allocation
-/// happens in a process it never looks at — which is exactly what the ceiling
-/// saw there: 4.1MB, unchanged, while the worker held three hundred.
-///
-/// Windows therefore sums the worker and its descendants. Double-counting
-/// shared pages errs towards recycling early, which is the safe direction for
-/// a limit. Unix keeps the single cheap read: nothing there stands between the
-/// spawn and the interpreter.
+/// happens in a process it never looks at. Windows therefore sums the worker
+/// and its descendants. Double-counting shared pages errs towards recycling
+/// early, which is the safe direction for a limit. Unix keeps the single cheap
+/// read: nothing there stands between the spawn and the interpreter.
 #[cfg(unix)]
 pub fn child_rss_with(sys: &mut sysinfo::System, pid: u32) -> Option<u64> {
     let key = sysinfo::Pid::from_u32(pid);
     sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[key]), false);
     sys.process(key).map(|p| p.memory())
+}
+
+/// The working set of one process, read from the API rather than through
+/// sysinfo.
+///
+/// sysinfo opens each process with PROCESS_QUERY_INFORMATION | PROCESS_VM_READ
+/// and reports nothing for the ones it is refused. That refusal is what the
+/// probe has been printing as `0.0 MB` for a child holding three hundred
+/// megabytes: the runner image changed under us between a green run on
+/// 20260810.198 and a red one on 20260907.229, with this crate, sysinfo 0.38.4
+/// and the workflow all byte-identical across the pair.
+///
+/// PROCESS_QUERY_LIMITED_INFORMATION is the least privilege that still answers
+/// a memory question, and it is granted where the wider pair is denied. This
+/// call was already here once — it was measured against Get-Process on Windows
+/// and agreed with it — and was dropped on the theory that the wrong pid, not
+/// the reading, was the whole story. The pid was half of it.
+#[cfg(windows)]
+fn process_rss(pid: u32) -> Option<u64> {
+    // PROCESS_MEMORY_COUNTERS: two DWORDs then eight SIZE_Ts, which on x86-64
+    // means the pair of u32s share the first eight bytes.
+    #[repr(C)]
+    #[derive(Default)]
+    struct Counters {
+        cb: u32,
+        page_fault_count: u32,
+        peak_working_set: usize,
+        working_set: usize,
+        quota_peak_paged: usize,
+        quota_paged: usize,
+        quota_peak_non_paged: usize,
+        quota_non_paged: usize,
+        pagefile: usize,
+        peak_pagefile: usize,
+    }
+
+    // K32GetProcessMemoryInfo lives in kernel32, which is linked already;
+    // GetProcessMemoryInfo is the same call forwarded through psapi.dll and
+    // would need a second library on the link line.
+    unsafe extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
+        fn K32GetProcessMemoryInfo(process: isize, counters: *mut Counters, cb: u32) -> i32;
+        fn CloseHandle(handle: isize) -> i32;
+    }
+
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle == 0 {
+            return None;
+        }
+        let mut counters = Counters {
+            cb: std::mem::size_of::<Counters>() as u32,
+            ..Default::default()
+        };
+        let ok = K32GetProcessMemoryInfo(
+            handle,
+            &mut counters,
+            std::mem::size_of::<Counters>() as u32,
+        );
+        CloseHandle(handle);
+        (ok != 0).then_some(counters.working_set as u64)
+    }
 }
 
 #[cfg(windows)]
@@ -137,12 +198,17 @@ pub fn child_rss_with(sys: &mut sysinfo::System, pid: u32) -> Option<u64> {
             break;
         }
     }
-    sys.process(root)?;
-    Some(
-        family
-            .iter()
-            .filter_map(|p| sys.process(*p))
-            .map(|p| p.memory())
-            .sum(),
-    )
+    // sysinfo is used to find the family and nothing else; every byte comes
+    // from process_rss. The root is read whether or not sysinfo listed it, so
+    // a process table we were refused cannot turn a live child into a zero —
+    // the old `sys.process(root)?` guard did exactly that.
+    let mut total = 0;
+    let mut read_any = false;
+    for member in &family {
+        if let Some(bytes) = process_rss(member.as_u32()) {
+            total += bytes;
+            read_any = true;
+        }
+    }
+    read_any.then_some(total)
 }

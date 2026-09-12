@@ -2168,7 +2168,7 @@ checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
 
 [[package]]
 name = "tarsk-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "lapin",
  "libc",
@@ -2182,7 +2182,7 @@ dependencies = [
 
 [[package]]
 name = "tarsk-python"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "pyo3",
  "rustls",

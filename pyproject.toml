@@ -1,6 +1,6 @@
 [project]
 name = "tarsk"
-version = "0.2.0"
+version = "0.2.1"
 description = "Memory-bounded task queue for Python with a Rust runtime"
 readme = "README.md"
 requires-python = ">=3.11"

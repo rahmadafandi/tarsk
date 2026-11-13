@@ -301,7 +301,11 @@ class Enqueue:
         # NOT deduplication — the queue takes both jobs and runs them both,
         # and only the answers collide. `dedup_key` or `unique=` is what stops
         # the second send; this used to claim otherwise.
-        self.task_id = task_id or secrets.token_hex(8)
+        #
+        # None means "mint one per send". Minting it here instead gave every
+        # send from a reused `task.options(...)` the same id, and so the same
+        # result key, without anyone having asked for that.
+        self.task_id = task_id
         self.chain = chain
         self.dedup_key = dedup_key
         self.dedup_ttl = dedup_ttl
@@ -311,12 +315,13 @@ class Enqueue:
         from . import _proto  # lazy — see App.producer
 
         app = self.task.app
+        task_id = self.task_id or secrets.token_hex(8)
         if app.middlewares:
             # Producer side, so sync only: send() is not a coroutine, and
             # making it one to accommodate a hook would be the tail wagging.
             ctx = Context(
                 name=self.task.spec.name,
-                task_id=self.task_id,
+                task_id=task_id,
                 attempt=0,  # not run yet
                 args=args,
                 kwargs=kwargs,
@@ -333,7 +338,7 @@ class Enqueue:
         payload = _proto.pack_args(args, kwargs)
         key, ttl_ms = self._dedup(payload)
         held = self.task.app.producer().send(
-            self.task_id, self.queue, self.task.spec.name, payload,
+            task_id, self.queue, self.task.spec.name, payload,
             self.timeout_ms, self.delay, self.chain,
             _proto.pack_result(self.meta) if self.meta else b"",
             key, ttl_ms, self.expires_ms,
@@ -341,7 +346,7 @@ class Enqueue:
         # A deduplicated send hands back the id of the job already covering it,
         # so the caller waits on the same answer instead of on a job that was
         # never queued.
-        return held or self.task_id
+        return held or task_id
 
     def _dedup(self, payload: bytes) -> tuple[str, int]:
         ttl = self.dedup_ttl if self.dedup_ttl is not None else self.task.spec.unique_ms / 1000

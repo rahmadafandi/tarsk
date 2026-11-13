@@ -219,6 +219,11 @@ async def _shutdown(app, writer) -> None:
         traceback.print_exc()
 
 
+# Progress frames in flight from async handlers. The loop keeps only a weak
+# reference to a task, so one nobody holds can be collected before it runs.
+_reports: set[asyncio.Task] = set()
+
+
 async def _one(app, wire: Wire, app_spec: str, task_id: int, name: str, payload,
                meta: bytes = b"", attempt: int = 1, job_id: str = "") -> None:
     """Run a single dispatched task and report it. Never raises."""
@@ -249,7 +254,9 @@ async def _one(app, wire: Wire, app_spec: str, task_id: int, name: str, payload,
                 # this task but every slot in the child, since the read loop
                 # shares the same thread. Scheduled instead; Wire's lock keeps
                 # the frame whole against concurrent Acks.
-                loop.create_task(wire.send("Progress", _id, payload))
+                report = loop.create_task(wire.send("Progress", _id, payload))
+                _reports.add(report)
+                report.add_done_callback(_reports.discard)
 
         ctx = Context(
             name=name,

@@ -572,31 +572,26 @@ impl Shared {
     /// Publish how far a running task has got, under the same expiry as its
     /// result. A progress record that outlives interest in the result is a leak
     /// that reports on itself.
-    async fn keep_progress(&self, job: &Job, blob: Vec<u8>) {
-        if job.id.is_empty() {
+    async fn keep_progress(&self, id: &str, name: &str, blob: Vec<u8>) {
+        if id.is_empty() {
             return;
         }
         let ttl = self
             .specs
             .lock()
             .unwrap()
-            .get(&job.name)
+            .get(name)
             .map(|s| s.result_ttl_ms)
             .unwrap_or(0);
         if ttl == 0 {
             return;
         }
-        if self
+        if let Err(err) = self
             .broker
-            .store_result(
-                &format!("progress:{}", job.id),
-                blob,
-                Duration::from_millis(ttl),
-            )
+            .store_result(&format!("progress:{id}"), blob, Duration::from_millis(ttl))
             .await
-            .is_err()
         {
-            self.counters.broker_errors.fetch_add(1, Ordering::Relaxed);
+            self.broker_error("storing progress", err.as_ref());
         }
     }
 
@@ -1270,17 +1265,38 @@ struct Served {
 fn settle_task(
     shared: &Arc<Shared>,
     capacity: usize,
-) -> (mpsc::Sender<(Job, Outcome)>, tokio::task::JoinHandle<()>) {
+) -> (mpsc::Sender<Settle>, tokio::task::JoinHandle<()>) {
     // The slot count is the ceiling on how many acks can land at once: a child
     // cannot answer for work it was never handed.
-    let (tx, mut rx) = mpsc::channel::<(Job, Outcome)>(capacity.max(1));
+    let (tx, mut rx) = mpsc::channel::<Settle>(capacity.max(1));
     let shared = shared.clone();
     let task = tokio::spawn(async move {
-        while let Some((job, outcome)) = rx.recv().await {
-            shared.settle(job, outcome).await;
+        while let Some(item) = rx.recv().await {
+            match item {
+                Settle::Done(job, outcome) => shared.settle(job, outcome).await,
+                Settle::Progress { id, name, blob } => shared.keep_progress(&id, &name, blob).await,
+            }
         }
     });
     (tx, task)
+}
+
+/// What a child's frame loop hands to its settle task.
+///
+/// Progress rides the same channel as the outcomes for the reason the
+/// outcomes do: it is a broker round trip, and awaited on the frame loop it
+/// held every other frame from that child behind it. The one consumer also
+/// keeps a task's reports in the order it made them, and ahead of its result.
+// Outcomes are the common case and the large one; boxing them to shrink the
+// rare variant would add an allocation to every settle.
+#[allow(clippy::large_enum_variant)]
+enum Settle {
+    Done(Job, Outcome),
+    Progress {
+        id: String,
+        name: String,
+        blob: Vec<u8>,
+    },
 }
 
 /// Handle one child until it needs replacing, dies, or the work runs out.
@@ -1302,7 +1318,7 @@ async fn serve_inner(
     shared: &Arc<Shared>,
     child: &mut ChildHandle,
     cfg: &Arc<Cfg>,
-    settle: &mpsc::Sender<(Job, Outcome)>,
+    settle: &mpsc::Sender<Settle>,
 ) -> Served {
     let ChildHandle {
         pid,
@@ -1416,7 +1432,7 @@ async fn serve_inner(
                     if waited > expires_ms {
                         shared.counters.expired.fetch_add(1, Ordering::Relaxed);
                         if settle
-                            .send((
+                            .send(Settle::Done(
                                 job,
                                 Outcome::nack(
                                     "Expired",
@@ -1516,7 +1532,7 @@ async fn serve_inner(
                     // Settled, not run. The delivery still has to be acked or
                     // the lease would expire and hand it back for another go.
                     if settle
-                        .send((
+                        .send(Settle::Done(
                             job,
                             Outcome::nack("Cancelled", "cancelled before it started".into()),
                         ))
@@ -1619,7 +1635,7 @@ async fn serve_inner(
                             // lease expiry and nothing would say why. Retire
                             // the child instead, which is a failure the
                             // supervisor counts and reports.
-                            if settle.send((job, done)).await.is_err() {
+                            if settle.send(Settle::Done(job, done)).await.is_err() {
                                 return Served { exit: Exit::Died, spare };
                             }
                             *tasks_done += 1;
@@ -1634,7 +1650,7 @@ async fn serve_inner(
                         if let Some(job) = inflight.remove(&task_id) {
                             let mut outcome = Outcome::nack(kind, tb.to_string());
                             outcome.directive = directive;
-                            if settle.send((job, outcome)).await.is_err() {
+                            if settle.send(Settle::Done(job, outcome)).await.is_err() {
                                 return Served { exit: Exit::Died, spare };
                             }
                             *tasks_done += 1;
@@ -1647,7 +1663,14 @@ async fn serve_inner(
                             (items[1].as_u64(), items[2].as_slice())
                         {
                             if let Some(job) = inflight.get(&task_id) {
-                                shared.keep_progress(job, blob.to_vec()).await;
+                                let report = Settle::Progress {
+                                    id: job.id.clone(),
+                                    name: job.name.clone(),
+                                    blob: blob.to_vec(),
+                                };
+                                if settle.send(report).await.is_err() {
+                                    return Served { exit: Exit::Died, spare };
+                                }
                             }
                         }
                     }
@@ -2490,7 +2513,7 @@ mod settle_tests {
 
         let (tx, task) = settle_task(&shared, 8);
         for job in jobs {
-            tx.send((job, Outcome::nack("Nope", String::new())))
+            tx.send(Settle::Done(job, Outcome::nack("Nope", String::new())))
                 .await
                 .unwrap();
         }
@@ -2522,8 +2545,12 @@ mod settle_tests {
 
         let (tx, task) = settle_task(&shared, ACKS);
         for job in jobs {
-            tx.try_send((job, Outcome::nack("Nope", String::new())))
-                .expect("queued, not yet settled");
+            if tx
+                .try_send(Settle::Done(job, Outcome::nack("Nope", String::new())))
+                .is_err()
+            {
+                panic!("the settle queue was full");
+            }
         }
         drop(tx);
         task.await.unwrap();

@@ -12,6 +12,8 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(any(feature = "postgres", feature = "amqp"))]
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -2717,6 +2719,11 @@ impl RedisBroker {
 /// reachable when a lease cannot outlive a known ceiling.
 #[cfg(feature = "postgres")]
 const PG_SCHEMA: &str = "
+-- This whole batch is one implicit transaction, so the lock makes workers that
+-- start together set the schema up one at a time instead of racing each other
+-- into duplicate-object errors.
+select pg_advisory_xact_lock(7401001);
+create table if not exists tarsk_schema (stamp bigint primary key);
 create table if not exists tarsk_jobs (
     id          bigserial primary key,
     job_id      text        not null,
@@ -2730,6 +2737,14 @@ create table if not exists tarsk_jobs (
     lease_until timestamptz,
     created_at  timestamptz not null default now()
 );
+-- Before the indexes, not after. `alter table` takes the strongest lock there
+-- is and `create index` a weaker one that still blocks writers; taken in that
+-- order inside this one transaction, a worker mid-claim and a process just
+-- connecting each ended up waiting on the other, and Postgres killed one.
+alter table tarsk_jobs add column if not exists chain      bytea;
+alter table tarsk_jobs add column if not exists claimed_by text;
+alter table tarsk_jobs add column if not exists meta       bytea;
+alter table tarsk_jobs add column if not exists expires_ms bigint not null default 0;
 create index if not exists tarsk_jobs_ready on tarsk_jobs (queue, id) where lease_until is null;
 create index if not exists tarsk_jobs_leased on tarsk_jobs (lease_until) where lease_until is not null;
 
@@ -2784,13 +2799,45 @@ create table if not exists tarsk_revoked (
     expires_at timestamptz not null
 );
 create index if not exists tarsk_revoked_expiry on tarsk_revoked (expires_at);
-alter table tarsk_jobs add column if not exists chain      bytea;
-alter table tarsk_jobs add column if not exists claimed_by text;
-alter table tarsk_jobs add column if not exists meta       bytea;
-alter table tarsk_jobs add column if not exists expires_ms bigint not null default 0;
 alter table tarsk_dead add column if not exists job_id     text;
 alter table tarsk_dead add column if not exists timeout_ms integer not null default 0;
+alter table tarsk_dead add column if not exists chain      bytea;
+alter table tarsk_dead add column if not exists meta       bytea;
+alter table tarsk_dead add column if not exists expires_ms bigint not null default 0;
+alter table tarsk_buckets add column if not exists took boolean not null default false;
+-- A function because the cap needs lock, then count, then insert, and a single
+-- statement cannot do that: its snapshot is taken before it waits for the
+-- lock, so the count would not see the insert it had just waited behind. Each
+-- statement in a plpgsql body gets a fresh one.
+create or replace function tarsk_acquire_slot(
+    p_task text, p_job text, p_max bigint, p_secs double precision
+) returns boolean language plpgsql as $tarsk$
+begin
+    perform pg_advisory_xact_lock(hashtext('tarsk_slots:' || p_task));
+    delete from tarsk_slots where expires_at <= now();
+    if (select count(*) from tarsk_slots
+         where task = p_task and job_id <> p_job) >= p_max then
+        return false;
+    end if;
+    insert into tarsk_slots (task, job_id, expires_at)
+    values (p_task, p_job, now() + make_interval(secs => p_secs))
+    on conflict (task, job_id) do update set expires_at = excluded.expires_at;
+    return true;
+end
+$tarsk$;
 ";
+
+/// FNV-1a of the schema text: changes whenever the schema does, with nobody
+/// having to remember to bump a number.
+#[cfg(feature = "postgres")]
+fn schema_stamp() -> i64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in PG_SCHEMA.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash as i64
+}
 
 /// Claiming and reclaiming are the same statement: a lease that has run out is
 /// indistinguishable from one that was never taken, so expiry needs no sweep.
@@ -2825,7 +2872,11 @@ returning tarsk_jobs.id, name, payload, attempt, run_lease, job_id, picked.ready
 
 #[cfg(feature = "postgres")]
 pub struct PgBroker {
-    client: tokio_postgres::Client,
+    /// Replaced when the server goes away. A `Client` whose connection has
+    /// ended fails every query from then on, and nothing short of a new one
+    /// brings it back.
+    link: tokio::sync::Mutex<Arc<tokio_postgres::Client>>,
+    url: String,
     queues: Vec<String>,
     stores: AtomicU64,
     /// The same identity Redis gets for free from its consumer group. Postgres
@@ -2835,7 +2886,7 @@ pub struct PgBroker {
 
 #[cfg(feature = "postgres")]
 impl PgBroker {
-    async fn connect(url: &str, queues: Vec<String>) -> Res<PgBroker> {
+    async fn open(url: &str) -> Res<tokio_postgres::Client> {
         // A TLS connector is always supplied, which is not the same as always
         // using TLS: tokio-postgres reads sslmode from the URL and defaults to
         // `prefer`, so a local server without TLS still connects and a managed
@@ -2862,20 +2913,55 @@ impl PgBroker {
         tokio::spawn(async move {
             let _ = connection.await;
         });
-        client.batch_execute(PG_SCHEMA).await?;
+        // The DDL takes table locks every running worker has to wait behind,
+        // so it runs when the schema text has changed and not on every
+        // connection. A missing table is an error here, and means "never set
+        // up" as surely as a missing row does.
+        let stamp = schema_stamp();
+        let current = client
+            .query_opt("select 1 from tarsk_schema where stamp = $1", &[&stamp])
+            .await;
+        if !matches!(current, Ok(Some(_))) {
+            client.batch_execute(PG_SCHEMA).await?;
+            client
+                .execute(
+                    "insert into tarsk_schema (stamp) values ($1) on conflict do nothing",
+                    &[&stamp],
+                )
+                .await?;
+        }
+        Ok(client)
+    }
+
+    async fn connect(url: &str, queues: Vec<String>) -> Res<PgBroker> {
         Ok(PgBroker {
             consumer: format!("tarsk-{}", std::process::id()),
-            client,
+            link: tokio::sync::Mutex::new(Arc::new(Self::open(url).await?)),
+            url: url.to_string(),
             queues,
             stores: AtomicU64::new(0),
         })
+    }
+
+    /// The live client, reconnecting first if the last one died.
+    ///
+    /// Held behind a lock so a restart is met with one reconnect rather than
+    /// one per waiting caller. While the server is still down this fails like
+    /// any other query, and the next call tries again.
+    async fn db(&self) -> Res<Arc<tokio_postgres::Client>> {
+        let mut link = self.link.lock().await;
+        if link.is_closed() {
+            *link = Arc::new(Self::open(&self.url).await?);
+        }
+        Ok(link.clone())
     }
 
     /// A delay needs no schedule table: the lease column is already a
     /// visibility timer, so a row leased into the future is simply not claimed
     /// until then.
     async fn push(&self, job: NewJob, delay: Duration) -> Res<()> {
-        self.client
+        self.db()
+            .await?
             .execute(
                 "insert into tarsk_jobs
                      (job_id, queue, name, payload, timeout_ms, lease_until, chain, meta,
@@ -2907,7 +2993,8 @@ impl PgBroker {
         let deadline = tokio::time::Instant::now() + block;
         loop {
             let rows = self
-                .client
+                .db()
+                .await?
                 .query(
                     PG_CLAIM,
                     &[&self.queues, &grace.as_secs_f64(), &self.consumer],
@@ -2947,7 +3034,8 @@ impl PgBroker {
         };
         // The run_lease guard: nothing happens if this job was reclaimed and
         // re-run while we were away.
-        self.client
+        self.db()
+            .await?
             .execute(
                 "delete from tarsk_jobs where id = $1 and run_lease = $2",
                 &[row, run_lease],
@@ -2969,7 +3057,8 @@ impl PgBroker {
         let Receipt::Postgres { row, run_lease } = receipt else {
             return Err("not a postgres receipt".into());
         };
-        self.client
+        self.db()
+            .await?
             .execute(
                 "update tarsk_jobs set lease_until = case when $3::double precision > 0
                      then now() + make_interval(secs => $3::double precision) else null end,
@@ -2984,14 +3073,16 @@ impl PgBroker {
     async fn claim_tick(&self, name: &str, minute: i64) -> Res<bool> {
         // The primary key is the election: exactly one insert can succeed.
         let inserted = self
-            .client
+            .db()
+            .await?
             .execute(
                 "insert into tarsk_cron (name, minute) values ($1, $2) on conflict do nothing",
                 &[&name, &minute],
             )
             .await?;
         if inserted == 1 {
-            self.client
+            self.db()
+                .await?
                 .execute(
                     "delete from tarsk_cron where minute < $1",
                     &[&(minute - 120)],
@@ -3002,7 +3093,8 @@ impl PgBroker {
     }
 
     async fn store_result(&self, id: &str, blob: Vec<u8>, ttl: Duration) -> Res<()> {
-        self.client
+        self.db()
+            .await?
             .execute(
                 "insert into tarsk_results (id, blob, expires_at)
                  values ($1, $2, now() + make_interval(secs => $3::double precision))
@@ -3018,7 +3110,8 @@ impl PgBroker {
             .fetch_add(1, Ordering::Relaxed)
             .is_multiple_of(256)
         {
-            self.client
+            self.db()
+                .await?
                 .execute("delete from tarsk_results where expires_at < now()", &[])
                 .await?;
         }
@@ -3027,7 +3120,8 @@ impl PgBroker {
 
     async fn get_result(&self, id: &str) -> Res<Option<Vec<u8>>> {
         let rows = self
-            .client
+            .db()
+            .await?
             .query(
                 "select blob from tarsk_results where id = $1 and expires_at > now()",
                 &[&id],
@@ -3042,7 +3136,8 @@ impl PgBroker {
         // extract(epoch) is milliseconds since the row became relevant:
         // positive for time waited, negative for time still to wait.
         let rows = self
-            .client
+            .db()
+            .await?
             .query(
                 "select job_id, queue, name, attempt,
                         case when lease_until is null or lease_until < now() then 'ready'
@@ -3086,7 +3181,8 @@ impl PgBroker {
         // job has never been claimed, an in-flight one has. Without it the
         // backlog and the work in progress look identical.
         let rows = self
-            .client
+            .db()
+            .await?
             .query(
                 "select queue,
                         count(*) filter (where lease_until is null or lease_until < now()),
@@ -3097,7 +3193,8 @@ impl PgBroker {
             )
             .await?;
         let dead = self
-            .client
+            .db()
+            .await?
             .query(
                 "select queue, count(*) from tarsk_dead where queue = any($1) group by queue",
                 &[&queues],
@@ -3124,7 +3221,8 @@ impl PgBroker {
 
     async fn claim_dedup(&self, key: &str, job_id: &str, ttl_ms: u64) -> Res<Option<String>> {
         let rows = self
-            .client
+            .db()
+            .await?
             .query(
                 "with fresh as (delete from tarsk_dedup where expires_at <= now())
                  insert into tarsk_dedup (key, job_id, expires_at)
@@ -3138,7 +3236,8 @@ impl PgBroker {
             return Ok(None); // inserted, so this caller owns the window
         }
         let held = self
-            .client
+            .db()
+            .await?
             .query(
                 "select job_id from tarsk_dedup where key = $1 and expires_at > now()",
                 &[&key],
@@ -3153,7 +3252,8 @@ impl PgBroker {
         // `on conflict do update` makes a redelivery renew its own slot rather
         // than be refused by it.
         let row = self
-            .client
+            .db()
+            .await?
             .query_one(
                 "with gone as (delete from tarsk_slots where expires_at <= now())
                  insert into tarsk_slots (task, job_id, expires_at)
@@ -3182,7 +3282,8 @@ impl PgBroker {
     }
 
     async fn release_slot(&self, task: &str, job_id: &str) -> Res<()> {
-        self.client
+        self.db()
+            .await?
             .execute(
                 "delete from tarsk_slots where task = $1 and job_id = $2",
                 &[&task, &job_id],
@@ -3197,7 +3298,8 @@ impl PgBroker {
         // rewrites it, and reports the level *before* the take, which is the
         // only number that says whether there was a token to take.
         let row = self
-            .client
+            .db()
+            .await?
             .query_one(
                 // No `$2::float8`: a cast makes Postgres infer the parameter
                 // as unknown and coerce at runtime, so the driver expects text
@@ -3239,7 +3341,8 @@ impl PgBroker {
     }
 
     async fn revoke(&self, queue: &str, id: &str, ttl_ms: u64) -> Res<()> {
-        self.client
+        self.db()
+            .await?
             .execute(
                 "insert into tarsk_revoked (id, queue, expires_at)
                  values ($1, $2, now() + make_interval(secs => $3))
@@ -3251,13 +3354,15 @@ impl PgBroker {
     }
 
     async fn revoked_all(&self) -> Res<Vec<String>> {
-        self.client
+        self.db()
+            .await?
             .execute("delete from tarsk_revoked where expires_at <= now()", &[])
             .await?;
         let rows = self
-            .client
+            .db()
+            .await?
             .query(
-                "select id from tarsk_revoked where queue = any($1)",
+                "select id from tarsk_revoked where queue = any()",
                 &[&self.queues],
             )
             .await?;
@@ -3266,7 +3371,8 @@ impl PgBroker {
 
     async fn dead_list(&self, queue: &str, limit: usize) -> Res<Vec<Dead>> {
         let rows = self
-            .client
+            .db()
+            .await?
             .query(
                 "select id, name, error, traceback,
                         (extract(epoch from died_at) * 1000)::bigint as died_ms
@@ -3304,14 +3410,15 @@ impl PgBroker {
                        (job_id, queue, name, payload, timeout_ms, attempt, lease_until)
                    select coalesce(job_id, ''), queue, name, payload, timeout_ms, 0, null
                      from gone";
-        let n = self.client.execute(sql, &[&queue, &picked]).await?;
+        let n = self.db().await?.execute(sql, &[&queue, &picked]).await?;
         Ok(n as usize)
     }
 
     async fn dead_purge(&self, queue: &str, ids: &[String]) -> Res<usize> {
         let picked: Vec<i64> = ids.iter().filter_map(|i| i.parse().ok()).collect();
         let n = self
-            .client
+            .db()
+            .await?
             .execute(
                 "delete from tarsk_dead
                   where queue = $1 and ($2::bigint[] = '{}' or id = any($2))",
@@ -3331,7 +3438,8 @@ impl PgBroker {
         let Receipt::Postgres { row, run_lease } = receipt else {
             return Err("not a postgres receipt".into());
         };
-        self.client
+        self.db()
+            .await?
             .execute(
                 "with gone as (
                      delete from tarsk_jobs where id = $1 and run_lease = $2
@@ -3348,7 +3456,8 @@ impl PgBroker {
             // Trimmed on write like the Redis side, rather than on a timer:
             // the row that pushes a queue over its cap is the one that should
             // pay for the trim, and nothing else has to remember to run.
-            self.client
+            self.db()
+                .await?
                 .execute(
                     "delete from tarsk_dead where id in (
                          select id from tarsk_dead

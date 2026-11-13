@@ -201,3 +201,25 @@ def reports(ctx=Depends(Context)):
         ctx.set_progress({"step": step, "of": 3})
         time.sleep(0.2)
     return "finished"
+
+
+@app.task(name="brief")
+def brief(tag):
+    """Short, so a backlog of them drains fast, and long enough that a worker
+    told to stop is still surrounded by them."""
+    time.sleep(0.5)
+    _log(tag)
+    return tag
+
+
+@app.task(name="knows_itself", result_ttl=60)
+def knows_itself(ctx=Depends(Context)):
+    return ctx.task_id
+
+
+@app.task(name="needs_marker", result_ttl=60)
+def needs_marker(path):
+    """Dead-letters until the file exists: a bug, and then its fix."""
+    if not os.path.exists(path):
+        raise RuntimeError("not deployed yet")
+    return "ready"

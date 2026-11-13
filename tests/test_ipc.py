@@ -243,13 +243,78 @@ def test_attempt_counts_up_across_retries():
         ATTEMPT_MARKER.unlink(missing_ok=True)
 
 
+def test_a_handlers_own_timeout_is_not_the_tasks():
+    """A handler raising TimeoutError is a handler that raised.
+
+    It used to be read as the task's deadline: no traceback, the wrong
+    message, and for a sync handler a killed worker — taking the sibling in
+    the next slot down with it.
+    """
+    sup = Supervisor("tests.demo_app:app", children=1, slots=2)
+    out = sup.run([("slow_lane", (), {}), ("own_timeout", (), {})])
+    kind, (error_type, tb) = out[1]
+    assert (kind, error_type) == ("nack", "TimeoutError"), out[1]
+    assert "the upstream socket timed out" in tb, f"its own traceback was lost: {tb!r}"
+    assert out[0] == ("ack", "done"), f"the sibling did not survive: {out[0]}"
+    assert EXIT_SYNC_TIMEOUT not in sup.exits, f"the worker was killed: {sup.exits}"
+
+
+def test_int_keyed_dicts_survive_the_trip():
+    """msgpack packs `{1: "a"}` and by default refuses to unpack it."""
+    out = Supervisor("tests.demo_app:app", children=1).run([("mirror", ({1: "a"},), {})])
+    assert out[0] == ("ack", {1: "a"}), out[0]
+
+
+def test_waiting_for_a_slot_is_not_an_attempt():
+    """Queueing behind `max_concurrency` must not spend the retry budget.
+
+    Each hand-back used to bump the attempt, so a job that waited its turn
+    arrived at its first real run already past `retries`.
+    """
+    sup = Supervisor("tests.demo_app:app", children=2)
+    out = sup.run([("lane_attempt", (), {})] * 4)
+    assert sup.stats["tasks_at_capacity"] > 0, "nothing ever waited, so nothing was tested"
+    assert sorted(v for _, v in out.values()) == [1, 1, 1, 1], out
+
+
+def test_a_worker_dependency_resolves_once():
+    """`scope="worker"` is once per process, however many slots race for it."""
+    out = Supervisor("tests.demo_app:app", children=1, slots=6).run(
+        [("shares_pool", (), {})] * 6)
+    assert [v for _, v in out.values()] == [1] * 6, out
+
+
+def test_each_send_mints_its_own_id():
+    """A reused `options(...)` must not file every send under one id."""
+    app = App(broker="memory://")
+    ids = []
+
+    class Capture:
+        def send(self, task_id, *rest):
+            ids.append(task_id)
+            return ""
+
+    app._producer = Capture()
+    task = app.task(name="x")(lambda: None)
+    held = task.options(queue="other")
+    assert held.send() != held.send(), "two sends shared an id"
+    assert len(set(ids)) == 2, ids
+    pinned = task.options(task_id="mine")
+    assert pinned.send() == pinned.send() == "mine", "an explicit id must be kept"
+
+
 if __name__ == "__main__":
     ran, skipped = [], []
     for check in (test_slots_overlap_inside_one_child, test_slots_overlap_sync_handlers_too, test_registry_hash, test_timeout_cap, test_end_to_end,
                   test_retry_then_succeed, test_retries_run_out,
                   test_reject_skips_the_remaining_retries, test_retry_hands_the_job_back,
                   test_a_duplicate_ack_is_not_counted,
-                  test_attempt_counts_up_across_retries):
+                  test_attempt_counts_up_across_retries,
+                  test_a_handlers_own_timeout_is_not_the_tasks,
+                  test_int_keyed_dicts_survive_the_trip,
+                  test_waiting_for_a_slot_is_not_an_attempt,
+                  test_a_worker_dependency_resolves_once,
+                  test_each_send_mints_its_own_id):
         try:
             check()
         except SkipTest as why:

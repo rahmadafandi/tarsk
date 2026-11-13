@@ -449,7 +449,7 @@ def _b07_cron_election(url, label, skip, app, env, log, producer):
         log.write_text("")
         # Two workers, so a schedule fired twice would show up as two ticks.
         pair = [start_worker(env, TARSK_LEASE_GRACE=1) for _ in range(2)]
-        seen = wait_for(log, {"tick"}, timeout=150)
+        wait_for(log, {"tick"}, timeout=150)
         time.sleep(3)  # let a duplicate arrive if one is going to
         ticks = [t for t in tags_in(log) if t == "tick"]
         for worker in pair:
@@ -1018,6 +1018,80 @@ def _b26_the_dead_letters_can(url, label, skip, app, env, log, producer):
     assert producer.dead_list(queue="default", limit=50) == [], \
         f"{label}: purge left {gone} behind"
 
+
+def _b27_the_handler_knows_its_id(url, label, skip, app, env, log, producer):
+    # --- ctx.task_id is the id send() returned ------------------------
+    # It was the supervisor's own dispatch counter, so a trace begun in
+    # before_send had nothing to join on in the handler.
+    sent = app.registry["knows_itself"].send()
+    worker = start_worker(env)
+    try:
+        seen = app.result(sent).get(timeout=60)
+    finally:
+        stop_worker(worker)
+    assert seen == sent, f"{label}: sent {sent!r}, the handler saw {seen!r}"
+
+
+def _b28_stop_means_stop(url, label, skip, app, env, log, producer):
+    # --- SIGTERM with a backlog ends the worker, not the backlog -------
+    # The supervisor alone gets the signal, as an orchestrator sends it. It
+    # used to keep claiming for as long as the queue had anything in it.
+    log.write_text("")
+    tags = {f"backlog-{i}" for i in range(60)}
+    for tag in sorted(tags):
+        app.registry["brief"].send(tag)
+    worker = start_worker(env)
+    try:
+        wait_for(log, {"backlog-0"}, timeout=60)
+        os.kill(worker.pid, signal.SIGTERM)
+        try:
+            worker.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            raise AssertionError(
+                f"{label}: still running 15s after SIGTERM, having worked through "
+                f"{len(tags_in(log))} of {len(tags)} queued jobs") from None
+    finally:
+        stop_worker(worker, hard=True)
+    done = set(tags_in(log))
+    assert len(done) < len(tags), f"{label}: the backlog was gone before the signal"
+
+    # Nothing it left behind is lost: another worker finishes the queue.
+    rescuer = start_worker(env, TARSK_SLOTS=50, TARSK_LEASE_GRACE=1)
+    seen = wait_for(log, tags, timeout=120)
+    stop_worker(rescuer)
+    assert tags <= set(seen), f"{label}: lost {sorted(tags - set(seen))}"
+
+
+def _b29_a_replay_is_the_same_job(url, label, skip, app, env, log, producer):
+    # --- a replayed dead letter keeps its id and the rest of its chain --
+    from tarsk import chain
+
+    marker = Path(env["TARSK_LOG"]).with_name("deployed")
+    marker.unlink(missing_ok=True)
+    steps = chain(app.registry["needs_marker"].si(str(marker)),
+                  app.registry["shout"].si("after"))
+    steps.send()
+    worker = start_worker(env, TARSK_LEASE_GRACE=1)
+    try:
+        deadline = time.time() + 60
+        parked = []
+        while time.time() < deadline and not parked:
+            parked = [e for e in producer.dead_list(queue="default", limit=50)
+                      if e[1] == "needs_marker"]
+            time.sleep(0.2)
+        assert parked, f"{label}: the failing step never reached the dead letters"
+
+        marker.write_text("")  # the fix ships
+        assert producer.dead_replay(queue="default", ids=[parked[-1][0]]) == 1
+        # The last step's id was minted before anything ran. Only a replay
+        # that kept the chain can ever put a result under it.
+        assert app.result(steps.result_id).get(timeout=60) == "AFTER", \
+            f"{label}: the chain did not resume after the replay"
+    finally:
+        stop_worker(worker)
+        marker.unlink(missing_ok=True)
+
+
 def check_broker(url: str, label: str, skip: frozenset = frozenset()) -> None:
     """`skip` names capability blocks a broker cannot express, by design.
 
@@ -1070,6 +1144,9 @@ def check_broker(url: str, label: str, skip: frozenset = frozenset()) -> None:
         _b24_cancel(url, label, skip, app, env, log, producer)
         _b25_retries_run_out_job(url, label, skip, app, env, log, producer)
         _b26_the_dead_letters_can(url, label, skip, app, env, log, producer)
+        _b27_the_handler_knows_its_id(url, label, skip, app, env, log, producer)
+        _b28_stop_means_stop(url, label, skip, app, env, log, producer)
+        _b29_a_replay_is_the_same_job(url, label, skip, app, env, log, producer)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 

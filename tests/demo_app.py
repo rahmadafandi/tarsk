@@ -192,3 +192,37 @@ def asks_again(marker):
     if tries == 0:
         raise Retry("upstream is cold", delay=0)
     return tries + 1
+
+
+@app.task(name="own_timeout")
+def own_timeout():
+    """Raises the builtin a socket or `Future.result()` would, well inside its
+    own deadline — which is not this task timing out."""
+    raise TimeoutError("the upstream socket timed out")
+
+
+@app.task(name="mirror")
+def mirror(value):
+    return value
+
+
+@app.task(name="lane_attempt", max_concurrency=1, retries=3)
+def lane_attempt(ctx=Depends(Context)):
+    """Reports the attempt it was run as, after queueing behind its own cap."""
+    time.sleep(0.4)
+    return ctx.attempt
+
+
+_dialled = []
+
+
+async def a_slow_pool():
+    await asyncio.sleep(0.05)  # long enough for every slot to arrive first
+    _dialled.append(1)
+    return len(_dialled)
+
+
+@app.task(name="shares_pool")
+async def shares_pool(pool=Depends(a_slow_pool)):
+    await asyncio.sleep(0.1)
+    return pool

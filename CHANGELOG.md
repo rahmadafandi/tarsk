@@ -55,6 +55,17 @@
 - `tarsk jobs --state …` filtered after `--limit`, so it could print nothing while
   matching jobs existed.
 - ctrl-C on `tarsk worker` ended a clean drain with a `KeyboardInterrupt` traceback.
+- **Cron: `7` is Sunday.** `0 0 * * 7` was refused, and a schedule that cannot be parsed
+  was dropped without a word. It is now reported once on the worker's stderr.
+- **Console without a token answers only as `127.0.0.1`, `localhost` or `[::1]`.** The
+  loopback bind was its only protection, and DNS rebinding walks round a bind.
+- Console: cancelling a delayed job now lasts until the job is due, not a fixed day.
+- **Redis: the lease sweep looks past the first 64 pending entries.** A stranded job
+  behind that many long-running ones was never examined while the queue stayed busy.
+- `--hard-max-rss` kills at the limit instead of first waiting for a replacement child
+  to finish starting.
+- Creating a producer no longer holds the GIL while it connects, and a producer made
+  before a fork is not shared with the child.
 
 ### Changed
 

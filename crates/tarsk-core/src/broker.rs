@@ -492,11 +492,14 @@ impl Broker {
     /// The TTL has to outlive the job it is cancelling: a delayed task due next
     /// week needs a cancellation that is still there next week. It is the
     /// caller's number because only the caller knows how far ahead it queued.
+    ///
+    /// `queue` is recorded where the store has a column for it and decides
+    /// nothing: cancellations are matched by id alone.
     pub async fn revoke(&self, queue: &str, id: &str, ttl_ms: u64) -> Res<()> {
         match self {
             Broker::Memory(b) => b.revoke(id, ttl_ms),
             #[cfg(feature = "redis")]
-            Broker::Redis(b) => b.revoke(queue, id, ttl_ms).await,
+            Broker::Redis(b) => b.revoke(id, ttl_ms).await,
             #[cfg(feature = "postgres")]
             Broker::Postgres(b) => b.revoke(queue, id, ttl_ms).await,
             // Not faked with a local set: a cancel the producer records and no
@@ -511,8 +514,7 @@ impl Broker {
         }
     }
 
-    /// Every id cancelled and not yet expired, across the queues this broker
-    /// was opened on — which it knows and the supervisor does not.
+    /// Every id cancelled and not yet expired, on any queue.
     ///
     /// Read as a set on a timer rather than asked per job: a lookup at every
     /// dispatch would put a broker round trip on the path of every task, to
@@ -522,9 +524,9 @@ impl Broker {
             Broker::Memory(b) => Ok(b.revoked()),
             #[cfg(feature = "redis")]
             Broker::Redis(b) => {
-                let mut out = Vec::new();
+                let mut out = b.revoked(REVOKED).await?;
                 for queue in &b.queues {
-                    out.extend(b.revoked(queue).await?);
+                    out.extend(b.revoked(&revoked_key(queue)).await?);
                 }
                 Ok(out)
             }
@@ -1793,6 +1795,12 @@ fn revoked_key(queue: &str) -> String {
     format!("{}:revoked", stream_key(queue))
 }
 
+/// Where cancellations live: one set for every queue, because an id is unique
+/// without one. `revoked_key` is where 0.2.1 and earlier wrote them, still
+/// read so a cancel issued before an upgrade survives it.
+#[cfg(feature = "redis")]
+const REVOKED: &str = "tarsk:revoked";
+
 #[cfg(feature = "redis")]
 impl RedisBroker {
     async fn connect(url: &str, queues: Vec<String>) -> Res<RedisBroker> {
@@ -2477,10 +2485,10 @@ impl RedisBroker {
         Ok(wait.max(0) as u64)
     }
 
-    async fn revoke(&self, queue: &str, id: &str, ttl_ms: u64) -> Res<()> {
+    async fn revoke(&self, id: &str, ttl_ms: u64) -> Res<()> {
         let mut conn = self.conn.clone();
         let _: i64 = redis::cmd("ZADD")
-            .arg(revoked_key(queue))
+            .arg(REVOKED)
             .arg(now_ms() + ttl_ms)
             .arg(id)
             .query_async(&mut conn)
@@ -2488,18 +2496,17 @@ impl RedisBroker {
         Ok(())
     }
 
-    async fn revoked(&self, queue: &str) -> Res<Vec<String>> {
-        let key = revoked_key(queue);
+    async fn revoked(&self, key: &str) -> Res<Vec<String>> {
         let mut conn = self.conn.clone();
         // Prune and read in one round trip. A sorted set scored by expiry gives
         // per-member TTL, which a plain SET cannot.
         let (_, live): (i64, Vec<String>) = redis::pipe()
             .cmd("ZREMRANGEBYSCORE")
-            .arg(&key)
+            .arg(key)
             .arg(0)
             .arg(now_ms())
             .cmd("ZRANGE")
-            .arg(&key)
+            .arg(key)
             .arg(0)
             .arg(-1)
             .query_async(&mut conn)
@@ -3388,7 +3395,8 @@ impl PgBroker {
             .execute(
                 "insert into tarsk_revoked (id, queue, expires_at)
                  values ($1, $2, now() + make_interval(secs => $3))
-                 on conflict (id) do update set expires_at = excluded.expires_at",
+                 on conflict (id) do update
+                    set expires_at = excluded.expires_at, queue = excluded.queue",
                 &[&id, &queue, &(ttl_ms as f64 / 1000.0)],
             )
             .await?;
@@ -3400,13 +3408,13 @@ impl PgBroker {
             .await?
             .execute("delete from tarsk_revoked where expires_at <= now()", &[])
             .await?;
+        // Every id, whatever queue the caller named: an id is unique on its
+        // own, and filtering by queue made a cancel with the wrong one a
+        // success that changed nothing.
         let rows = self
             .db()
             .await?
-            .query(
-                "select id from tarsk_revoked where queue = any()",
-                &[&self.queues],
-            )
+            .query("select id from tarsk_revoked", &[])
             .await?;
         Ok(rows.iter().map(|r| r.get(0)).collect())
     }

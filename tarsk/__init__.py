@@ -571,6 +571,9 @@ class App:
 
         `ttl` is how long the cancellation is remembered, and it has to outlive
         the job: cancelling something scheduled for next week needs a week.
+
+        `queue` no longer decides anything and is kept so existing calls still
+        work: a job is found by its id, whichever queue it is on.
         """
         self.producer().cancel(task_id, queue=queue, ttl=ttl)
 

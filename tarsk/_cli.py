@@ -89,7 +89,9 @@ def build_parser() -> argparse.ArgumentParser:
     single_queue = argparse.ArgumentParser(add_help=False)
     single_queue.add_argument("--broker", default=os.environ.get("TARSK_BROKER"),
                               help="redis://…, postgres://…, amqp://… (or TARSK_BROKER, or ./.env)")
-    single_queue.add_argument("--queue", default="default")
+    single_queue.add_argument("--queue", default="default",
+                              help="which queue's dead letters. `cancel` finds a job by "
+                                   "its id and does not need it")
 
     cancel = sub.add_parser("cancel", parents=[single_queue],
                             help="stop queued jobs from running")

@@ -223,3 +223,39 @@ def needs_marker(path):
     if not os.path.exists(path):
         raise RuntimeError("not deployed yet")
     return "ready"
+
+
+@app.task(name="announces", result_ttl=60)
+def announces(tag):
+    """Says when it starts and when it ends, with a signal's worth of time between."""
+    _log(f"{tag}-start")
+    time.sleep(2.5)
+    _log(f"{tag}-end")
+    return tag
+
+
+@app.task(name="queued_attempt", max_concurrency=1, result_ttl=60)
+def queued_attempt(ctx=Depends(Context)):
+    """Waits its turn behind its own cap, then says which attempt it was run as."""
+    time.sleep(0.4)
+    return ctx.attempt
+
+
+@app.task(name="holds", timeout=20)
+def holds(tag):
+    """Sits in flight, inside its lease, for as long as a test needs it there."""
+    if not os.path.exists(os.environ["TARSK_LOG"] + ".release"):
+        time.sleep(30)
+    return tag
+
+
+@app.task(name="strands_once", timeout=3, retries=1)
+def strands_once(tag):
+    """Hangs the first time, so killing its worker strands the lease; the second
+    run is the redelivery, and says so at once."""
+    marker = Path(os.environ["TARSK_LOG"] + ".stranded")
+    if not marker.exists():
+        marker.touch()
+        time.sleep(60)
+    _log(tag)
+    return tag

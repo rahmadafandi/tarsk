@@ -1092,6 +1092,438 @@ def _b29_a_replay_is_the_same_job(url, label, skip, app, env, log, producer):
         marker.unlink(missing_ok=True)
 
 
+def _redis_do(url: str, *commands) -> list[bytes]:
+    """Run commands on the URL's database and hand back the raw replies' text."""
+    parts = urlsplit(url)
+    setup = []
+    if parts.password:
+        setup.append(("AUTH", *[p for p in (parts.username, parts.password) if p]))
+    setup.append(("SELECT", parts.path.lstrip("/") or "0"))
+    with socket.create_connection((parts.hostname or "127.0.0.1", parts.port or 6379), 10) as sock:
+        sock.sendall(b"".join(_resp(c) for c in (*setup, *commands)))
+        sock.settimeout(1.0)
+        buf = b""
+        try:
+            while True:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+        except OSError:
+            pass  # quiet for a second: everything asked for has been answered
+    return buf.split(b"\r\n")
+
+
+def _drop_connections(url: str, label: str) -> bool:
+    """Close every connection the broker's clients hold, from the server's side.
+
+    False where this machine has no way to do it, said out loud.
+    """
+    if scheme_is(url, ("redis://", "rediss://")):
+        db = urlsplit(url).path.lstrip("/") or "0"
+        # Only this database's clients: a shared server has other tenants.
+        ids = [field.split(b"=")[1].decode()
+               for reply in _redis_do(url, ("CLIENT", "LIST"))
+               for line in reply.split(b"\n")  # one bulk string, a client per line
+               if b" db=%s " % db.encode() in line and b" cmd=client" not in line
+               for field in line.split() if field.startswith(b"id=")]
+        assert ids, f"{label}: found no connections to drop"
+        _redis_do(url, *[("CLIENT", "KILL", "ID", i) for i in ids])
+        return True
+    if scheme_is(url, ("postgres://", "postgresql://")):
+        if not shutil.which("psql"):
+            print(f"  {label}: skip reconnect — no psql here to end the server's connections with")
+            return False
+        ended = subprocess.run(
+            ["psql", url, "-tAc",
+             "select pg_terminate_backend(pid) from pg_stat_activity "
+             "where datname = current_database() and pid <> pg_backend_pid()"],
+            capture_output=True, text=True, check=True).stdout.split()
+        assert "t" in ended, f"{label}: found no connections to drop"
+        return True
+    return False
+
+
+def _send_until_it_lands(send, label: str, tries: int = 5) -> str:
+    """The call that finds the connection gone still fails; the next reconnects."""
+    for attempt in range(tries):
+        try:
+            return send()
+        except Exception as why:  # noqa: BLE001 — any broker error, by design
+            last = why
+            time.sleep(0.3)
+    raise AssertionError(f"{label}: still failing after {tries} sends: {last}")
+
+
+def _b30_a_signal_to_the_group_drains(url, label, skip, app, env, log, producer):
+    # --- ctrl-C and systemd signal the children too, and work still finishes
+    # Both go to the whole process group. A child that died on them cut its
+    # task off mid-run instead of letting the supervisor drain it.
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        log.write_text("")
+        tag = f"through-{sig.name}"
+        app.registry["announces"].send(tag)
+        worker = start_worker(env)
+        try:
+            wait_for(log, {f"{tag}-start"}, timeout=60)
+            os.killpg(os.getpgid(worker.pid), sig)
+            worker.wait(timeout=30)
+        finally:
+            stop_worker(worker, hard=True)
+        assert f"{tag}-end" in tags_in(log), \
+            f"{label}: {sig.name} to the group cut the running task off: {tags_in(log)}"
+
+
+def _b31_a_wait_is_not_an_attempt(url, label, skip, app, env, log, producer):
+    # --- queueing behind max_concurrency does not spend the retry budget
+    ids = [app.registry["queued_attempt"].send() for _ in range(4)]
+    worker = start_worker(env, TARSK_SLOTS=4, TARSK_LEASE_GRACE=1)
+    try:
+        attempts = [app.result(i).get(timeout=60) for i in ids]
+    finally:
+        stop_worker(worker)
+    assert attempts == [1, 1, 1, 1], \
+        f"{label}: jobs that only waited their turn were run as attempts {attempts}"
+
+
+def _b32_a_cancel_needs_no_queue(url, label, skip, app, env, log, producer):
+    if "cancel" in skip:
+        print(f"  {label}: skip cancel-by-id — this broker refuses cancellation outright")
+        return
+    # --- a cancellation finds its job whatever queue the caller named ----
+    # Naming the wrong one used to report success and change nothing — and
+    # "default" is the wrong one for every job on any other queue.
+    log.write_text("")
+    doomed = app.registry["note"].send_in(3, "cancelled-by-id")
+    app.cancel(doomed, queue="some-other-queue")
+    app.registry["note"].send_in(3, "left-alone")
+    worker = start_worker(env, TARSK_LEASE_GRACE=1)
+    try:
+        seen = wait_for(log, {"left-alone"}, timeout=60)
+        time.sleep(1.5)  # room for the cancelled one to run, if it is going to
+        seen = tags_in(log)
+    finally:
+        stop_worker(worker)
+    assert "left-alone" in seen, f"{label}: the job beside it never ran"
+    assert "cancelled-by-id" not in seen, f"{label}: a cancelled job ran anyway"
+
+
+def _b33_jobs_filters_before_it_limits(url, label, skip, app, env, log, producer):
+    if "listing-and-cancel" in skip:
+        print(f"  {label}: skip jobs-by-state — this broker cannot enumerate delayed jobs")
+        return
+    # --- `tarsk jobs --state X --limit N` is N jobs in X, not N jobs filtered
+    log.write_text("")
+    for tag in ("ahead-1", "ahead-2"):
+        app.registry["note"].send(tag)
+    later = app.registry["note"].send_in(120, "far-off")
+    try:
+        out = subprocess.run(
+            [sys.executable, "-m", "tarsk._cli", "jobs", "--state", "delayed", "--limit", "1"],
+            env=env, capture_output=True, text=True, timeout=60)
+        # One row, and a delayed one. Not necessarily this block's: on a server
+        # that keeps its data between runs an older delayed job sorts first.
+        rows = [line for line in out.stdout.splitlines() if line.strip()]
+        assert len(rows) == 1 and "  delayed  " in rows[0], \
+            f"{label}: the delayed job was cut off by the limit:\n{out.stdout}{out.stderr}"
+    finally:
+        app.cancel(later, ttl=600)
+        worker = start_worker(env, TARSK_LEASE_GRACE=1)
+        wait_for(log, {"ahead-1", "ahead-2"}, timeout=60)
+        stop_worker(worker)
+
+
+def _console(port: int, request: bytes, then: bytes = b"") -> str:
+    """One request to the console; `then` is sent as a later segment."""
+    with socket.create_connection(("127.0.0.1", port), timeout=10) as sock:
+        sock.sendall(request)
+        if then:
+            time.sleep(0.4)
+            sock.sendall(then)
+        chunks = []
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    return b"".join(chunks).decode(errors="replace")
+
+
+def _b34_the_console_acts_on_what_it_was_sent(url, label, skip, app, env, log, producer):
+    # --- one dead letter purged from the console is one dead letter -----
+    log.write_text("")
+    before = count_dead(url)
+    for tag in ("console-a", "console-b"):
+        app.registry["always_fails"].send(tag)
+    port = free_port()
+    worker = start_worker(env, TARSK_LEASE_GRACE=1, TARSK_METRICS=f"127.0.0.1:{port}",
+                          TARSK_ADMIN_ACTIONS=1)
+    try:
+        deadline = time.time() + 60
+        while time.time() < deadline and count_dead(url) < before + 2:
+            time.sleep(0.2)
+        parked = producer.dead_list(queue="default", limit=50)
+        assert len(parked) >= 2, f"{label}: expected two dead letters, found {len(parked)}"
+        scrape_metrics(port)  # the listener is up
+
+        # No token, so it answers only as the machine itself. A page that has
+        # re-pointed its own name at 127.0.0.1 still arrives under that name.
+        own = _console(port, f"GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n".encode())
+        assert own.startswith("HTTP/1.1 200"), f"{label}: the console refused its own host"
+        rebound = _console(port, b"GET / HTTP/1.1\r\nHost: evil.example\r\n\r\n")
+        assert rebound.startswith("HTTP/1.1 403"), \
+            f"{label}: a rebound hostname was served: {rebound[:80]!r}"
+
+        # The body arrives after the headers, as it does through some proxies.
+        # Read as empty, the form meant "every dead letter in default".
+        victim = parked[0][0]
+        body = f"queue=default&id={victim}".encode()
+        head = (f"POST /purge HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+                f"Content-Type: application/x-www-form-urlencoded\r\n"
+                f"Content-Length: {len(body)}\r\n\r\n").encode()
+        reply = _console(port, head, then=body)
+        assert reply.startswith("HTTP/1.1 303"), f"{label}: purge said {reply[:80]!r}"
+        left = [e[0] for e in producer.dead_list(queue="default", limit=50)]
+        assert victim not in left, f"{label}: the purged entry is still there"
+        assert len(left) == len(parked) - 1, \
+            f"{label}: purging one dead letter left {len(left)} of {len(parked)}"
+
+        # And a form that names no queue is refused, not pointed at "default".
+        bare = b"id=whatever"
+        reply = _console(port, (f"POST /purge HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+                                f"Content-Length: {len(bare)}\r\n\r\n").encode() + bare)
+        assert reply.startswith("HTTP/1.1 400"), f"{label}: a queueless purge said {reply[:80]!r}"
+        assert len(producer.dead_list(queue="default", limit=50)) == len(left), \
+            f"{label}: a refused purge still purged"
+    finally:
+        stop_worker(worker)
+        producer.dead_purge(queue="default")
+
+
+def _b35_a_dropped_connection_comes_back(url, label, skip, app, env, log, producer):
+    # --- the worker and the producer both survive losing their connection
+    log.write_text("")
+    if scheme_is(url, ("amqp://", "amqps://")):
+        # No way to close a client from outside without the management API,
+        # so the client is made to close its own channel: declaring a queue
+        # that exists with other arguments is a channel error, and a closed
+        # channel used to stay closed for the rest of the process's life.
+        held = app.registry["echoes"].send("kept")
+        worker = start_worker(env)
+        try:
+            app.result(held).get(timeout=60)
+        finally:
+            stop_worker(worker)
+        try:
+            producer.depth([f"result:{held}"])
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"{label}: the conflicting declare was expected to fail")
+        rows = producer.depth(["default"])
+        assert rows and rows[0][0] == "default", f"{label}: the channel never came back: {rows}"
+        return
+
+    app.registry["note"].send("before-the-drop")
+    worker = start_worker(env, TARSK_LEASE_GRACE=1)
+    try:
+        wait_for(log, {"before-the-drop"}, timeout=60)
+        if not _drop_connections(url, label):
+            return
+        time.sleep(1.0)
+        _send_until_it_lands(lambda: app.registry["note"].send("after-the-drop"), label)
+        # The suite's other producers lost their connections to the same
+        # sweep, and each owes the one failed call that discovers it.
+        for other in (producer, _producers.get(url)):
+            if other is not None:
+                _send_until_it_lands(lambda: other.depth(["default"]), label)
+        seen = wait_for(log, {"after-the-drop"}, timeout=60)
+    finally:
+        stop_worker(worker)
+    assert "after-the-drop" in seen, \
+        f"{label}: nothing ran after the connections were dropped — the worker never reconnected"
+
+
+def _b36_a_failed_send_frees_its_reservation(url, label, skip, app, env, log, producer):
+    if "dedup" in skip:
+        print(f"  {label}: skip dedup-release — this broker holds no reservations to release")
+        return
+    # --- a send that reserved its dedup window and then failed gives it back
+    log.write_text("")
+    once = app.registry["once"]
+    # A key nobody has used: on a server that keeps its data, a window left
+    # over from an earlier run would decide this instead of the send under test.
+    key = f"released-{os.urandom(4).hex()}"
+    if scheme_is(url, ("redis://", "rediss://")):
+        # A queue whose stream key is already a string: the reservation
+        # succeeds and the XADD after it cannot.
+        held = app.registry["echoes"].send("poison")
+        worker = start_worker(env)
+        try:
+            app.result(held).get(timeout=60)
+        finally:
+            stop_worker(worker)
+        broken = f"result:{held}"
+    else:
+        broken = "no\x00such"  # Postgres refuses a NUL in text
+    try:
+        once.options(queue=broken, dedup_key=key, dedup_ttl=60).send("freed")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError(f"{label}: the send to {broken!r} was expected to fail")
+
+    # --- and a window that has lapsed is reserved again by the next send --
+    # On Postgres the first send after an expiry used to win without leaving
+    # a reservation behind, so the one after it won as well.
+    lapsing = f"lapsed-{os.urandom(4).hex()}"
+    first = once.options(dedup_key=lapsing, dedup_ttl=1).send("lapsed")
+    time.sleep(1.5)
+    second = once.options(dedup_key=lapsing, dedup_ttl=60).send("lapsed")
+    third = once.options(dedup_key=lapsing, dedup_ttl=60).send("lapsed")
+    assert second != first, f"{label}: an expired window still answered with its old job"
+    assert third == second, f"{label}: two sends inside one window were both queued"
+
+    # The same key again. Had the reservation been kept, this would be answered
+    # with the id of a job that was never queued, and nothing would run.
+    once.options(dedup_key=key, dedup_ttl=60).send("freed")
+    worker = start_worker(env, TARSK_LEASE_GRACE=1)
+    try:
+        seen = wait_for(log, {"once-freed"}, timeout=30)
+    finally:
+        stop_worker(worker)
+    assert "once-freed" in seen, \
+        f"{label}: the retry was swallowed by the failed send's reservation"
+
+
+def _b37_many_workers_share_one_cap(url, label, skip, app, env, log, producer):
+    if "shared-concurrency" in skip:
+        print(f"  {label}: skip shared-cap-across-workers — the cap is per worker on this broker")
+        return
+    # --- three supervisors, three connections, one cap and one bucket ----
+    # One worker pipelines everything down a single connection, which hides a
+    # check that is only atomic per connection. Separate processes do not.
+    log.write_text("")
+    for i in range(12):
+        app.registry["capped"].send(f"m{i}")
+    workers = [start_worker(env, TARSK_LEASE_GRACE=1, TARSK_CHILDREN=2, TARSK_SLOTS=4)
+               for _ in range(3)]
+    try:
+        deadline = time.time() + 90
+        while time.time() < deadline and \
+                len([t for t in tags_in(log) if t.startswith("end-")]) < 12:
+            time.sleep(0.2)
+    finally:
+        for worker in workers:
+            stop_worker(worker)
+    live = peak = 0
+    for tag in tags_in(log):
+        if tag.startswith("start-"):
+            live += 1
+            peak = max(peak, live)
+        elif tag.startswith("end-"):
+            live -= 1
+    finished = len([t for t in tags_in(log) if t.startswith("end-")])
+    assert finished == 12, f"{label}: only {finished}/12 capped jobs finished"
+    assert peak <= 2, f"{label}: max_concurrency=2 across three workers, but {peak} ran at once"
+
+    log.write_text("")
+    for i in range(15):
+        app.registry["metered"].send(f"shared-{i}")
+    workers = [start_worker(env, TARSK_LEASE_GRACE=1, TARSK_CHILDREN=2, TARSK_SLOTS=4)
+               for _ in range(3)]
+    started = time.time()
+    try:
+        deadline = time.time() + 60
+        while time.time() < deadline and len(tags_in(log)) < 15:
+            time.sleep(0.1)
+    finally:
+        for worker in workers:
+            stop_worker(worker)
+    took = time.time() - started
+    assert len(tags_in(log)) == 15, f"{label}: only {len(tags_in(log))}/15 ever ran"
+    assert took >= 1.5, f"{label}: 15 tasks at 5/s across three workers took {took:.2f}s"
+
+
+def _b38_redis_only(url, label, skip, app, env, log, producer):
+    if not scheme_is(url, ("redis://", "rediss://")):
+        return
+    from tarsk._core import Producer
+
+    # --- delayed jobs from two producers do not overwrite each other -----
+    # Their member in the delayed set was <pid>-<counter>, both counting from
+    # zero: two producers in one process are the two containers that are both
+    # pid 1.
+    log.write_text("")
+    for n, sender in enumerate((Producer(broker_url=url), Producer(broker_url=url))):
+        app._producer, kept = sender, app._producer
+        try:
+            app.registry["note"].send_in(1, f"delayed-by-{n}")
+        finally:
+            app._producer = kept
+    worker = start_worker(env, TARSK_LEASE_GRACE=1)
+    try:
+        seen = wait_for(log, {"delayed-by-0", "delayed-by-1"}, timeout=30)
+    finally:
+        stop_worker(worker)
+    assert {"delayed-by-0", "delayed-by-1"} <= set(seen), \
+        f"{label}: one producer's delayed job replaced the other's: {seen}"
+
+    # --- the lease sweep reaches an entry behind 64 others ---------------
+    # Seventy jobs in flight and inside their lease, then one stranded behind
+    # them by a killed worker. The sweep's filter is the shortest timeout, so
+    # its first page is those seventy; the stranded one is on the second.
+    log.write_text("")
+    release = Path(env["TARSK_LOG"] + ".release")
+    stranded = Path(env["TARSK_LOG"] + ".stranded")
+    release.unlink(missing_ok=True)
+    stranded.unlink(missing_ok=True)
+    for i in range(70):
+        app.registry["holds"].send(f"held-{i}")
+    holder = start_worker(env, TARSK_SLOTS=70, TARSK_LEASE_GRACE=1)
+    try:
+        deadline = time.time() + 60
+        while time.time() < deadline and producer.depth(["default"])[0][2] < 70:
+            time.sleep(0.2)
+        assert producer.depth(["default"])[0][2] == 70, \
+            f"{label}: the holder never took all seventy: {producer.depth(['default'])}"
+    finally:
+        stop_worker(holder, hard=True)  # their leases stay, for twenty seconds more
+    held_since = time.time()
+
+    app.registry["strands_once"].send("behind-the-page")
+    victim = start_worker(env, TARSK_LEASE_GRACE=1)
+    try:
+        deadline = time.time() + 30
+        while time.time() < deadline and not stranded.exists():
+            time.sleep(0.1)
+        assert stranded.exists(), f"{label}: the job to strand never started"
+    finally:
+        stop_worker(victim, hard=True)
+
+    rescuer = start_worker(env, TARSK_SLOTS=70, TARSK_LEASE_GRACE=1)
+    try:
+        seen = wait_for(log, {"behind-the-page"}, timeout=12)
+        waited = time.time() - held_since
+        assert "behind-the-page" in seen, \
+            f"{label}: a stranded job behind 64 pending entries was not swept in {waited:.0f}s"
+        # Before the seventy in front of it were themselves due, or this
+        # proved only that the queue eventually empties.
+        assert waited < 19, f"{label}: swept only once the page ahead had expired ({waited:.0f}s)"
+        release.touch()
+        # Ready and running only: a delayed job parked by an earlier block is
+        # not this one's to wait for.
+        deadline = time.time() + 90
+        while time.time() < deadline and sum(producer.depth(["default"])[0][1:3]) > 0:
+            time.sleep(0.5)
+        assert sum(producer.depth(["default"])[0][1:3]) == 0, \
+            f"{label}: the held jobs never drained: {producer.depth(['default'])}"
+    finally:
+        stop_worker(rescuer)
+        release.unlink(missing_ok=True)
+        stranded.unlink(missing_ok=True)
+
+
 def check_broker(url: str, label: str, skip: frozenset = frozenset()) -> None:
     """`skip` names capability blocks a broker cannot express, by design.
 
@@ -1147,6 +1579,15 @@ def check_broker(url: str, label: str, skip: frozenset = frozenset()) -> None:
         _b27_the_handler_knows_its_id(url, label, skip, app, env, log, producer)
         _b28_stop_means_stop(url, label, skip, app, env, log, producer)
         _b29_a_replay_is_the_same_job(url, label, skip, app, env, log, producer)
+        _b30_a_signal_to_the_group_drains(url, label, skip, app, env, log, producer)
+        _b31_a_wait_is_not_an_attempt(url, label, skip, app, env, log, producer)
+        _b32_a_cancel_needs_no_queue(url, label, skip, app, env, log, producer)
+        _b33_jobs_filters_before_it_limits(url, label, skip, app, env, log, producer)
+        _b34_the_console_acts_on_what_it_was_sent(url, label, skip, app, env, log, producer)
+        _b35_a_dropped_connection_comes_back(url, label, skip, app, env, log, producer)
+        _b36_a_failed_send_frees_its_reservation(url, label, skip, app, env, log, producer)
+        _b37_many_workers_share_one_cap(url, label, skip, app, env, log, producer)
+        _b38_redis_only(url, label, skip, app, env, log, producer)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 

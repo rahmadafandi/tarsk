@@ -320,6 +320,9 @@ pub struct Shared {
     /// Which trigger fired, per recycle — the leaky-handler demo needs to show
     /// max_rss firing, not just that *something* recycled.
     reasons: Mutex<HashMap<&'static str, u64>>,
+    /// When a broker error was last printed, and how many have gone unprinted
+    /// since. See `broker_error`.
+    reported: Mutex<(Option<Instant>, u64)>,
 }
 
 impl Shared {
@@ -356,6 +359,34 @@ impl Shared {
 
     fn batch(&self) -> bool {
         self.broker.drains_when_empty()
+    }
+
+    /// Count a broker failure and say what it was.
+    ///
+    /// The counter alone told an operator that something was wrong and
+    /// nothing about what. Printed at most once every few seconds: an outage
+    /// fails every claim, and a line per failure would bury the first one.
+    fn broker_error(&self, during: &str, err: &(dyn std::error::Error + 'static)) {
+        let err = broker::describe(err);
+        self.counters.broker_errors.fetch_add(1, Ordering::Relaxed);
+        let mut reported = self.reported.lock().unwrap();
+        if reported
+            .0
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(5))
+        {
+            reported.1 += 1;
+            return;
+        }
+        let skipped = std::mem::take(&mut reported.1);
+        reported.0 = Some(Instant::now());
+        drop(reported);
+        if skipped > 0 {
+            eprintln!(
+                "tarsk: broker error during {during}: {err} ({skipped} more since the last report)"
+            );
+        } else {
+            eprintln!("tarsk: broker error during {during}: {err}");
+        }
     }
 
     /// Abandon the run with a diagnosis. Marking it done unblocks every parked
@@ -412,13 +443,12 @@ impl Shared {
         if rmpv::encode::write_value(&mut blob, &envelope).is_err() {
             return;
         }
-        if self
+        if let Err(err) = self
             .broker
             .store_result(&job.id, blob, Duration::from_millis(ttl))
             .await
-            .is_err()
         {
-            self.counters.broker_errors.fetch_add(1, Ordering::Relaxed);
+            self.broker_error("storing a result", err.as_ref());
         }
     }
 
@@ -580,15 +610,15 @@ impl Shared {
                 _ => backoff_for(spec.as_ref(), job.attempt, &job.id),
             };
             self.counters.retried.fetch_add(1, Ordering::Relaxed);
-            if self.broker.retry(&job.receipt, delay).await.is_err() {
-                self.counters.broker_errors.fetch_add(1, Ordering::Relaxed);
+            if let Err(err) = self.broker.retry(&job.receipt, delay).await {
+                self.broker_error("retry", err.as_ref());
             }
             self.work.notify_waiters();
             return;
         }
         self.counters.dead_lettered.fetch_add(1, Ordering::Relaxed);
         self.keep_result(&job, &outcome).await;
-        if self
+        if let Err(err) = self
             .broker
             .dead_letter(
                 &job.receipt,
@@ -597,9 +627,8 @@ impl Shared {
                 self.max_dead.load(Ordering::Relaxed),
             )
             .await
-            .is_err()
         {
-            self.counters.broker_errors.fetch_add(1, Ordering::Relaxed);
+            self.broker_error("dead-lettering", err.as_ref());
         }
         self.record(job.task_id, outcome);
     }
@@ -616,8 +645,8 @@ impl Shared {
         match self.broker.claim(lease, Duration::from_millis(0)).await {
             Ok(Some(delivery)) => Some(self.adopt(delivery)),
             Ok(None) => None,
-            Err(_) => {
-                self.counters.broker_errors.fetch_add(1, Ordering::Relaxed);
+            Err(err) => {
+                self.broker_error("claim", err.as_ref());
                 None
             }
         }
@@ -628,8 +657,8 @@ impl Shared {
             match self.broker.claim(lease, block).await {
                 Ok(Some(delivery)) => return Some(self.adopt(delivery)),
                 Ok(None) => {}
-                Err(_) => {
-                    self.counters.broker_errors.fetch_add(1, Ordering::Relaxed);
+                Err(err) => {
+                    self.broker_error("claim", err.as_ref());
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             }
@@ -1405,16 +1434,13 @@ async fn serve_inner(
                                 .await;
                             continue;
                         }
-                        Err(_) => {
+                        Err(err) => {
                             // Fail closed. A limit exists because exceeding it
                             // hurts something outside this process — a quota, a
                             // database, someone else's API. Dispatching when the
                             // bucket cannot be read trades a delay the caller
                             // asked for against a breach they did not.
-                            shared
-                                .counters
-                                .broker_errors
-                                .fetch_add(1, Ordering::Relaxed);
+                            shared.broker_error("a rate or concurrency check", err.as_ref());
                             let _ = shared
                                 .broker
                                 .retry(&job.receipt, Duration::from_millis(1000))
@@ -1449,13 +1475,10 @@ async fn serve_inner(
                                 .await;
                             continue;
                         }
-                        Err(_) => {
+                        Err(err) => {
                             // Fail closed, for the same reason the rate limit
                             // does: the cap is protecting something outside.
-                            shared
-                                .counters
-                                .broker_errors
-                                .fetch_add(1, Ordering::Relaxed);
+                            shared.broker_error("a rate or concurrency check", err.as_ref());
                             let _ = shared
                                 .broker
                                 .retry(&job.receipt, Duration::from_millis(1000))
@@ -1959,22 +1982,12 @@ pub async fn supervise_until(
                                 .map(|d| (d.queue, [d.ready, d.in_flight, d.delayed, d.dead]))
                                 .collect(),
                         ),
-                        Err(_) => {
-                            shared
-                                .counters
-                                .broker_errors
-                                .fetch_add(1, Ordering::Relaxed);
-                        }
+                        Err(err) => shared.broker_error("reading queue depth", err.as_ref()),
                     }
                 }
                 match shared.broker.revoked_all().await {
                     Ok(ids) => *shared.revoked.lock().unwrap() = ids.into_iter().collect(),
-                    Err(_) => {
-                        shared
-                            .counters
-                            .broker_errors
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
+                    Err(err) => shared.broker_error("reading cancellations", err.as_ref()),
                 }
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
@@ -1988,11 +2001,8 @@ pub async fn supervise_until(
         let grace = cfg.lease_grace;
         tokio::spawn(async move {
             while !shared.done.load(Ordering::SeqCst) {
-                if shared.broker.reclaim_expired(grace).await.is_err() {
-                    shared
-                        .counters
-                        .broker_errors
-                        .fetch_add(1, Ordering::Relaxed);
+                if let Err(err) = shared.broker.reclaim_expired(grace).await {
+                    shared.broker_error("the lease sweep", err.as_ref());
                 }
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
@@ -2047,11 +2057,8 @@ pub async fn supervise_until(
                         match shared.broker.claim_tick(&name, minute).await {
                             Ok(true) => {}
                             Ok(false) => continue, // another worker has this minute
-                            Err(_) => {
-                                shared
-                                    .counters
-                                    .broker_errors
-                                    .fetch_add(1, Ordering::Relaxed);
+                            Err(err) => {
+                                shared.broker_error("the cron election", err.as_ref());
                                 continue;
                             }
                         }
@@ -2178,11 +2185,12 @@ pub fn new_shared(broker: Broker, total: usize, batch: bool) -> Arc<Shared> {
         counters: Counters::default(),
         metrics: Metrics::default(),
         reasons: Mutex::new(HashMap::new()),
+        reported: Mutex::new((None, 0)),
     })
 }
 
 pub fn io_err(err: Box<dyn std::error::Error + Send + Sync>) -> io::Error {
-    io::Error::other(err.to_string())
+    io::Error::other(broker::describe(err.as_ref()))
 }
 
 /// Scratch directory for the child socket. Torn down with the run.

@@ -17,6 +17,11 @@ use tarsk_core::{
     build_cfg, console, io_err, new_shared, socket_dir, supervise, transport, Outcome,
 };
 
+/// A broker failure as Python sees it, with its causes attached.
+fn broker_err(err: Box<dyn std::error::Error + Send + Sync>) -> PyErr {
+    PyValueError::new_err(tarsk_core::broker::describe(err.as_ref()))
+}
+
 fn to_python(py: Python<'_>, outcomes: Vec<(u64, Outcome)>) -> PyResult<Vec<Py<PyAny>>> {
     outcomes
         .into_iter()
@@ -235,7 +240,7 @@ impl Producer {
             .build()?;
         let broker = runtime
             .block_on(Broker::connect(&broker_url, Vec::new()))
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            .map_err(broker_err)?;
         Ok(Producer { runtime, broker })
     }
 
@@ -288,7 +293,7 @@ impl Producer {
                 Ok(None)
             })
         })
-        .map_err(|e: Box<dyn std::error::Error + Send + Sync>| PyValueError::new_err(e.to_string()))
+        .map_err(broker_err)
     }
 
     /// The stored envelope for `id`, or None while it is unfinished, was never
@@ -297,7 +302,7 @@ impl Producer {
     fn result(&self, py: Python<'_>, id: String) -> PyResult<Option<Py<PyAny>>> {
         let found = py
             .detach(|| self.runtime.block_on(self.broker.get_result(&id)))
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            .map_err(broker_err)?;
         match found {
             Some(blob) => Ok(Some(PyBytes::new(py, &blob).into_any().unbind())),
             None => Ok(None),
@@ -317,7 +322,7 @@ impl Producer {
                     .revoke(queue, id, (ttl.max(0.0) * 1000.0) as u64),
             )
         })
-        .map_err(|e| PyValueError::new_err(e.to_string()))
+        .map_err(broker_err)
     }
 
     /// Backlog per queue: (queue, ready, in flight, delayed, dead).
@@ -325,7 +330,7 @@ impl Producer {
     fn depth(&self, py: Python<'_>, queues: Vec<String>) -> PyResult<Vec<DepthRow>> {
         let rows = py
             .detach(|| self.runtime.block_on(self.broker.depth_of(&queues)))
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            .map_err(broker_err)?;
         Ok(rows
             .into_iter()
             .map(|d| (d.queue, d.ready, d.in_flight, d.delayed, d.dead))
@@ -337,7 +342,7 @@ impl Producer {
     fn jobs(&self, py: Python<'_>, queues: Vec<String>, limit: usize) -> PyResult<Vec<JobRow>> {
         let rows = py
             .detach(|| self.runtime.block_on(self.broker.jobs(&queues, limit)))
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            .map_err(broker_err)?;
         Ok(rows
             .into_iter()
             .map(|j| {
@@ -360,7 +365,7 @@ impl Producer {
     fn dead_list(&self, py: Python<'_>, queue: &str, limit: usize) -> PyResult<Vec<DeadRow>> {
         let found = py
             .detach(|| self.runtime.block_on(self.broker.dead_list(queue, limit)))
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            .map_err(broker_err)?;
         Ok(found
             .into_iter()
             .map(|d| (d.id, d.name, d.error, d.traceback, d.died_at_ms))
@@ -371,14 +376,14 @@ impl Producer {
     #[pyo3(signature = (queue="default", ids=Vec::new()))]
     fn dead_replay(&self, py: Python<'_>, queue: &str, ids: Vec<String>) -> PyResult<usize> {
         py.detach(|| self.runtime.block_on(self.broker.dead_replay(queue, &ids)))
-            .map_err(|e| PyValueError::new_err(e.to_string()))
+            .map_err(broker_err)
     }
 
     /// Drop dead letters. Empty `ids` means all of them.
     #[pyo3(signature = (queue="default", ids=Vec::new()))]
     fn dead_purge(&self, py: Python<'_>, queue: &str, ids: Vec<String>) -> PyResult<usize> {
         py.detach(|| self.runtime.block_on(self.broker.dead_purge(queue, &ids)))
-            .map_err(|e| PyValueError::new_err(e.to_string()))
+            .map_err(broker_err)
     }
 }
 

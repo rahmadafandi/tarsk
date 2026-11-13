@@ -17,6 +17,25 @@ use std::time::Duration;
 
 pub type Res<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+/// An error with its causes, on one line.
+///
+/// tokio-postgres displays every server-side failure as the two words
+/// "db error" and keeps what the server actually said in `source()`. Printed
+/// without the chain, that is all an operator ever saw.
+pub fn describe(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = err.to_string();
+    let mut source = err.source();
+    while let Some(inner) = source {
+        let text = inner.to_string();
+        if !out.contains(&text) {
+            out.push_str(": ");
+            out.push_str(&text);
+        }
+        source = inner.source();
+    }
+    out
+}
+
 pub fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

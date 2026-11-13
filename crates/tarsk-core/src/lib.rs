@@ -1439,9 +1439,11 @@ async fn serve_inner(
                         Ok(0) => {}
                         Ok(wait_ms) => {
                             shared.counters.rate_limited.fetch_add(1, Ordering::Relaxed);
+                            // `defer`, not `retry`: waiting for a token is not
+                            // a failed attempt and must not be charged as one.
                             let _ = shared
                                 .broker
-                                .retry(&job.receipt, Duration::from_millis(wait_ms))
+                                .defer(&job.receipt, Duration::from_millis(wait_ms), job.attempt)
                                 .await;
                             continue;
                         }
@@ -1454,7 +1456,7 @@ async fn serve_inner(
                             shared.broker_error("a rate or concurrency check", err.as_ref());
                             let _ = shared
                                 .broker
-                                .retry(&job.receipt, Duration::from_millis(1000))
+                                .defer(&job.receipt, Duration::from_millis(1000), job.attempt)
                                 .await;
                             continue;
                         }
@@ -1482,7 +1484,7 @@ async fn serve_inner(
                             shared.counters.at_capacity.fetch_add(1, Ordering::Relaxed);
                             let _ = shared
                                 .broker
-                                .retry(&job.receipt, Duration::from_millis(250))
+                                .defer(&job.receipt, Duration::from_millis(250), job.attempt)
                                 .await;
                             continue;
                         }
@@ -1492,7 +1494,7 @@ async fn serve_inner(
                             shared.broker_error("a rate or concurrency check", err.as_ref());
                             let _ = shared
                                 .broker
-                                .retry(&job.receipt, Duration::from_millis(1000))
+                                .defer(&job.receipt, Duration::from_millis(1000), job.attempt)
                                 .await;
                             continue;
                         }

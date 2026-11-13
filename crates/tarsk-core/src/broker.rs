@@ -398,6 +398,31 @@ impl Broker {
         }
     }
 
+    /// Hand the job back because it may not start yet — over its rate limit or
+    /// its concurrency cap — rather than because it failed.
+    ///
+    /// The difference from `retry` is the attempt count. Every backend bumps
+    /// it on redelivery, which is right for a failure and wrong for a wait: a
+    /// job that queued behind a cap would arrive at its first real run already
+    /// out of retries. `attempt` is what the delivery being handed back
+    /// carried.
+    pub async fn defer(&self, receipt: &Receipt, delay: Duration, attempt: u32) -> Res<()> {
+        match (self, receipt) {
+            (Broker::Memory(b), Receipt::Memory { id }) => b.defer(*id, delay),
+            #[cfg(feature = "redis")]
+            (Broker::Redis(b), r) => {
+                b.requeue_as(r, delay, Some(attempt.saturating_sub(1)))
+                    .await
+            }
+            #[cfg(feature = "postgres")]
+            (Broker::Postgres(b), r) => b.requeue_as(r, delay, 1).await,
+            #[cfg(feature = "amqp")]
+            (Broker::Amqp(b), r @ Receipt::Amqp { .. }) => b.retry_as(r, delay, false).await,
+            #[cfg(any(feature = "redis", feature = "postgres", feature = "amqp"))]
+            _ => Err("receipt does not belong to this broker".into()),
+        }
+    }
+
     /// Take one of `task`'s concurrency slots, or report that none is free.
     ///
     /// The slot carries its own expiry rather than being a plain counter: a
@@ -914,6 +939,13 @@ impl MemoryBroker {
         Ok(())
     }
 
+    fn defer(&self, id: u64, delay: Duration) -> Res<()> {
+        if let Some((_, attempt, _)) = self.jobs.lock().unwrap().get_mut(&id) {
+            *attempt = attempt.saturating_sub(1);
+        }
+        self.requeue(id, delay)
+    }
+
     fn requeue(&self, id: u64, delay: Duration) -> Res<()> {
         if self.jobs.lock().unwrap().contains_key(&id) {
             let due = (!delay.is_zero()).then(|| std::time::Instant::now() + delay);
@@ -1255,6 +1287,11 @@ impl AmqpBroker {
     }
 
     async fn retry(&self, receipt: &Receipt, delay: Duration) -> Res<()> {
+        self.retry_as(receipt, delay, true).await
+    }
+
+    /// `failed` is whether this hand-back spends an attempt. See `Broker::defer`.
+    async fn retry_as(&self, receipt: &Receipt, delay: Duration, failed: bool) -> Res<()> {
         let Receipt::Amqp {
             queue,
             acker,
@@ -1264,7 +1301,7 @@ impl AmqpBroker {
             return Err("not an amqp receipt".into());
         };
         let mut again = record.clone();
-        again.attempt += 1;
+        again.attempt += u32::from(failed);
         let ready_at = now_ms() + delay.as_millis() as u64;
         let target = if delay.is_zero() {
             stream_key(queue)
@@ -2052,6 +2089,18 @@ impl RedisBroker {
     /// a copy and acking the original would be two writes with a window between
     /// them, and a crash in that window leaves the job in the stream twice.
     async fn requeue(&self, receipt: &Receipt, delay: Duration) -> Res<()> {
+        self.requeue_as(receipt, delay, None).await
+    }
+
+    /// `delivered`, when given, rewrites the entry's delivery count. A deferral
+    /// sets it one back so the reclaim's own bump lands on the number the job
+    /// already had. See `Broker::defer`.
+    async fn requeue_as(
+        &self,
+        receipt: &Receipt,
+        delay: Duration,
+        delivered: Option<u32>,
+    ) -> Res<()> {
         let Receipt::Redis { queue, id } = receipt else {
             return Err("not a redis receipt".into());
         };
@@ -2076,17 +2125,20 @@ impl RedisBroker {
         // is the first place a script would actually earn its keep here.
         let delay_ms = delay.as_millis() as u64;
         let idle = deadline.saturating_sub(delay_ms) + 1;
-        let _: redis::Value = redis::cmd("XCLAIM")
+        let mut claim = redis::cmd("XCLAIM");
+        claim
             .arg(&key)
             .arg(REDIS_GROUP)
             .arg(&self.consumer)
             .arg(0)
             .arg(id)
             .arg("IDLE")
-            .arg(idle)
-            .arg("JUSTID") // no delivery-count bump: the reclaim will do that
-            .query_async(&mut conn)
-            .await?;
+            .arg(idle);
+        if let Some(count) = delivered {
+            claim.arg("RETRYCOUNT").arg(count);
+        }
+        claim.arg("JUSTID"); // no delivery-count bump: the reclaim will do that
+        let _: redis::Value = claim.query_async(&mut conn).await?;
         Ok(())
     }
 
@@ -2858,15 +2910,22 @@ impl PgBroker {
     /// future is invisible to `claim` until then, so backoff needs no separate
     /// schedule. Zero delay clears it and the row is claimable immediately.
     async fn requeue(&self, receipt: &Receipt, delay: Duration) -> Res<()> {
+        self.requeue_as(receipt, delay, 0).await
+    }
+
+    /// `refund` is how many attempts to give back: one for a deferral, which
+    /// the claim counted and the job did not spend. See `Broker::defer`.
+    async fn requeue_as(&self, receipt: &Receipt, delay: Duration, refund: i32) -> Res<()> {
         let Receipt::Postgres { row, run_lease } = receipt else {
             return Err("not a postgres receipt".into());
         };
         self.client
             .execute(
                 "update tarsk_jobs set lease_until = case when $3::double precision > 0
-                     then now() + make_interval(secs => $3::double precision) else null end
+                     then now() + make_interval(secs => $3::double precision) else null end,
+                     attempt = greatest(attempt - $4, 0)
                  where id = $1 and run_lease = $2",
-                &[row, run_lease, &delay.as_secs_f64()],
+                &[row, run_lease, &delay.as_secs_f64(), &refund],
             )
             .await?;
         Ok(())

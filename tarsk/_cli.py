@@ -74,8 +74,7 @@ def build_parser() -> argparse.ArgumentParser:
                      help="where to listen. Off loopback it refuses to start without "
                           "TARSK_ADMIN_TOKEN, since the console shows task payloads")
 
-    status = sub.add_parser("status", parents=[broker_args],
-                            help="how much work is waiting")
+    sub.add_parser("status", parents=[broker_args], help="how much work is waiting")
 
     jobs = sub.add_parser("jobs", parents=[broker_args],
                           help="which jobs are waiting or running")

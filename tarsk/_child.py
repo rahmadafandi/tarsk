@@ -211,7 +211,7 @@ async def _run_hooks(hooks) -> None:
             await result
 
 
-async def _shutdown(app, writer) -> None:
+async def _shutdown(app) -> None:
     """Let the child put its own things down before the process ends."""
     try:
         await _run_hooks(app.stop_hooks)
@@ -418,7 +418,7 @@ async def main(socket_path: str, app_spec: str, child_id: int, slots: int = 1) -
     # letting the supervisor time it out and redeliver.
     if running:
         await asyncio.gather(*running, return_exceptions=True)
-    await _shutdown(app, writer)
+    await _shutdown(app)
 
 
 if __name__ == "__main__":

@@ -359,8 +359,6 @@ class Enqueue:
         if self.dedup_key:
             return f"{self.task.spec.name}:{self.dedup_key}", int(ttl * 1000)
         # No key given, so the arguments are the key: same task, same call.
-        import hashlib
-
         digest = hashlib.blake2b(payload, digest_size=16).hexdigest()
         return f"{self.task.spec.name}:{digest}", int(ttl * 1000)
 

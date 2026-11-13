@@ -5,8 +5,8 @@
 //! arrives over the wire in `Register`, so this process stays a constant-RSS
 //! Rust process no matter what the user's app module drags in.
 //!
-//! Not here yet: broker (step 3), retry state machine (step 4), metrics
-//! (step 5). Jobs arrive as an in-memory list from the caller.
+//! Jobs come from a `Broker`; the retry state machine, the cron scheduler and
+//! the metrics endpoint all run here, beside the children and never in them.
 
 pub mod broker;
 pub mod console;
@@ -2176,7 +2176,6 @@ pub async fn supervise_until(
     // A slot can give up (spawn cap, socket failure) with jobs outstanding.
     // Say so rather than hanging or reporting a clean run.
     if batch && !shared.done.load(Ordering::SeqCst) {
-        let settled = shared.results.lock().unwrap().len();
         // The grown total, not the submitted one: chain steps queued mid-run
         // took memory ids past the original count and deserve the same answer.
         for task_id in 0..shared.total.load(Ordering::SeqCst) as u64 {
@@ -2188,7 +2187,6 @@ pub async fn supervise_until(
                 Outcome::nack("NoWorker", "every child slot gave up".into()),
             );
         }
-        let _ = settled;
     }
 
     let registry = shared.registry.lock().unwrap();

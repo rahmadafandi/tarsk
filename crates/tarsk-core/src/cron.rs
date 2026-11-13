@@ -83,7 +83,10 @@ pub fn parse(expr: &str) -> Result<Schedule, String> {
     let (hour, _) = parse_field(fields[1], 0, 23, "hour")?;
     let (dom, dom_restricted) = parse_field(fields[2], 1, 31, "day-of-month")?;
     let (month, _) = parse_field(fields[3], 1, 12, "month")?;
-    let (dow, dow_restricted) = parse_field(fields[4], 0, 6, "day-of-week")?;
+    // 7 is Sunday too, as every cron since Vixie's has had it: `0 0 * * 7`
+    // used to be refused, and a refused schedule is one that never fires.
+    let (dow, dow_restricted) = parse_field(fields[4], 0, 7, "day-of-week")?;
+    let dow = (dow | (dow >> 7)) & 0x7f;
     Ok(Schedule {
         minute,
         hour: hour as u32,
@@ -204,11 +207,26 @@ mod tests {
     }
 
     #[test]
+    fn seven_is_sunday() {
+        /// 2026-08-16T17:04:00Z, the Sunday after THU.
+        const SUN: i64 = THU + 3 * 86_400;
+        for expr in ["4 17 * * 7", "4 17 * * 0", "4 17 * * 5-7"] {
+            assert!(
+                parse(expr).unwrap().matches(SUN),
+                "{expr:?} missed a Sunday"
+            );
+        }
+        assert!(!parse("4 17 * * 7").unwrap().matches(THU));
+        assert_eq!(parse("* * * * 7").unwrap(), parse("* * * * 0").unwrap());
+    }
+
+    #[test]
     fn bad_expressions_say_why() {
         for (expr, needle) in [
             ("* * * *", "5 fields"),
             ("60 * * * *", "outside 0-59"),
             ("* 25 * * *", "outside 0-23"),
+            ("* * * * 8", "outside 0-7"),
             ("*/0 * * * *", "step of zero"),
             ("x * * * *", "not a number"),
         ] {

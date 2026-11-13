@@ -1788,7 +1788,15 @@ impl RedisBroker {
             queues,
             min_timeout_ms: AtomicU64::new(u64::MAX),
             grace_ms: AtomicU64::new(0),
-            next_delayed: AtomicU64::new(0),
+            // Seeded from the clock, not zero: the member is `<pid>-<n>`, and
+            // two producers that are both pid 1 in their containers would each
+            // count from the same place and overwrite each other's jobs.
+            next_delayed: AtomicU64::new(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0),
+            ),
             claimed: Mutex::new(VecDeque::new()),
             prefetch: AtomicU64::new(1),
             prefetch_cap: AtomicU64::new(DEFAULT_PREFETCH_CAP),

@@ -88,6 +88,24 @@ impl Request {
         }
         true
     }
+
+    /// Was this addressed to the machine itself, by one of its own names?
+    ///
+    /// With no token the console binds to loopback only, and that is the whole
+    /// of its protection. DNS rebinding walks round it: a page on another site
+    /// re-points its own hostname at 127.0.0.1, and the browser then treats
+    /// requests to this console as same-origin with that page. The one thing
+    /// such a request cannot fake is the Host header, which still carries the
+    /// attacker's name.
+    fn names_loopback(&self) -> bool {
+        let host = self.host.as_str();
+        let name = if host.ends_with(']') {
+            host
+        } else {
+            host.rsplit_once(':').map(|(name, _)| name).unwrap_or(host)
+        };
+        matches!(name, "127.0.0.1" | "localhost" | "[::1]")
+    }
 }
 
 /// What the environment permits. Read once at startup so a request never pays
@@ -240,6 +258,16 @@ async fn handle(
     // a console would be a poor trade.
     if request.path == "/metrics" {
         return respond(&mut stream, 200, "text/plain; version=0.0.4", &metrics_body).await;
+    }
+
+    if guard.expect.is_empty() && !request.names_loopback() {
+        return respond(
+            &mut stream,
+            403,
+            "text/plain",
+            "this console has no token and answers only as 127.0.0.1, localhost or [::1]",
+        )
+        .await;
     }
 
     if !guard.allows(&request) {
@@ -653,6 +681,31 @@ mod tests {
         assert_eq!(form_value("id=abc%3A1&queue=q", "id"), "abc:1");
         assert_eq!(form_value("id=abc&queue=two+words", "queue"), "two words");
         assert_eq!(form_value("id=abc", "missing"), "");
+    }
+
+    #[test]
+    fn only_the_machines_own_names_reach_a_tokenless_console() {
+        let mut request = posted("", "");
+        for host in [
+            "127.0.0.1:9090",
+            "localhost:9090",
+            "localhost",
+            "[::1]:9090",
+            "[::1]",
+        ] {
+            request.host = host.into();
+            assert!(request.names_loopback(), "{host} is this machine");
+        }
+        // A rebinding page arrives under its own name, whatever it resolves to.
+        for host in [
+            "evil.example:9090",
+            "127.0.0.1.evil.example",
+            "",
+            "10.0.0.5:9090",
+        ] {
+            request.host = host.into();
+            assert!(!request.names_loopback(), "{host:?} is not this machine");
+        }
     }
 
     fn posted(fetch_site: &str, origin: &str) -> Request {

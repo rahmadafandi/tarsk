@@ -74,7 +74,7 @@ jobs:
     # Everything platform-specific here is a candidate: RSS accounting through
     # sysinfo, ru_maxrss being bytes rather than kilobytes, and the spawn and
     # socket paths.
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -242,7 +242,7 @@ jobs:
           # define __ARM_ARCH"`. zig cc gets the target flags right; verified by
           # building this wheel on an x86_64 host before it was written here.
           - { target: aarch64, os: ubuntu-24.04, zig: true }
-          - { target: universal2-apple-darwin, os: macos-14 }
+          - { target: universal2-apple-darwin, os: macos-15 }
           - { target: x64, os: windows-latest }
     steps:
       - uses: actions/checkout@v7

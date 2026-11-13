@@ -74,7 +74,7 @@ jobs:
           # variant dimension above, two rows for one target key would collide
           # instead of expanding.
           - { target: x86_64-musl, os: ubuntu-24.04, manylinux: musllinux_1_2, build: x86_64 }
-          - { target: universal2-apple-darwin, os: macos-14 }
+          - { target: universal2-apple-darwin, os: macos-15 }
           - { target: x64, os: windows-latest }
     steps:
       - uses: actions/checkout@v7

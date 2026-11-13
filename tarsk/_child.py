@@ -11,6 +11,7 @@ import concurrent.futures
 import functools
 import inspect
 import os
+import signal
 import sys
 import traceback
 
@@ -346,6 +347,25 @@ async def main(socket_path: str, app_spec: str, child_id: int, slots: int = 1) -
 
     running: set[asyncio.Task] = set()
     draining = False
+    leaving = False
+
+    # A terminal's ctrl-C and systemd's default stop both signal the whole
+    # process group, children included. The supervisor is the one that decides
+    # when a child stops — it sends Drain and waits for in-flight work — so a
+    # child that died on the same signal turned every graceful shutdown into
+    # tasks cut off mid-run. SIGTERM is honoured once this child is already on
+    # its way out, which is when the supervisor sends it as an escalation.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+    def on_term() -> None:
+        if leaving:
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            os.kill(os.getpid(), signal.SIGTERM)
+
+    try:
+        asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, on_term)
+    except NotImplementedError:  # Windows: no SIGTERM to catch
+        pass
     for _ in range(slots):
         await wire.send("Ready")
 
@@ -380,6 +400,7 @@ async def main(socket_path: str, app_spec: str, child_id: int, slots: int = 1) -
         running.add(job)
         job.add_done_callback(running.discard)
 
+    leaving = True
     # Whatever is still in flight owns a lease; finishing it is cheaper than
     # letting the supervisor time it out and redeliver.
     if running:

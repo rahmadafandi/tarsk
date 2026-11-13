@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import signal
 import sys
 
 _SIZE = re.compile(r"^\s*([0-9]*\.?[0-9]+)\s*([KMGT]?)i?B?\s*$", re.IGNORECASE)
@@ -298,6 +299,10 @@ def main(argv: list[str] | None = None) -> int:
         max_dead=args.max_dead,
     )
     queues = [q.strip() for q in args.queues.split(",") if q.strip()]
+    # ctrl-C is a shutdown request the supervisor already acts on. Left on
+    # Python's default handler it also became a KeyboardInterrupt the moment
+    # the drain finished, so a clean stop ended in a traceback and no stats.
+    signal.signal(signal.SIGINT, lambda *_: None)
     stats = supervisor.work(
         args.broker, queues, lease_grace=args.lease_grace, metrics_addr=args.metrics
     )

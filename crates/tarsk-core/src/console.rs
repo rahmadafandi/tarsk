@@ -269,11 +269,12 @@ async fn handle(
         ("POST", path) if guard.actions => {
             let id = form_value(&request.body, "id");
             let queue = form_value(&request.body, "queue");
-            let queue = if queue.is_empty() {
-                "default".to_string()
-            } else {
-                queue
-            };
+            // Every form on the page names its queue. One that does not is not
+            // from the page, and "default" is too large a thing to assume on
+            // behalf of a request that can purge.
+            if queue.is_empty() {
+                return respond(&mut stream, 400, "text/plain", "missing queue").await;
+            }
             let ids = if id.is_empty() {
                 Vec::new()
             } else {
@@ -343,8 +344,9 @@ async fn read_request(stream: &mut TcpStream) -> Option<Request> {
         }
         raw.extend_from_slice(&chunk[..read]);
     }
-    let text = String::from_utf8_lossy(&raw).into_owned();
-    let (head, rest) = text.split_once("\r\n\r\n")?;
+    let split = raw.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
+    let head = String::from_utf8_lossy(&raw[..split - 4]).into_owned();
+    let head = head.as_str();
     let mut lines = head.lines();
     let mut start = lines.next()?.split_whitespace();
     let method = start.next()?.to_string();
@@ -367,7 +369,26 @@ async fn read_request(stream: &mut TcpStream) -> Option<Request> {
     let fetch_site = header("sec-fetch-site").to_ascii_lowercase();
     let origin = header("origin");
     let host = header("host");
-    // Bodies here are one short form; anything already read is all of it.
+    // The body is whatever Content-Length says, not whatever happened to
+    // arrive with the headers. A proxy that sends the two separately used to
+    // leave this with an empty form — and an empty `id` means "all of them",
+    // so a click on one dead letter purged the lot. Short of the promised
+    // length is a broken request, and it is refused rather than guessed at.
+    let length: usize = header("content-length").parse().unwrap_or(0);
+    if length > MAX_REQUEST {
+        return None;
+    }
+    while raw.len() < split + length {
+        let read = tokio::time::timeout_at(deadline, stream.read(&mut chunk))
+            .await
+            .ok()?
+            .ok()?;
+        if read == 0 {
+            return None;
+        }
+        raw.extend_from_slice(&chunk[..read]);
+    }
+    let rest = String::from_utf8_lossy(&raw[split..split + length]).into_owned();
     Some(Request {
         method,
         path,
@@ -375,7 +396,7 @@ async fn read_request(stream: &mut TcpStream) -> Option<Request> {
         fetch_site,
         origin,
         host,
-        body: rest.to_string(),
+        body: rest,
     })
 }
 

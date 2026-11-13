@@ -245,9 +245,14 @@ def main(argv: list[str] | None = None) -> int:
         from ._core import Producer
 
         wanted = [q.strip() for q in args.queues.split(",") if q.strip()]
-        rows = Producer(broker_url=args.broker).jobs(wanted, args.limit)
+        # ponytail: with --state the filter runs here, over a wider read, so
+        # `--state running --limit 50` is fifty running jobs and not whichever
+        # of the first fifty happen to be. Ceiling is 5000 rows scanned; push
+        # the filter into the brokers when a queue is deeper than that.
+        fetch = max(args.limit, 5000) if args.state else args.limit
+        rows = Producer(broker_url=args.broker).jobs(wanted, fetch)
         if args.state:
-            rows = [r for r in rows if r[3] == args.state]
+            rows = [r for r in rows if r[3] == args.state][:args.limit]
         if not rows:
             print("nothing waiting or running")
             return 0

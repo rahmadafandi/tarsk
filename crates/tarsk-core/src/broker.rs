@@ -1008,8 +1008,11 @@ pub struct AmqpRecord {
 /// Cancellation and send-dedup are refused outright rather than faked.
 #[cfg(feature = "amqp")]
 pub struct AmqpBroker {
-    channel: lapin::Channel,
-    conn: lapin::Connection,
+    /// Replaced when the connection or its channel closes. A channel-level
+    /// error closes the channel for good, and before this every call after
+    /// one failed for the rest of the process's life.
+    link: tokio::sync::Mutex<Arc<AmqpLink>>,
+    url: String,
     queues: Vec<String>,
     /// Queues declared this run, so steady-state publishes skip the declare.
     /// Only queues without `x-expires` are cached: a delay queue deletes
@@ -1018,6 +1021,12 @@ pub struct AmqpBroker {
     declared: Mutex<std::collections::HashSet<String>>,
     // Per-process stand-ins for state AMQP cannot hold.
     local: LocalCoordination,
+}
+
+#[cfg(feature = "amqp")]
+struct AmqpLink {
+    conn: lapin::Connection,
+    channel: lapin::Channel,
 }
 
 #[cfg(feature = "amqp")]
@@ -1068,7 +1077,7 @@ fn amqp_record_from(headers: &lapin::types::FieldTable, data: &[u8]) -> AmqpReco
 
 #[cfg(feature = "amqp")]
 impl AmqpBroker {
-    async fn connect(url: &str, queues: Vec<String>) -> Res<AmqpBroker> {
+    async fn open(url: &str) -> Res<AmqpLink> {
         let conn = lapin::Connection::connect(url, lapin::ConnectionProperties::default()).await?;
         let channel = conn.create_channel().await?;
         // Publisher confirms, so push returning Ok means the server has the
@@ -1076,9 +1085,26 @@ impl AmqpBroker {
         channel
             .confirm_select(lapin::options::ConfirmSelectOptions::default())
             .await?;
+        Ok(AmqpLink { conn, channel })
+    }
+
+    /// The live connection and channel, reopened first if either has closed.
+    ///
+    /// Deliveries claimed on the old channel cannot be acked on the new one;
+    /// the server requeued them when it closed, which is the at-least-once
+    /// this queue already promises.
+    async fn link(&self) -> Res<Arc<AmqpLink>> {
+        let mut link = self.link.lock().await;
+        if !link.conn.status().connected() || !link.channel.status().connected() {
+            *link = Arc::new(Self::open(&self.url).await?);
+        }
+        Ok(link.clone())
+    }
+
+    async fn connect(url: &str, queues: Vec<String>) -> Res<AmqpBroker> {
         let broker = AmqpBroker {
-            channel,
-            conn,
+            link: tokio::sync::Mutex::new(Arc::new(Self::open(url).await?)),
+            url: url.to_string(),
             queues,
             declared: Mutex::new(std::collections::HashSet::new()),
             local: LocalCoordination::default(),
@@ -1093,6 +1119,8 @@ impl AmqpBroker {
     /// expire out from under the cache.
     async fn declare_plain(&self, name: &str) -> Res<u32> {
         let q = self
+            .link()
+            .await?
             .channel
             .queue_declare(
                 name.into(),
@@ -1134,7 +1162,9 @@ impl AmqpBroker {
             "x-expires".into(),
             lapin::types::AMQPValue::LongLongInt(ms as i64 + 60_000),
         );
-        self.channel
+        self.link()
+            .await?
+            .channel
             .queue_declare(
                 name.as_str().into(),
                 lapin::options::QueueDeclareOptions {
@@ -1205,7 +1235,9 @@ impl AmqpBroker {
         ready_at_ms: u64,
         extra: &[(&str, &str)],
     ) -> Res<()> {
-        self.channel
+        self.link()
+            .await?
+            .channel
             .basic_publish(
                 "".into(),
                 target.into(),
@@ -1283,6 +1315,8 @@ impl AmqpBroker {
         loop {
             for queue in &self.queues {
                 let got = self
+                    .link()
+                    .await?
                     .channel
                     .basic_get(
                         stream_key(queue).as_str().into(),
@@ -1374,6 +1408,8 @@ impl AmqpBroker {
             let mut count = self.declare_plain(&dead).await? as u64;
             while count > keep {
                 let Some(oldest) = self
+                    .link()
+                    .await?
                     .channel
                     .basic_get(
                         dead.as_str().into(),
@@ -1405,6 +1441,8 @@ impl AmqpBroker {
         let mut seen = Vec::new();
         for _ in 0..limit {
             let Some(msg) = self
+                .link()
+                .await?
                 .channel
                 .basic_get(
                     name.into(),
@@ -1465,7 +1503,9 @@ impl AmqpBroker {
             "x-overflow".into(),
             lapin::types::AMQPValue::LongString("drop-head".into()),
         );
-        self.channel
+        self.link()
+            .await?
+            .channel
             .queue_declare(
                 name.as_str().into(),
                 lapin::options::QueueDeclareOptions {
@@ -1475,7 +1515,9 @@ impl AmqpBroker {
                 args,
             )
             .await?;
-        self.channel
+        self.link()
+            .await?
+            .channel
             .basic_publish(
                 "".into(),
                 name.as_str().into(),
@@ -1491,7 +1533,7 @@ impl AmqpBroker {
     async fn get_result(&self, id: &str) -> Res<Option<Vec<u8>>> {
         // A passive declare on a missing queue closes the channel, so this
         // uses a throwaway one and reads a closed channel as "no result yet".
-        let channel = match self.conn.create_channel().await {
+        let channel = match self.link().await?.conn.create_channel().await {
             Ok(channel) => channel,
             Err(_) => return Ok(None),
         };

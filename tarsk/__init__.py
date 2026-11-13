@@ -392,6 +392,8 @@ class App:
         self._resolving = asyncio.Lock()
         self._overrides: dict = {}
         self._producer = None
+        self._producer_pid = 0
+        self._inherited: list = []
 
     def task(
         self,
@@ -550,12 +552,23 @@ class App:
         Imported lazily and cached: children import this module (spec §4.1) and
         must not pull in the extension module or a broker client to do it.
         """
-        if self._producer is None:
+        # A producer made before a fork is shared with the parent: one socket,
+        # two processes writing to it, replies landing in whichever reads
+        # first. `gunicorn --preload` with a send at import time is enough.
+        # The pid is recorded only for a producer made here, so one a test
+        # assigns directly is left alone.
+        forked = self._producer_pid and self._producer_pid != os.getpid()
+        if self._producer is None or forked:
             if not self.broker:
                 raise RuntimeError("App(broker=...) is required to send tasks")
             from ._core import Producer
 
+            if self._producer is not None:
+                # Kept, not dropped: tearing down a connection this process
+                # only inherited would close it under the parent.
+                self._inherited.append(self._producer)
             self._producer = Producer(self.broker)
+            self._producer_pid = os.getpid()
         return self._producer
 
     def cancel(self, task_id: str, *, queue: str = "default", ttl: float = 86400.0) -> None:

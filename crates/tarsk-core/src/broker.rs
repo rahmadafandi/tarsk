@@ -1628,11 +1628,11 @@ impl AmqpBroker {
 
 #[cfg(feature = "redis")]
 pub struct RedisBroker {
-    /// Cloned per command rather than locked. A MultiplexedConnection is built
-    /// to be used concurrently — putting a mutex round it made every command
+    /// Cloned per command rather than locked. The connection is multiplexed and
+    /// built to be used concurrently — putting a mutex round it made every command
     /// from every child queue behind one lock on a single-threaded runtime,
     /// which is a bottleneck this driver invented for itself.
-    conn: redis::aio::MultiplexedConnection,
+    conn: redis::aio::ConnectionManager,
     /// Only for `XREADGROUP … BLOCK`, and never shared with anything else.
     ///
     /// A blocking command on a multiplexed connection holds up every command
@@ -1640,7 +1640,7 @@ pub struct RedisBroker {
     /// in order. With children waiting for work, that put the reclaim sweep,
     /// the acks and the rate-limit script behind a 250ms wait each time — the
     /// sweep was timing out and requeued jobs were never coming back.
-    blocking: redis::aio::MultiplexedConnection,
+    blocking: redis::aio::ConnectionManager,
     consumer: String,
     queues: Vec<String>,
     /// Shortest timeout registered anywhere, the floor for the pending sweep.
@@ -1753,8 +1753,11 @@ fn revoked_key(queue: &str) -> String {
 impl RedisBroker {
     async fn connect(url: &str, queues: Vec<String>) -> Res<RedisBroker> {
         let client = redis::Client::open(url)?;
-        let mut conn = client.get_multiplexed_async_connection().await?;
-        let mut blocking = client.get_multiplexed_async_connection().await?;
+        // Managers rather than bare connections: they reconnect after a
+        // failover or a restart, where a multiplexed connection stays closed
+        // and leaves a worker that is up, healthy to its orchestrator, and
+        // failing every command.
+        let mut conn = client.get_connection_manager().await?;
         // Every serve loop parks its `XREADGROUP … BLOCK` here, and one socket
         // answers them one at a time — with each wait rounded up to the
         // server's next `hz` sweep (~100ms at the default hz 10), N children
@@ -1763,7 +1766,12 @@ impl RedisBroker {
         // to manufacture a steady "timed out" every ~300ms: broker_errors
         // climbed ~3/s on a healthy worker doing nothing, burying real errors.
         // The commands themselves are fine; only the deadline was wrong.
-        blocking.set_response_timeout(std::time::Duration::from_secs(30));
+        let blocking = client
+            .get_connection_manager_with_config(
+                redis::aio::ConnectionManagerConfig::new()
+                    .set_response_timeout(Some(std::time::Duration::from_secs(30))),
+            )
+            .await?;
         for queue in &queues {
             // MKSTREAM so producers and consumers can start in either order;
             // from 0 so messages published before the group existed are seen.

@@ -72,13 +72,25 @@ async def _call(app, task: Task, ctx: Context, args: list, kwargs: dict):
             chain = functools.partial(_layer, middleware, ctx, chain)
     hard = task.spec.timeout_ms / 1000
     soft = task.spec.soft_timeout_ms / 1000
-    if not soft:
-        return await asyncio.wait_for(chain(), hard)
     return await _both_deadlines(chain, ctx, soft, hard)
 
 
+class _Deadline(Exception):
+    """The task's own `timeout` ran out.
+
+    Not `TimeoutError`, which is what this used to be: that is also what a
+    socket, `asyncio.timeout()` and `Future.result()` raise, so a handler whose
+    HTTP call timed out after two seconds was reported as having exceeded its
+    thirty — with no traceback, and, for a sync handler, by killing the worker
+    and every task sharing it.
+    """
+
+
 async def _both_deadlines(chain, ctx: Context, soft: float, hard: float):
-    """Run the work under two deadlines, and report which one stopped it.
+    """Run the work under its deadlines, and report which one stopped it.
+
+    `soft` is zero for a task that set none, and then only the hard one is
+    armed.
 
     Cancellation is the only lever asyncio gives for interrupting a coroutine,
     so the handler sees `CancelledError` and not a type of our choosing. What
@@ -122,7 +134,9 @@ async def _both_deadlines(chain, ctx: Context, soft: float, hard: float):
         running.cancel()
 
     loop = asyncio.get_running_loop()
-    timers = (loop.call_later(soft, ask), loop.call_later(hard, take))
+    timers = [loop.call_later(hard, take)]
+    if soft:
+        timers.append(loop.call_later(soft, ask))
     try:
         # A handler that catches the cancellation and returns anyway lands
         # here with a value: it was asked, it tidied up, it finished in time.
@@ -130,7 +144,7 @@ async def _both_deadlines(chain, ctx: Context, soft: float, hard: float):
         return await running
     except asyncio.CancelledError:
         if fired == "hard":
-            raise TimeoutError(f"exceeded timeout of {hard}s") from None
+            raise _Deadline(f"exceeded timeout of {hard}s") from None
         if fired == "soft":
             raise SoftTimeout(f"exceeded soft_timeout of {soft}s") from None
         raise  # the worker is going down, not a deadline
@@ -260,7 +274,7 @@ async def _one(app, wire: Wire, app_spec: str, task_id: int, name: str, payload,
             "Nack", task_id, "Retry", f"{type(exc).__name__}: {exc}",
             "retry", int(exc.delay * 1000),
         )
-    except TimeoutError:
+    except _Deadline:
         await wire.send(
             "Nack", task_id, "TimeoutError",
             f"{name} exceeded timeout of {task.spec.timeout_ms / 1000}s", "", 0,

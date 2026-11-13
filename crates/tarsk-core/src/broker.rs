@@ -761,6 +761,21 @@ impl Broker {
         }
     }
 
+    /// Give a reservation back, if `job_id` still holds it.
+    ///
+    /// For a send whose push failed after `claim_dedup` succeeded. Left in
+    /// place, the key would answer the caller's retry with the id of a job
+    /// that was never queued, for the whole window.
+    pub async fn release_dedup(&self, key: &str, job_id: &str) -> Res<()> {
+        match self {
+            #[cfg(feature = "redis")]
+            Broker::Redis(b) => b.release_dedup(key, job_id).await,
+            #[cfg(feature = "postgres")]
+            Broker::Postgres(b) => b.release_dedup(key, job_id).await,
+            _ => Ok(()),
+        }
+    }
+
     /// File a finished task's answer under its id, to expire after `ttl`.
     /// Only called for tasks that asked for it: writing every result to a
     /// broker nobody reads from is most of why Celery feels heavy (spec §2).
@@ -2414,6 +2429,24 @@ impl RedisBroker {
         Ok(holder)
     }
 
+    async fn release_dedup(&self, key: &str, job_id: &str) -> Res<()> {
+        // Only if it is still ours: the window may have lapsed and been taken
+        // by another send while the push that failed was in flight.
+        let script = redis::Script::new(
+            r"if redis.call('GET', KEYS[1]) == ARGV[1] then
+                return redis.call('DEL', KEYS[1])
+              end
+              return 0",
+        );
+        let mut conn = self.conn.clone();
+        let _: i64 = script
+            .key(dedup_key(key))
+            .arg(job_id)
+            .invoke_async(&mut conn)
+            .await?;
+        Ok(())
+    }
+
     async fn acquire_slot(&self, task: &str, job_id: &str, max: u32, lease_ms: u64) -> Res<bool> {
         // Prune, count and add cannot be three commands: two workers would both
         // see the last slot free. A sorted set scored by expiry gives the prune
@@ -3273,10 +3306,16 @@ impl PgBroker {
             .db()
             .await?
             .query(
-                "with fresh as (delete from tarsk_dedup where expires_at <= now())
-                 insert into tarsk_dedup (key, job_id, expires_at)
+                // The upsert is the reservation. `do update … where` reads the
+                // row as it is now, under its lock, so an expired window is
+                // taken over by exactly one caller and a live one is left
+                // alone — which a separate delete of expired rows could not
+                // promise, since the insert beside it never saw the delete.
+                "insert into tarsk_dedup as d (key, job_id, expires_at)
                  values ($1, $2, now() + make_interval(secs => $3))
-                 on conflict (key) do nothing
+                 on conflict (key) do update
+                    set job_id = excluded.job_id, expires_at = excluded.expires_at
+                  where d.expires_at <= now()
                  returning job_id",
                 &[&key, &job_id, &(ttl_ms.max(1) as f64 / 1000.0)],
             )
@@ -3293,6 +3332,17 @@ impl PgBroker {
             )
             .await?;
         Ok(held.first().map(|r| r.get(0)))
+    }
+
+    async fn release_dedup(&self, key: &str, job_id: &str) -> Res<()> {
+        self.db()
+            .await?
+            .execute(
+                "delete from tarsk_dedup where key = $1 and job_id = $2",
+                &[&key, &job_id],
+            )
+            .await?;
+        Ok(())
     }
 
     async fn acquire_slot(&self, task: &str, job_id: &str, max: u32, lease_ms: u64) -> Res<bool> {

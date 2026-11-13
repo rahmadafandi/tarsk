@@ -289,7 +289,15 @@ impl Producer {
                         return Ok(Some(held));
                     }
                 }
-                self.broker.push(job, delay).await?;
+                if let Err(err) = self.broker.push(job, delay).await {
+                    // Nothing was queued, so the reservation covers nothing.
+                    // Held, it would answer this caller's retry with the id
+                    // of a job that does not exist, for the whole window.
+                    if !dedup_key.is_empty() {
+                        let _ = self.broker.release_dedup(&dedup_key, &id).await;
+                    }
+                    return Err(err);
+                }
                 Ok(None)
             })
         })

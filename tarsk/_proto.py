@@ -100,6 +100,13 @@ def _extend(obj: Any) -> msgpack.ExtType:
     )
 
 
+def _unpack(data: bytes) -> Any:
+    # strict_map_key off: msgpack packs a dict keyed by ints without complaint
+    # and then, by default, refuses to unpack it. That made `send({1: "a"})`
+    # succeed at the caller and fail in the worker on every attempt.
+    return msgpack.unpackb(data, raw=False, ext_hook=_revive, strict_map_key=False)
+
+
 def _revive(code: int, data: bytes) -> Any:
     if code == _DATETIME:
         return datetime.datetime.fromisoformat(data.decode())
@@ -115,9 +122,9 @@ def _revive(code: int, data: bytes) -> Any:
     if code == _UUID:
         return uuid.UUID(bytes=data)
     if code == _SET:
-        return set(msgpack.unpackb(data, raw=False, ext_hook=_revive))
+        return set(_unpack(data))
     if code == _FROZENSET:
-        return frozenset(msgpack.unpackb(data, raw=False, ext_hook=_revive))
+        return frozenset(_unpack(data))
     # An unknown code is a newer sender talking to an older worker. Handing back
     # the raw ExtType keeps the rest of the payload readable, which beats
     # failing the whole call over one argument.
@@ -132,7 +139,7 @@ def pack_args(args: tuple, kwargs: dict) -> bytes:
 
 
 def unpack_args(payload: bytes) -> tuple[list, dict]:
-    args, kwargs = msgpack.unpackb(payload, raw=False, ext_hook=_revive)
+    args, kwargs = _unpack(payload)
     return args, kwargs
 
 
@@ -157,4 +164,4 @@ def pack_result(value: Any) -> bytes:
 
 
 def unpack_result(payload: bytes) -> Any:
-    return msgpack.unpackb(payload, raw=False, ext_hook=_revive)
+    return _unpack(payload)

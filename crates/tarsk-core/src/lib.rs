@@ -642,6 +642,12 @@ impl Shared {
     /// One claim attempt. Never parks, so it is safe to call from a frame loop
     /// that still owes itself the reading of an Ack.
     async fn try_job(&self, lease: Duration) -> Option<Job> {
+        // Shutting down means no new work, not "no new work once the queue is
+        // empty". Without this a worker told to stop kept claiming for as long
+        // as there was a backlog, and was eventually killed mid-task instead.
+        if self.done.load(Ordering::SeqCst) {
+            return None;
+        }
         match self.broker.claim(lease, Duration::from_millis(0)).await {
             Ok(Some(delivery)) => Some(self.adopt(delivery)),
             Ok(None) => None,
@@ -654,6 +660,11 @@ impl Shared {
 
     async fn next_job(&self, lease: Duration, block: Duration) -> Option<Job> {
         loop {
+            // Before the claim as well as after it, for the reason in
+            // `try_job`: a claim that succeeds is a job this worker now owes.
+            if self.done.load(Ordering::SeqCst) {
+                return None;
+            }
             match self.broker.claim(lease, block).await {
                 Ok(Some(delivery)) => return Some(self.adopt(delivery)),
                 Ok(None) => {}

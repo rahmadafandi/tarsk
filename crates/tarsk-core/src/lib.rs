@@ -2541,6 +2541,136 @@ mod settle_tests {
         assert_eq!(seen, expected, "settles reached the broker out of order");
     }
 
+    /// One job carrying a one-step chain, claimed and ready to be settled.
+    async fn claimed_with_a_chain(shared: &Arc<Shared>) -> Job {
+        let mut chain = Vec::new();
+        let step = Value::Array(vec![
+            Value::from("next-id"),
+            Value::from("next"),
+            Value::Binary(Vec::new()),
+            Value::from(1_000u32),
+            Value::from("default"),
+            Value::from(false),
+        ]);
+        rmpv::encode::write_value(&mut chain, &Value::Array(vec![step])).unwrap();
+        let first = broker::NewJob {
+            id: "first-id".into(),
+            queue: "default".into(),
+            name: "first".into(),
+            payload: Vec::new(),
+            timeout_ms: 1_000,
+            meta: Vec::new(),
+            expires_ms: 0,
+            chain,
+        };
+        shared.broker.push(first, Duration::ZERO).await.unwrap();
+        shared.try_job(Duration::ZERO).await.unwrap()
+    }
+
+    fn succeeded() -> Outcome {
+        Outcome {
+            ok: true,
+            result: Vec::new(),
+            error_type: String::new(),
+            traceback: String::new(),
+            directive: Directive::Policy,
+        }
+    }
+
+    fn memory(shared: &Arc<Shared>) -> &broker::MemoryBroker {
+        // Irrefutable when only the memory broker is compiled in.
+        #[allow(irrefutable_let_patterns)]
+        let broker::Broker::Memory(memory) = &shared.broker
+        else {
+            panic!("these tests run on the memory broker");
+        };
+        memory
+    }
+
+    async fn on_memory() -> Arc<Shared> {
+        let broker = broker::Broker::connect("memory://", Vec::new())
+            .await
+            .unwrap();
+        new_shared(broker, 0, false)
+    }
+
+    #[tokio::test]
+    async fn a_step_is_not_acked_past_a_failed_enqueue() {
+        // The next step could not be queued. Acking the finished one anyway is
+        // how the rest of a chain used to vanish, so it must still be there to
+        // be redelivered — which on this broker means a requeue finds it.
+        let shared = on_memory().await;
+        let job = claimed_with_a_chain(&shared).await;
+        let receipt = job.receipt.clone();
+        memory(&shared).refuse_pushes.store(true, Ordering::SeqCst);
+        shared.settle(job, succeeded()).await;
+        memory(&shared).refuse_pushes.store(false, Ordering::SeqCst);
+
+        assert_eq!(shared.counters.broker_errors.load(Ordering::Relaxed), 1);
+        assert_eq!(shared.counters.chained.load(Ordering::Relaxed), 0);
+        shared.broker.retry(&receipt, Duration::ZERO).await.unwrap();
+        let again = shared.try_job(Duration::ZERO).await;
+        assert_eq!(
+            again.map(|job| job.name).as_deref(),
+            Some("first"),
+            "the step was acked although the next one was never queued"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_step_that_handed_over_is_acked() {
+        // The control for the test above: with the enqueue working, the step
+        // settles for good and what comes off the queue next is its successor.
+        let shared = on_memory().await;
+        let job = claimed_with_a_chain(&shared).await;
+        let receipt = job.receipt.clone();
+        shared.settle(job, succeeded()).await;
+        // On the memory broker a settled job can end the run, and a run that
+        // has ended claims nothing — which is not what is being asked here.
+        shared.done.store(false, Ordering::SeqCst);
+
+        assert_eq!(shared.counters.chained.load(Ordering::Relaxed), 1);
+        shared.broker.retry(&receipt, Duration::ZERO).await.unwrap();
+        let next = shared.try_job(Duration::ZERO).await.unwrap();
+        assert_eq!((next.name.as_str(), next.id.as_str()), ("next", "next-id"));
+        assert!(
+            shared.try_job(Duration::ZERO).await.is_none(),
+            "the acked step came back"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_worker_told_to_stop_claims_nothing() {
+        // Work is waiting and the worker is shutting down. It must be left for
+        // someone else rather than claimed on the way out.
+        let shared = on_memory().await;
+        let _busy = claimed(&shared, 1).await; // one in flight, as a busy child has
+        let waiting = broker::NewJob {
+            id: "waiting".into(),
+            queue: "default".into(),
+            name: "waiting".into(),
+            payload: Vec::new(),
+            timeout_ms: 1_000,
+            meta: Vec::new(),
+            expires_ms: 0,
+            chain: Vec::new(),
+        };
+        shared.broker.push(waiting, Duration::ZERO).await.unwrap();
+
+        shared.done.store(true, Ordering::SeqCst);
+        assert!(shared.try_job(Duration::ZERO).await.is_none());
+        let parked = shared.next_job(Duration::ZERO, Duration::ZERO).await;
+        assert!(parked.is_none());
+
+        shared.done.store(false, Ordering::SeqCst);
+        let left = shared.try_job(Duration::ZERO).await;
+        assert_eq!(
+            left.map(|job| job.name).as_deref(),
+            Some("waiting"),
+            "the job should still be there for the next worker"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn a_retiring_child_settles_everything_it_queued() {
         // A single-threaded runtime is the only honest stand-in for broker

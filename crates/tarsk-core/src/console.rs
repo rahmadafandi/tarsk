@@ -316,8 +316,7 @@ async fn handle(
                     // A cancellation has to outlive the job it cancels. A day
                     // covers anything already runnable; a delayed job's form
                     // says how long it still has to wait, and gets that.
-                    let wanted: u64 = form_value(&request.body, "ms").parse().unwrap_or(0);
-                    let ttl = wanted.clamp(CANCEL_TTL_MS, 400 * CANCEL_TTL_MS);
+                    let ttl = cancel_ttl(&request.body);
                     shared.broker.revoke(&queue, &id, ttl).await.map(|_| 1usize)
                 }
                 "/replay" => shared.broker.dead_replay(&queue, &ids).await,
@@ -432,6 +431,12 @@ async fn read_request(stream: &mut TcpStream) -> Option<Request> {
         host,
         body: rest,
     })
+}
+
+/// How long to remember a cancellation posted with this form.
+fn cancel_ttl(body: &str) -> u64 {
+    let wanted: u64 = form_value(body, "ms").parse().unwrap_or(0);
+    wanted.clamp(CANCEL_TTL_MS, 400 * CANCEL_TTL_MS)
 }
 
 fn form_value(body: &str, key: &str) -> String {
@@ -726,6 +731,29 @@ mod tests {
             request.host = host.into();
             assert!(!request.names_loopback(), "{host:?} is not this machine");
         }
+    }
+
+    #[test]
+    fn a_cancellation_outlives_the_job_it_cancels() {
+        const DAY: u64 = 86_400_000;
+        // Runnable now, or a form that says nothing: a day, as before.
+        assert_eq!(cancel_ttl("queue=q&id=a"), DAY);
+        assert_eq!(cancel_ttl("queue=q&id=a&ms=5000"), DAY);
+        assert_eq!(cancel_ttl("queue=q&id=a&ms=nonsense"), DAY);
+        // Due in a week: remembered for the week.
+        assert_eq!(cancel_ttl(&format!("id=a&ms={}", 7 * DAY)), 7 * DAY);
+        // And not for ever, whatever the form claims.
+        assert_eq!(cancel_ttl(&format!("id=a&ms={}", u64::MAX)), 400 * DAY);
+
+        let guard = Guard {
+            expect: String::new(),
+            actions: true,
+        };
+        let delayed = action(&guard, "/cancel", "q", "a", "cancel", Some(7 * DAY));
+        let field = format!("name=ms value=\"{}\"", 7 * DAY);
+        assert!(delayed.contains(&field), "{delayed}");
+        let ready = action(&guard, "/cancel", "q", "a", "cancel", None);
+        assert!(!ready.contains("name=ms"), "{ready}");
     }
 
     fn posted(fetch_site: &str, origin: &str) -> Request {

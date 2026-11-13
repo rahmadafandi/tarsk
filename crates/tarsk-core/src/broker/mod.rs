@@ -828,6 +828,83 @@ mod tests {
     use super::*;
 
     #[test]
+    fn an_error_is_described_with_its_causes() {
+        #[derive(Debug)]
+        struct Outer(std::io::Error);
+        impl std::fmt::Display for Outer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "db error")
+            }
+        }
+        impl std::error::Error for Outer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        // The shape tokio-postgres hands back: two words on top, the server's
+        // own message underneath.
+        let err = Outer(std::io::Error::other("deadlock detected"));
+        assert_eq!(describe(&err), "db error: deadlock detected");
+        // A cause the message already carries is not said twice.
+        let plain = std::io::Error::other("connection closed");
+        assert_eq!(describe(&plain), "connection closed");
+    }
+
+    #[tokio::test]
+    async fn a_deferral_gives_its_attempt_back() {
+        let broker = Broker::connect("memory://", Vec::new()).await.unwrap();
+        let job = NewJob {
+            id: "j".into(),
+            queue: "default".into(),
+            name: "t".into(),
+            payload: Vec::new(),
+            timeout_ms: 1_000,
+            meta: Vec::new(),
+            expires_ms: 0,
+            chain: Vec::new(),
+        };
+        broker.push(job, Duration::ZERO).await.unwrap();
+        let wait = Duration::ZERO;
+        let first = broker.claim(wait, wait).await.unwrap().unwrap();
+        assert_eq!(first.attempt, 1);
+        // Waiting for a slot, three times over, is still the first attempt.
+        let mut seen = first;
+        for _ in 0..3 {
+            broker
+                .defer(&seen.receipt, wait, seen.attempt)
+                .await
+                .unwrap();
+            seen = broker.claim(wait, wait).await.unwrap().unwrap();
+            assert_eq!(seen.attempt, 1, "a deferral was charged as an attempt");
+        }
+        // A failure is not a wait, and is still counted.
+        broker.retry(&seen.receipt, wait).await.unwrap();
+        let after = broker.claim(wait, wait).await.unwrap().unwrap();
+        assert_eq!(after.attempt, 2);
+    }
+
+    #[tokio::test]
+    async fn local_ticks_do_not_accumulate() {
+        // Irrefutable when only the memory broker is compiled in.
+        #[allow(irrefutable_let_patterns)]
+        let Broker::Memory(broker) = Broker::connect("memory://", Vec::new()).await.unwrap() else {
+            unreachable!()
+        };
+        assert!(broker.local.claim_tick("nightly", 100));
+        assert!(
+            !broker.local.claim_tick("nightly", 100),
+            "one winner per minute"
+        );
+        for minute in 101..400 {
+            assert!(broker.local.claim_tick("nightly", minute));
+        }
+        assert!(
+            broker.local.ticks.lock().unwrap().len() <= 3,
+            "ticks were kept forever"
+        );
+    }
+
+    #[test]
     fn a_gated_out_backend_is_not_reported_as_an_unsupported_url() {
         let msg = unsupported("redis://localhost/0");
         assert!(

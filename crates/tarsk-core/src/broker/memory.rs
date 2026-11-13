@@ -13,7 +13,7 @@ use super::*;
 /// between the two.
 #[derive(Default)]
 pub(super) struct LocalCoordination {
-    ticks: Mutex<std::collections::HashSet<(String, i64)>>,
+    pub(super) ticks: Mutex<std::collections::HashSet<(String, i64)>>,
     buckets: Mutex<HashMap<String, (f64, std::time::Instant)>>,
     slots: Mutex<HashMap<String, HashMap<String, std::time::Instant>>>,
 }
@@ -78,6 +78,10 @@ pub struct MemoryBroker {
     next_id: AtomicU64,
     results: Mutex<HashMap<String, (Vec<u8>, std::time::Instant)>>,
     pub(super) revoked: Mutex<HashMap<String, std::time::Instant>>,
+    /// Makes `push` fail, for the tests of what happens when an enqueue does.
+    /// This broker cannot fail one on its own, and the real ones can.
+    #[cfg(test)]
+    pub(crate) refuse_pushes: std::sync::atomic::AtomicBool,
     pub(super) local: LocalCoordination,
 }
 
@@ -96,6 +100,10 @@ impl MemoryBroker {
     }
 
     pub(super) fn push(&self, job: NewJob, delay: Duration) -> Res<()> {
+        #[cfg(test)]
+        if self.refuse_pushes.load(Ordering::SeqCst) {
+            return Err("push refused".into());
+        }
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let ready_ms = now_ms() + delay.as_millis() as u64;
         self.jobs.lock().unwrap().insert(id, (job, 0, ready_ms));

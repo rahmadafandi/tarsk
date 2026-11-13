@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  # So release.yml can run every job here before it builds anything to publish.
+  workflow_call:
 
 jobs:
   test:
@@ -62,6 +64,9 @@ jobs:
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --lib
       - run: cargo test --lib --all-features
+      # Pyflakes-level only; the rule set is in pyproject.toml. The package
+      # ships py.typed and nothing had ever looked at the Python.
+      - run: pipx run ruff check tarsk tests packaging
 
   test-macos:
     # The wheel has been built for macOS since the first CI commit and nothing
@@ -213,6 +218,10 @@ jobs:
 
   wheels:
     # Proves the matrix builds; publishing is a separate, deliberate step.
+    # Not when release.yml calls this file: it builds the same matrix itself
+    # and uploads under the same artifact names, and two uploads of one name
+    # in one run is an error.
+    if: github.workflow == 'ci'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

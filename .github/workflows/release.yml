@@ -41,8 +41,12 @@ jobs:
       # local build would publish four distributions under one name.
       - run: python3 packaging/variant.py --check
 
+  # A tag used to publish whatever commit it pointed at, tested or not.
+  tests:
+    uses: ./.github/workflows/ci.yml
+
   build:
-    needs: check
+    needs: [check, tests]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -116,7 +120,7 @@ jobs:
           path: dist
 
   sdist:
-    needs: check
+    needs: [check, tests]
     runs-on: ubuntu-24.04
     strategy:
       matrix:

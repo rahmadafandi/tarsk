@@ -143,6 +143,10 @@ const REDIS_GROUP: &str = "tarsk";
 #[cfg(feature = "redis")]
 const DEFAULT_PREFETCH_CAP: u64 = 4;
 
+/// Pending entries the lease sweep reads per round trip.
+#[cfg(feature = "redis")]
+const PENDING_PAGE: usize = 64;
+
 #[derive(Clone, Debug)]
 pub struct NewJob {
     /// Chosen by the producer so `send()` can hand it back without a round
@@ -2756,61 +2760,79 @@ impl RedisBroker {
         for queue in &self.queues {
             let key = stream_key(queue);
             let mut conn = self.conn.clone();
-            let pending: redis::streams::StreamPendingCountReply = redis::cmd("XPENDING")
-                .arg(&key)
-                .arg(REDIS_GROUP)
-                .arg("IDLE")
-                .arg(floor)
-                .arg("-")
-                .arg("+")
-                .arg(64)
-                .query_async(&mut conn)
-                .await?;
-            for candidate in pending.ids {
-                let entries: redis::streams::StreamRangeReply = redis::cmd("XRANGE")
-                    .arg(&key)
-                    .arg(&candidate.id)
-                    .arg(&candidate.id)
-                    .query_async(&mut conn)
-                    .await?;
-                let Some(entry) = entries.ids.first() else {
-                    continue;
-                };
-                let (name, payload, timeout_ms) = entry_fields(entry);
-                let deadline = timeout_ms + grace_ms;
-                if (candidate.last_delivered_ms as u64) <= deadline {
-                    continue; // still inside its own lease
-                }
-                let claimed: redis::streams::StreamClaimReply = redis::cmd("XCLAIM")
+            // In pages, not one read. The filter is the *shortest* timeout,
+            // so the first 64 entries past it can all be long jobs still inside
+            // their own lease — and an entry stranded behind them was never
+            // looked at, for as long as the queue stayed that busy.
+            //
+            // ponytail: stops after 16 pages, 1024 entries a sweep per queue.
+            // Each candidate costs an XRANGE, and the sweep runs every second;
+            // carry the cursor between sweeps if a queue holds more in flight.
+            let mut start = "-".to_string();
+            for _ in 0..16 {
+                let pending: redis::streams::StreamPendingCountReply = redis::cmd("XPENDING")
                     .arg(&key)
                     .arg(REDIS_GROUP)
-                    .arg(&self.consumer)
-                    .arg(deadline)
-                    .arg(&candidate.id)
+                    .arg("IDLE")
+                    .arg(floor)
+                    .arg(&start)
+                    .arg("+")
+                    .arg(PENDING_PAGE)
                     .query_async(&mut conn)
                     .await?;
-                if claimed.ids.is_empty() {
-                    continue; // another supervisor got there first
+                let full = pending.ids.len() == PENDING_PAGE;
+                if let Some(last) = pending.ids.last() {
+                    start = format!("({}", last.id); // exclusive: the next page
                 }
-                self.claimed.lock().unwrap().push_back((
-                    Delivery {
-                        id: entry_id(entry),
-                        name,
-                        payload,
-                        attempt: candidate.times_delivered as u32 + 1,
-                        ready_at_ms: stream_id_ms(&candidate.id),
-                        expires_ms: entry_expires(entry),
-                        chain: entry.get("c").unwrap_or_default(),
-                        meta: entry.get("m").unwrap_or_default(),
-                        receipt: Receipt::Redis {
-                            queue: queue.clone(),
-                            id: candidate.id,
+                for candidate in pending.ids {
+                    let entries: redis::streams::StreamRangeReply = redis::cmd("XRANGE")
+                        .arg(&key)
+                        .arg(&candidate.id)
+                        .arg(&candidate.id)
+                        .query_async(&mut conn)
+                        .await?;
+                    let Some(entry) = entries.ids.first() else {
+                        continue;
+                    };
+                    let (name, payload, timeout_ms) = entry_fields(entry);
+                    let deadline = timeout_ms + grace_ms;
+                    if (candidate.last_delivered_ms as u64) <= deadline {
+                        continue; // still inside its own lease
+                    }
+                    let claimed: redis::streams::StreamClaimReply = redis::cmd("XCLAIM")
+                        .arg(&key)
+                        .arg(REDIS_GROUP)
+                        .arg(&self.consumer)
+                        .arg(deadline)
+                        .arg(&candidate.id)
+                        .query_async(&mut conn)
+                        .await?;
+                    if claimed.ids.is_empty() {
+                        continue; // another supervisor got there first
+                    }
+                    self.claimed.lock().unwrap().push_back((
+                        Delivery {
+                            id: entry_id(entry),
+                            name,
+                            payload,
+                            attempt: candidate.times_delivered as u32 + 1,
+                            ready_at_ms: stream_id_ms(&candidate.id),
+                            expires_ms: entry_expires(entry),
+                            chain: entry.get("c").unwrap_or_default(),
+                            meta: entry.get("m").unwrap_or_default(),
+                            receipt: Receipt::Redis {
+                                queue: queue.clone(),
+                                id: candidate.id,
+                            },
                         },
-                    },
-                    std::time::Instant::now(),
-                    timeout_ms.max(1),
-                ));
-                reclaimed += 1;
+                        std::time::Instant::now(),
+                        timeout_ms.max(1),
+                    ));
+                    reclaimed += 1;
+                }
+                if !full {
+                    break;
+                }
             }
         }
         Ok(reclaimed)

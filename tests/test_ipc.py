@@ -303,6 +303,78 @@ def test_each_send_mints_its_own_id():
     assert pinned.send() == pinned.send() == "mine", "an explicit id must be kept"
 
 
+def test_a_forked_process_gets_its_own_producer():
+    """A producer made before a fork must not be the one the child sends on."""
+    if not hasattr(os, "fork"):
+        raise SkipTest("no fork on this platform")
+    app = App(broker="memory://")
+    parent = app.producer()
+    pid = os.fork()
+    if pid == 0:
+        # In the child: a different object, and the same one on every call after.
+        mine = app.producer()
+        os._exit(0 if mine is not parent and app.producer() is mine else 1)
+    _, status = os.waitpid(pid, 0)
+    assert status == 0, "the child reused the connection it inherited"
+    assert app.producer() is parent, "the parent lost its own producer"
+
+
+def test_connecting_does_not_hold_the_gil():
+    """A broker that never answers must not freeze every other thread.
+
+    The server here accepts the connection, says nothing for a while, and
+    hangs up. Python threads can only run during that wait if the connect
+    happens with the GIL released.
+
+    The server is another process on purpose. If the GIL *is* held, nothing in
+    this one can run to end the wait — so it has to end by itself, or the
+    failure this is here to catch would show up as a hung suite instead.
+    """
+    import subprocess
+    import threading
+    import time
+
+    from tarsk._core import Producer, backends
+
+    if "redis" not in backends():
+        raise SkipTest("needs a build with the redis backend to have something to connect to")
+    silent = subprocess.Popen(
+        [sys.executable, "-c",
+         "import socket, time\n"
+         "s = socket.socket(); s.bind(('127.0.0.1', 0)); s.listen(8)\n"
+         "print(s.getsockname()[1], flush=True)\n"
+         "conns = []\n"
+         "s.settimeout(0.1)\n"
+         "end = time.monotonic() + 1.5\n"
+         "while time.monotonic() < end:\n"
+         "    try: conns.append(s.accept()[0])\n"
+         "    except OSError: pass\n"],
+        stdout=subprocess.PIPE, text=True)
+    port = int(silent.stdout.readline())
+    took = []
+
+    def connect():
+        began = time.monotonic()
+        try:
+            Producer(broker_url=f"redis://127.0.0.1:{port}/0")
+        except Exception:
+            pass
+        took.append(time.monotonic() - began)
+
+    thread = threading.Thread(target=connect, daemon=True)
+    thread.start()
+    ticks = 0
+    while thread.is_alive() and ticks < 1000:
+        time.sleep(0.01)
+        ticks += 1
+    silent.wait(timeout=10)
+    thread.join(timeout=10)
+    assert took and took[0] > 0.5, f"the connect did not wait, so nothing was measured: {took}"
+    assert ticks >= 20, (
+        f"this thread ran {ticks} times in the {took[0]:.2f}s the connect took: "
+        "the GIL was held across it")
+
+
 if __name__ == "__main__":
     ran, skipped = [], []
     for check in (test_slots_overlap_inside_one_child, test_slots_overlap_sync_handlers_too, test_registry_hash, test_timeout_cap, test_end_to_end,
@@ -314,7 +386,9 @@ if __name__ == "__main__":
                   test_int_keyed_dicts_survive_the_trip,
                   test_waiting_for_a_slot_is_not_an_attempt,
                   test_a_worker_dependency_resolves_once,
-                  test_each_send_mints_its_own_id):
+                  test_each_send_mints_its_own_id,
+                  test_a_forked_process_gets_its_own_producer,
+                  test_connecting_does_not_hold_the_gil):
         try:
             check()
         except SkipTest as why:

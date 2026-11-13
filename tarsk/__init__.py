@@ -18,6 +18,10 @@ import re
 import secrets
 import time
 from dataclasses import dataclass, field
+from typing import Callable, Generic, ParamSpec, TypeVar
+
+P = ParamSpec("P")
+R = TypeVar("R")
 
 __all__ = [
     "App", "AsyncResult", "Chain", "Context", "Depends", "Group", "Signature",
@@ -174,8 +178,8 @@ class Depends:
         self.scope = scope
 
 
-class Task:
-    def __init__(self, fn, spec: TaskSpec, app: "App"):
+class Task(Generic[P, R]):
+    def __init__(self, fn: Callable[P, R], spec: TaskSpec, app: "App"):
         self.fn = fn
         self.spec = spec
         self.app = app
@@ -188,10 +192,10 @@ class Task:
         }
         functools.update_wrapper(self, fn)
 
-    def __call__(self, *args, **kwargs):
+    def __call__(self, *args: P.args, **kwargs: P.kwargs) -> R:
         return self.fn(*args, **kwargs)
 
-    def send(self, *args, **kwargs) -> str:
+    def send(self, *args: P.args, **kwargs: P.kwargs) -> str:
         """Enqueue this task and return its id.
 
         An id, not a future (spec §4.3). Nothing is written anywhere unless the
@@ -199,7 +203,7 @@ class Task:
         """
         return Enqueue(self).send(*args, **kwargs)
 
-    async def send_async(self, *args, **kwargs) -> str:
+    async def send_async(self, *args: P.args, **kwargs: P.kwargs) -> str:
         """Enqueue without blocking the event loop.
 
         The Rust producer releases the GIL for the round trip, so handing it to
@@ -221,11 +225,11 @@ class Task:
         """This task with these arguments, fed the previous step's result."""
         return Signature(self, args, kwargs, feed=True)
 
-    def si(self, *args, **kwargs) -> "Signature":
+    def si(self, *args: P.args, **kwargs: P.kwargs) -> "Signature":
         """This task with these arguments and nothing else — `i` for immutable."""
         return Signature(self, args, kwargs, feed=False)
 
-    def send_in(self, delay: float, /, *args, **kwargs) -> str:
+    def send_in(self, delay: float, /, *args: P.args, **kwargs: P.kwargs) -> str:
         """Enqueue, to run no earlier than `delay` seconds from now.
 
         `delay` is positional on purpose. The spec sketched
@@ -234,7 +238,7 @@ class Task:
         """
         return Enqueue(self, delay=delay).send(*args, **kwargs)
 
-    def send_at(self, when: "datetime.datetime", /, *args, **kwargs) -> str:
+    def send_at(self, when: "datetime.datetime", /, *args: P.args, **kwargs: P.kwargs) -> str:
         """Enqueue for an absolute time. Must be timezone-aware.
 
         A naive datetime is the same bug as a local-time cron: it means
@@ -406,8 +410,8 @@ class App:
         max_concurrency: int = 0,
         unique: float = 0.0,
         soft_timeout: float = 0.0,
-    ):
-        def decorate(fn):
+    ) -> Callable[[Callable[P, R]], Task[P, R]]:
+        def decorate(fn: Callable[P, R]) -> Task[P, R]:
             t = self.default_timeout if timeout is None else timeout
             if t <= 0:
                 raise ValueError(f"{fn.__qualname__}: timeout must be positive")

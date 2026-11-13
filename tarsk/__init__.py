@@ -382,6 +382,7 @@ class App:
         self.stop_hooks: list = []
         self.middlewares: list = []
         self._provided: dict = {}
+        self._resolving = asyncio.Lock()
         self._overrides: dict = {}
         self._producer = None
 
@@ -520,14 +521,21 @@ class App:
 
     async def resolve(self, dep: Depends):
         provider = self._overrides.get(dep.provider, dep.provider)
-        if dep.scope == "worker" and provider in self._provided:
+        if dep.scope != "worker":
+            value = provider()
+            return await value if inspect.isawaitable(value) else value
+        if provider in self._provided:
             return self._provided[provider]
-        value = provider()
-        if inspect.isawaitable(value):
-            value = await value
-        if dep.scope == "worker":
-            self._provided[provider] = value
-        return value
+        # Once per process means once, and with more than one slot the first
+        # tasks all arrive before any of them has finished awaiting the
+        # provider: unlocked, a hundred slots opened a hundred pools.
+        async with self._resolving:
+            if provider not in self._provided:
+                value = provider()
+                if inspect.isawaitable(value):
+                    value = await value
+                self._provided[provider] = value
+            return self._provided[provider]
 
     def producer(self):
         """Connection to the broker for enqueueing.

@@ -3369,22 +3369,14 @@ impl PgBroker {
     }
 
     async fn acquire_slot(&self, task: &str, job_id: &str, max: u32, lease_ms: u64) -> Res<bool> {
-        // One statement again: the delete of expired holders, the count and the
-        // insert have to be indivisible or two workers both find room.
-        // `on conflict do update` makes a redelivery renew its own slot rather
-        // than be refused by it.
+        // Lock, prune, count and insert, indivisibly — see the function in
+        // PG_SCHEMA for why that is a function rather than one statement. A
+        // redelivery renews its own slot rather than being refused by it.
         let row = self
             .db()
             .await?
             .query_one(
-                "with gone as (delete from tarsk_slots where expires_at <= now())
-                 insert into tarsk_slots (task, job_id, expires_at)
-                 select $1, $2, now() + make_interval(secs => $4)
-                  where (select count(*) from tarsk_slots
-                          where task = $1 and expires_at > now()
-                            and job_id <> $2) < $3
-                 on conflict (task, job_id) do update set expires_at = excluded.expires_at
-                 returning true",
+                "select tarsk_acquire_slot($1, $2, $3, $4)",
                 &[
                     &task,
                     &job_id,
@@ -3392,15 +3384,8 @@ impl PgBroker {
                     &(lease_ms.max(1) as f64 / 1000.0),
                 ],
             )
-            .await;
-        match row {
-            Ok(_) => Ok(true),
-            // No row inserted means the where-clause found no room. tokio-postgres
-            // reports that as "unexpected number of rows", which is the answer
-            // rather than a fault.
-            Err(e) if e.to_string().contains("unexpected number of rows") => Ok(false),
-            Err(e) => Err(e.into()),
-        }
+            .await?;
+        Ok(row.get(0))
     }
 
     async fn release_slot(&self, task: &str, job_id: &str) -> Res<()> {
@@ -3415,49 +3400,33 @@ impl PgBroker {
     }
 
     async fn take_token(&self, task: &str, per_sec: f64, burst: u32) -> Res<u64> {
-        // One statement, so a refill and a take cannot be split by another
-        // worker. `refill` reads the row inside the same statement that
-        // rewrites it, and reports the level *before* the take, which is the
-        // only number that says whether there was a token to take.
+        // The refill is computed inside `do update`, from the row as it is
+        // under its lock. Reading the bucket first and writing back a number
+        // worked out from that read let two workers both see the last token.
+        // `took` says whether this call got one, which the level after the
+        // take cannot: 0.4 left is either a refusal or the change from 1.4.
         let row = self
             .db()
             .await?
             .query_one(
-                // No `$2::float8`: a cast makes Postgres infer the parameter
-                // as unknown and coerce at runtime, so the driver expects text
-                // and serializing an f64 fails. Inference from context is what
-                // types these — b.tokens is float8, and extract() returns
-                // numeric, so that one needs the cast on the column instead.
-                "with refill as (
-                     select least($2,
-                                  coalesce(b.tokens, $2)
-                                  + extract(epoch from now() - coalesce(b.seen, now()))::float8
-                                    * $3
-                            ) as level
-                       from (select 1) one
-                       left join tarsk_buckets b on b.task = $1
-                 ), taken as (
-                     insert into tarsk_buckets (task, tokens, seen)
-                     -- Cast every parameter: in a SELECT list Postgres has
-                     -- nothing to infer $1's type from and refuses the whole
-                     -- statement, which this failed silently on until the
-                     -- limiter was measured rather than assumed.
-                     select $1::text,
-                            case when level >= 1 then level - 1 else level end,
+                "insert into tarsk_buckets as b (task, tokens, seen, took)
+                 values ($1, $2 - 1::float8, now(), true)
+                 on conflict (task) do update set (tokens, took, seen) = (
+                     select case when level >= 1 then level - 1 else level end,
+                            level >= 1,
                             now()
-                       from refill
-                     on conflict (task) do update
-                        set tokens = excluded.tokens, seen = excluded.seen
-                     returning 1
-                 )
-                 select level from refill, taken",
+                       from (select least($2,
+                                b.tokens + greatest(0::float8,
+                                    extract(epoch from now() - b.seen)::float8) * $3
+                             ) as level) refill)
+                 returning took, tokens",
                 &[&task, &(burst as f64), &per_sec],
             )
             .await?;
-        let level: f64 = row.get(0);
-        if level >= 1.0 {
+        if row.get::<_, bool>(0) {
             Ok(0)
         } else {
+            let level: f64 = row.get(1);
             Ok(((1.0 - level) / per_sec * 1000.0).ceil() as u64)
         }
     }

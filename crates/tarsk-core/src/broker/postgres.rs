@@ -1,0 +1,766 @@
+//! Postgres.
+
+use super::*;
+
+/// One table, because the 5-minute `max_timeout` cap (spec §9) means a lease
+/// never needs renewing. `awa` splits ready / deferred / lease / tombstone
+/// tables to support heartbeats and mutable attempt state; none of that is
+/// reachable when a lease cannot outlive a known ceiling.
+const PG_SCHEMA: &str = "
+-- This whole batch is one implicit transaction, so the lock makes workers that
+-- start together set the schema up one at a time instead of racing each other
+-- into duplicate-object errors.
+select pg_advisory_xact_lock(7401001);
+create table if not exists tarsk_schema (stamp bigint primary key);
+create table if not exists tarsk_jobs (
+    id          bigserial primary key,
+    job_id      text        not null,
+    queue       text        not null,
+    name        text        not null,
+    payload     bytea       not null,
+    timeout_ms  integer     not null,
+    chain       bytea,
+    attempt     integer     not null default 0,
+    run_lease   bigint      not null default 0,
+    lease_until timestamptz,
+    created_at  timestamptz not null default now()
+);
+-- Before the indexes, not after. `alter table` takes the strongest lock there
+-- is and `create index` a weaker one that still blocks writers; taken in that
+-- order inside this one transaction, a worker mid-claim and a process just
+-- connecting each ended up waiting on the other, and Postgres killed one.
+alter table tarsk_jobs add column if not exists chain      bytea;
+alter table tarsk_jobs add column if not exists claimed_by text;
+alter table tarsk_jobs add column if not exists meta       bytea;
+alter table tarsk_jobs add column if not exists expires_ms bigint not null default 0;
+create index if not exists tarsk_jobs_ready on tarsk_jobs (queue, id) where lease_until is null;
+create index if not exists tarsk_jobs_leased on tarsk_jobs (lease_until) where lease_until is not null;
+
+create table if not exists tarsk_cron (
+    name    text   not null,
+    minute  bigint not null,
+    primary key (name, minute)
+);
+
+create table if not exists tarsk_results (
+    id         text        primary key,
+    blob       bytea       not null,
+    expires_at timestamptz not null
+);
+create index if not exists tarsk_results_expiry on tarsk_results (expires_at);
+
+create table if not exists tarsk_dead (
+    id          bigint      primary key,
+    queue       text        not null,
+    name        text        not null,
+    payload     bytea       not null,
+    attempt     integer     not null,
+    error       text        not null,
+    traceback   text        not null,
+    died_at     timestamptz not null default now()
+);
+-- job_id and timeout_ms were not kept until the dead letters could be read
+-- back. Nothing noticed, because nothing read them: a store you can only write
+-- to cannot tell you it is missing a column. Added separately from the CREATE
+-- so a table made by an earlier version gains them too.
+create table if not exists tarsk_dedup (
+    key        text        primary key,
+    job_id     text        not null,
+    expires_at timestamptz not null
+);
+create index if not exists tarsk_dedup_expiry on tarsk_dedup (expires_at);
+create table if not exists tarsk_slots (
+    task       text        not null,
+    job_id     text        not null,
+    expires_at timestamptz not null,
+    primary key (task, job_id)
+);
+create index if not exists tarsk_slots_expiry on tarsk_slots (expires_at);
+create table if not exists tarsk_buckets (
+    task   text             primary key,
+    tokens double precision not null,
+    seen   timestamptz      not null
+);
+create table if not exists tarsk_revoked (
+    id         text        primary key,
+    queue      text        not null,
+    expires_at timestamptz not null
+);
+create index if not exists tarsk_revoked_expiry on tarsk_revoked (expires_at);
+alter table tarsk_dead add column if not exists job_id     text;
+alter table tarsk_dead add column if not exists timeout_ms integer not null default 0;
+alter table tarsk_dead add column if not exists chain      bytea;
+alter table tarsk_dead add column if not exists meta       bytea;
+alter table tarsk_dead add column if not exists expires_ms bigint not null default 0;
+alter table tarsk_buckets add column if not exists took boolean not null default false;
+-- A function because the cap needs lock, then count, then insert, and a single
+-- statement cannot do that: its snapshot is taken before it waits for the
+-- lock, so the count would not see the insert it had just waited behind. Each
+-- statement in a plpgsql body gets a fresh one.
+create or replace function tarsk_acquire_slot(
+    p_task text, p_job text, p_max bigint, p_secs double precision
+) returns boolean language plpgsql as $tarsk$
+begin
+    perform pg_advisory_xact_lock(hashtext('tarsk_slots:' || p_task));
+    delete from tarsk_slots where expires_at <= now();
+    if (select count(*) from tarsk_slots
+         where task = p_task and job_id <> p_job) >= p_max then
+        return false;
+    end if;
+    insert into tarsk_slots (task, job_id, expires_at)
+    values (p_task, p_job, now() + make_interval(secs => p_secs))
+    on conflict (task, job_id) do update set expires_at = excluded.expires_at;
+    return true;
+end
+$tarsk$;
+";
+
+/// FNV-1a of the schema text: changes whenever the schema does, with nobody
+/// having to remember to bump a number.
+fn schema_stamp() -> i64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in PG_SCHEMA.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash as i64
+}
+
+/// Claiming and reclaiming are the same statement: a lease that has run out is
+/// indistinguishable from one that was never taken, so expiry needs no sweep.
+const PG_CLAIM: &str = "
+with picked as (
+    select id,
+           -- The moment this became runnable, captured before the update
+           -- overwrites it: lease_until is when a delayed job came due or a
+           -- lost lease lapsed, and null means it was runnable when written.
+           coalesce(lease_until, created_at) as ready_at
+      from tarsk_jobs
+     where queue = any($1) and (lease_until is null or lease_until < now())
+     -- Priority before age: `--queues high,low` is an ordering, and
+     -- array_position turns it into one the planner can sort by. Strict here
+     -- in a way Redis cannot be, because this claims one row at a time and so
+     -- never holds a batch of the wrong queue.
+     order by array_position($1::text[], queue), id
+       for update skip locked
+     limit 1
+)
+update tarsk_jobs set
+    lease_until = now() + make_interval(secs => timeout_ms / 1000.0 + $2::double precision),
+    attempt     = attempt + 1,
+    run_lease   = run_lease + 1,
+    claimed_by  = $3
+from picked
+where tarsk_jobs.id = picked.id
+returning tarsk_jobs.id, name, payload, attempt, run_lease, job_id, picked.ready_at,
+          chain, meta, expires_ms
+";
+
+pub struct PgBroker {
+    /// Replaced when the server goes away. A `Client` whose connection has
+    /// ended fails every query from then on, and nothing short of a new one
+    /// brings it back.
+    link: tokio::sync::Mutex<Arc<tokio_postgres::Client>>,
+    url: String,
+    pub(super) queues: Vec<String>,
+    stores: AtomicU64,
+    /// The same identity Redis gets for free from its consumer group. Postgres
+    /// has no equivalent, so a claim writes it down.
+    consumer: String,
+}
+
+impl PgBroker {
+    async fn open(url: &str) -> Res<tokio_postgres::Client> {
+        // A TLS connector is always supplied, which is not the same as always
+        // using TLS: tokio-postgres reads sslmode from the URL and defaults to
+        // `prefer`, so a local server without TLS still connects and a managed
+        // one gets an encrypted link. Before this, `sslmode=require` failed
+        // with "error performing TLS handshake" — loudly, at least, rather than
+        // quietly in the clear, but it meant no managed Postgres at all.
+        // The system trust store, so `sslmode=verify-full` has roots to check
+        // against. Individual certificates that fail to load are ignored the
+        // way every other client does: one unparseable file in /etc/ssl should
+        // not stop a connection the rest of the store can verify.
+        let (tls, _ignored) = tokio_postgres_rustls::MakeRustlsConnect::with_native_certs()
+            .map_err(|errors| format!("could not read the system certificate store: {errors:?}"))?;
+        // tokio-postgres knows disable, prefer and require, and rejects the
+        // whole string on verify-ca or verify-full — which is what a managed
+        // provider's copy-paste connection string usually says. They are mapped
+        // to require rather than refused, and that is not a downgrade: rustls
+        // checks the chain and the hostname on every handshake, so what this
+        // driver calls require is what libpq calls verify-full.
+        let url = url
+            .replace("sslmode=verify-full", "sslmode=require")
+            .replace("sslmode=verify-ca", "sslmode=require");
+        let (client, connection) = tokio_postgres::connect(&url, tls).await?;
+        // The connection future drives the socket; dropping it closes the link.
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        // The DDL takes table locks every running worker has to wait behind,
+        // so it runs when the schema text has changed and not on every
+        // connection. A missing table is an error here, and means "never set
+        // up" as surely as a missing row does.
+        let stamp = schema_stamp();
+        let current = client
+            .query_opt("select 1 from tarsk_schema where stamp = $1", &[&stamp])
+            .await;
+        if !matches!(current, Ok(Some(_))) {
+            client.batch_execute(PG_SCHEMA).await?;
+            client
+                .execute(
+                    "insert into tarsk_schema (stamp) values ($1) on conflict do nothing",
+                    &[&stamp],
+                )
+                .await?;
+        }
+        Ok(client)
+    }
+
+    pub(super) async fn connect(url: &str, queues: Vec<String>) -> Res<PgBroker> {
+        Ok(PgBroker {
+            consumer: format!("tarsk-{}", std::process::id()),
+            link: tokio::sync::Mutex::new(Arc::new(Self::open(url).await?)),
+            url: url.to_string(),
+            queues,
+            stores: AtomicU64::new(0),
+        })
+    }
+
+    /// The live client, reconnecting first if the last one died.
+    ///
+    /// Held behind a lock so a restart is met with one reconnect rather than
+    /// one per waiting caller. While the server is still down this fails like
+    /// any other query, and the next call tries again.
+    async fn db(&self) -> Res<Arc<tokio_postgres::Client>> {
+        let mut link = self.link.lock().await;
+        if link.is_closed() {
+            *link = Arc::new(Self::open(&self.url).await?);
+        }
+        Ok(link.clone())
+    }
+
+    /// A delay needs no schedule table: the lease column is already a
+    /// visibility timer, so a row leased into the future is simply not claimed
+    /// until then.
+    pub(super) async fn push(&self, job: NewJob, delay: Duration) -> Res<()> {
+        self.db()
+            .await?
+            .execute(
+                "insert into tarsk_jobs
+                     (job_id, queue, name, payload, timeout_ms, lease_until, chain, meta,
+                      expires_ms)
+                 values ($6, $1, $2, $3, $4, case when $5::double precision > 0
+                     then now() + make_interval(secs => $5::double precision) else null end,
+                     $7, $8, $9)",
+                &[
+                    &job.queue,
+                    &job.name,
+                    &job.payload,
+                    &(job.timeout_ms as i32),
+                    &delay.as_secs_f64(),
+                    &job.id,
+                    &job.chain,
+                    &job.meta,
+                    &(job.expires_ms as i64),
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub(super) async fn claim(&self, grace: Duration, block: Duration) -> Res<Option<Delivery>> {
+        // ponytail: polls. LISTEN/NOTIFY is the upgrade and would cut idle
+        // pickup latency to the round trip; it costs a dedicated connection to
+        // hold the notification stream, which is not worth it until someone
+        // measures the wait.
+        let deadline = tokio::time::Instant::now() + block;
+        loop {
+            let rows = self
+                .db()
+                .await?
+                .query(
+                    PG_CLAIM,
+                    &[&self.queues, &grace.as_secs_f64(), &self.consumer],
+                )
+                .await?;
+            if let Some(row) = rows.first() {
+                let run_lease: i64 = row.get(4);
+                let ready: std::time::SystemTime = row.get(6);
+                return Ok(Some(Delivery {
+                    id: row.get(5),
+                    name: row.get(1),
+                    payload: row.get(2),
+                    attempt: row.get::<_, i32>(3) as u32,
+                    ready_at_ms: ready
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0),
+                    chain: row.get::<_, Option<Vec<u8>>>(7).unwrap_or_default(),
+                    meta: row.get::<_, Option<Vec<u8>>>(8).unwrap_or_default(),
+                    expires_ms: row.get::<_, i64>(9).max(0) as u64,
+                    receipt: Receipt::Postgres {
+                        row: row.get(0),
+                        run_lease,
+                    },
+                }));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(None);
+            }
+            tokio::time::sleep(Duration::from_millis(25).min(block)).await;
+        }
+    }
+
+    pub(super) async fn ack(&self, receipt: &Receipt) -> Res<()> {
+        let Receipt::Postgres { row, run_lease } = receipt else {
+            return Err("not a postgres receipt".into());
+        };
+        // The run_lease guard: nothing happens if this job was reclaimed and
+        // re-run while we were away.
+        self.db()
+            .await?
+            .execute(
+                "delete from tarsk_jobs where id = $1 and run_lease = $2",
+                &[row, run_lease],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// The lease column doubles as the visibility timer: a row leased into the
+    /// future is invisible to `claim` until then, so backoff needs no separate
+    /// schedule. Zero delay clears it and the row is claimable immediately.
+    pub(super) async fn requeue(&self, receipt: &Receipt, delay: Duration) -> Res<()> {
+        self.requeue_as(receipt, delay, 0).await
+    }
+
+    /// `refund` is how many attempts to give back: one for a deferral, which
+    /// the claim counted and the job did not spend. See `Broker::defer`.
+    pub(super) async fn requeue_as(
+        &self,
+        receipt: &Receipt,
+        delay: Duration,
+        refund: i32,
+    ) -> Res<()> {
+        let Receipt::Postgres { row, run_lease } = receipt else {
+            return Err("not a postgres receipt".into());
+        };
+        self.db()
+            .await?
+            .execute(
+                "update tarsk_jobs set lease_until = case when $3::double precision > 0
+                     then now() + make_interval(secs => $3::double precision) else null end,
+                     attempt = greatest(attempt - $4, 0)
+                 where id = $1 and run_lease = $2",
+                &[row, run_lease, &delay.as_secs_f64(), &refund],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub(super) async fn claim_tick(&self, name: &str, minute: i64) -> Res<bool> {
+        // The primary key is the election: exactly one insert can succeed.
+        let inserted = self
+            .db()
+            .await?
+            .execute(
+                "insert into tarsk_cron (name, minute) values ($1, $2) on conflict do nothing",
+                &[&name, &minute],
+            )
+            .await?;
+        if inserted == 1 {
+            self.db()
+                .await?
+                .execute(
+                    "delete from tarsk_cron where minute < $1",
+                    &[&(minute - 120)],
+                )
+                .await?;
+        }
+        Ok(inserted == 1)
+    }
+
+    pub(super) async fn store_result(&self, id: &str, blob: Vec<u8>, ttl: Duration) -> Res<()> {
+        self.db()
+            .await?
+            .execute(
+                "insert into tarsk_results (id, blob, expires_at)
+                 values ($1, $2, now() + make_interval(secs => $3::double precision))
+                 on conflict (id) do update set blob = excluded.blob,
+                                                expires_at = excluded.expires_at",
+                &[&id, &blob, &ttl.as_secs_f64()],
+            )
+            .await?;
+        // Postgres has no TTL of its own, so expiry has to be swept. Every
+        // 256th write keeps it off the hot path without needing a scheduler.
+        if self
+            .stores
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(256)
+        {
+            self.db()
+                .await?
+                .execute("delete from tarsk_results where expires_at < now()", &[])
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub(super) async fn get_result(&self, id: &str) -> Res<Option<Vec<u8>>> {
+        let rows = self
+            .db()
+            .await?
+            .query(
+                "select blob from tarsk_results where id = $1 and expires_at > now()",
+                &[&id],
+            )
+            .await?;
+        Ok(rows.first().map(|row| row.get(0)))
+    }
+
+    /// One statement, so the row cannot be in both tables or neither.
+    pub(super) async fn jobs(&self, queues: &[String], limit: usize) -> Res<Vec<Listed>> {
+        // The same three states the depth query counts, named here instead.
+        // extract(epoch) is milliseconds since the row became relevant:
+        // positive for time waited, negative for time still to wait.
+        let rows = self
+            .db()
+            .await?
+            .query(
+                "select job_id, queue, name, attempt,
+                        case when lease_until is null or lease_until < now() then 'ready'
+                             when run_lease > 0 then 'running'
+                             else 'delayed' end as state,
+                        (extract(epoch from
+                            now() - coalesce(lease_until, created_at)) * 1000)::bigint as age_ms,
+                        coalesce(claimed_by, '') as worker, meta
+                   from tarsk_jobs
+                  where queue = any($1)
+                  order by id
+                  limit $2",
+                &[&queues, &(limit as i64)],
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|r| Listed {
+                id: r.get(0),
+                queue: r.get(1),
+                name: r.get(2),
+                attempt: r.get::<_, i32>(3).max(0) as u32,
+                state: match r.get::<_, &str>(4) {
+                    "running" => "running",
+                    "delayed" => "delayed",
+                    _ => "ready",
+                },
+                age_ms: r.get(5),
+                worker: if r.get::<_, &str>(4) == "running" {
+                    r.get(6)
+                } else {
+                    String::new()
+                },
+                meta: r.get::<_, Option<Vec<u8>>>(7).unwrap_or_default(),
+            })
+            .collect())
+    }
+
+    pub(super) async fn depth(&self, queues: &[String]) -> Res<Vec<Depth>> {
+        // run_lease separates the two kinds of future lease_until: a delayed
+        // job has never been claimed, an in-flight one has. Without it the
+        // backlog and the work in progress look identical.
+        let rows = self
+            .db()
+            .await?
+            .query(
+                "select queue,
+                        count(*) filter (where lease_until is null or lease_until < now()),
+                        count(*) filter (where lease_until >= now() and run_lease > 0),
+                        count(*) filter (where lease_until >= now() and run_lease = 0)
+                   from tarsk_jobs where queue = any($1) group by queue",
+                &[&queues],
+            )
+            .await?;
+        let dead = self
+            .db()
+            .await?
+            .query(
+                "select queue, count(*) from tarsk_dead where queue = any($1) group by queue",
+                &[&queues],
+            )
+            .await?;
+        let mut out = Vec::new();
+        for queue in queues {
+            let row = rows.iter().find(|r| r.get::<_, String>(0) == *queue);
+            let buried = dead
+                .iter()
+                .find(|r| r.get::<_, String>(0) == *queue)
+                .map(|r| r.get::<_, i64>(1))
+                .unwrap_or(0);
+            out.push(Depth {
+                queue: queue.clone(),
+                ready: row.map(|r| r.get::<_, i64>(1)).unwrap_or(0).max(0) as u64,
+                in_flight: row.map(|r| r.get::<_, i64>(2)).unwrap_or(0).max(0) as u64,
+                delayed: row.map(|r| r.get::<_, i64>(3)).unwrap_or(0).max(0) as u64,
+                dead: buried.max(0) as u64,
+            });
+        }
+        Ok(out)
+    }
+
+    pub(super) async fn claim_dedup(
+        &self,
+        key: &str,
+        job_id: &str,
+        ttl_ms: u64,
+    ) -> Res<Option<String>> {
+        let rows = self
+            .db()
+            .await?
+            .query(
+                // The upsert is the reservation. `do update … where` reads the
+                // row as it is now, under its lock, so an expired window is
+                // taken over by exactly one caller and a live one is left
+                // alone — which a separate delete of expired rows could not
+                // promise, since the insert beside it never saw the delete.
+                "insert into tarsk_dedup as d (key, job_id, expires_at)
+                 values ($1, $2, now() + make_interval(secs => $3))
+                 on conflict (key) do update
+                    set job_id = excluded.job_id, expires_at = excluded.expires_at
+                  where d.expires_at <= now()
+                 returning job_id",
+                &[&key, &job_id, &(ttl_ms.max(1) as f64 / 1000.0)],
+            )
+            .await?;
+        if !rows.is_empty() {
+            return Ok(None); // inserted, so this caller owns the window
+        }
+        let held = self
+            .db()
+            .await?
+            .query(
+                "select job_id from tarsk_dedup where key = $1 and expires_at > now()",
+                &[&key],
+            )
+            .await?;
+        Ok(held.first().map(|r| r.get(0)))
+    }
+
+    pub(super) async fn release_dedup(&self, key: &str, job_id: &str) -> Res<()> {
+        self.db()
+            .await?
+            .execute(
+                "delete from tarsk_dedup where key = $1 and job_id = $2",
+                &[&key, &job_id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub(super) async fn acquire_slot(
+        &self,
+        task: &str,
+        job_id: &str,
+        max: u32,
+        lease_ms: u64,
+    ) -> Res<bool> {
+        // Lock, prune, count and insert, indivisibly — see the function in
+        // PG_SCHEMA for why that is a function rather than one statement. A
+        // redelivery renews its own slot rather than being refused by it.
+        let row = self
+            .db()
+            .await?
+            .query_one(
+                "select tarsk_acquire_slot($1, $2, $3, $4)",
+                &[
+                    &task,
+                    &job_id,
+                    &(max as i64),
+                    &(lease_ms.max(1) as f64 / 1000.0),
+                ],
+            )
+            .await?;
+        Ok(row.get(0))
+    }
+
+    pub(super) async fn release_slot(&self, task: &str, job_id: &str) -> Res<()> {
+        self.db()
+            .await?
+            .execute(
+                "delete from tarsk_slots where task = $1 and job_id = $2",
+                &[&task, &job_id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub(super) async fn take_token(&self, task: &str, per_sec: f64, burst: u32) -> Res<u64> {
+        // The refill is computed inside `do update`, from the row as it is
+        // under its lock. Reading the bucket first and writing back a number
+        // worked out from that read let two workers both see the last token.
+        // `took` says whether this call got one, which the level after the
+        // take cannot: 0.4 left is either a refusal or the change from 1.4.
+        let row = self
+            .db()
+            .await?
+            .query_one(
+                "insert into tarsk_buckets as b (task, tokens, seen, took)
+                 values ($1, $2 - 1::float8, now(), true)
+                 on conflict (task) do update set (tokens, took, seen) = (
+                     select case when level >= 1 then level - 1 else level end,
+                            level >= 1,
+                            now()
+                       from (select least($2,
+                                b.tokens + greatest(0::float8,
+                                    extract(epoch from now() - b.seen)::float8) * $3
+                             ) as level) refill)
+                 returning took, tokens",
+                &[&task, &(burst as f64), &per_sec],
+            )
+            .await?;
+        if row.get::<_, bool>(0) {
+            Ok(0)
+        } else {
+            let level: f64 = row.get(1);
+            Ok(((1.0 - level) / per_sec * 1000.0).ceil() as u64)
+        }
+    }
+
+    pub(super) async fn revoke(&self, queue: &str, id: &str, ttl_ms: u64) -> Res<()> {
+        self.db()
+            .await?
+            .execute(
+                "insert into tarsk_revoked (id, queue, expires_at)
+                 values ($1, $2, now() + make_interval(secs => $3))
+                 on conflict (id) do update
+                    set expires_at = excluded.expires_at, queue = excluded.queue",
+                &[&id, &queue, &(ttl_ms as f64 / 1000.0)],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub(super) async fn revoked_all(&self) -> Res<Vec<String>> {
+        self.db()
+            .await?
+            .execute("delete from tarsk_revoked where expires_at <= now()", &[])
+            .await?;
+        // Every id, whatever queue the caller named: an id is unique on its
+        // own, and filtering by queue made a cancel with the wrong one a
+        // success that changed nothing.
+        let rows = self
+            .db()
+            .await?
+            .query("select id from tarsk_revoked", &[])
+            .await?;
+        Ok(rows.iter().map(|r| r.get(0)).collect())
+    }
+
+    pub(super) async fn dead_list(&self, queue: &str, limit: usize) -> Res<Vec<Dead>> {
+        let rows = self
+            .db()
+            .await?
+            .query(
+                "select id, name, error, traceback,
+                        (extract(epoch from died_at) * 1000)::bigint as died_ms
+                   from tarsk_dead where queue = $1
+                  order by died_at desc limit $2",
+                &[&queue, &(limit as i64)],
+            )
+            .await?;
+        let mut out: Vec<Dead> = rows
+            .iter()
+            .map(|r| Dead {
+                id: r.get::<_, i64>(0).to_string(),
+                name: r.get(1),
+                error: r.get(2),
+                traceback: r.get(3),
+                died_at_ms: r.get::<_, i64>(4).max(0) as u64,
+            })
+            .collect();
+        out.reverse();
+        Ok(out)
+    }
+
+    pub(super) async fn dead_replay(&self, queue: &str, ids: &[String]) -> Res<usize> {
+        // Back onto the live table with the lease cleared, inside one statement
+        // so nothing can observe a job in both places.
+        let picked: Vec<i64> = ids.iter().filter_map(|i| i.parse().ok()).collect();
+        // A fresh row rather than the old id: bigserial hands out the next one,
+        // and reusing a primary key that a result or a log still refers to
+        // would quietly merge two runs of the same job into one identity.
+        let sql = "with gone as (
+                       delete from tarsk_dead
+                        where queue = $1 and ($2::bigint[] = '{}' or id = any($2))
+                    returning job_id, queue, name, payload, timeout_ms, chain, meta,
+                              expires_ms)
+                   insert into tarsk_jobs
+                       (job_id, queue, name, payload, timeout_ms, attempt, lease_until,
+                        chain, meta, expires_ms)
+                   select coalesce(job_id, ''), queue, name, payload, timeout_ms, 0, null,
+                          chain, meta, expires_ms
+                     from gone";
+        let n = self.db().await?.execute(sql, &[&queue, &picked]).await?;
+        Ok(n as usize)
+    }
+
+    pub(super) async fn dead_purge(&self, queue: &str, ids: &[String]) -> Res<usize> {
+        let picked: Vec<i64> = ids.iter().filter_map(|i| i.parse().ok()).collect();
+        let n = self
+            .db()
+            .await?
+            .execute(
+                "delete from tarsk_dead
+                  where queue = $1 and ($2::bigint[] = '{}' or id = any($2))",
+                &[&queue, &picked],
+            )
+            .await?;
+        Ok(n as usize)
+    }
+
+    pub(super) async fn dead_letter(
+        &self,
+        receipt: &Receipt,
+        error: &str,
+        traceback: &str,
+        keep: u64,
+    ) -> Res<()> {
+        let Receipt::Postgres { row, run_lease } = receipt else {
+            return Err("not a postgres receipt".into());
+        };
+        self.db()
+            .await?
+            .execute(
+                "with gone as (
+                     delete from tarsk_jobs where id = $1 and run_lease = $2
+                     returning id, job_id, queue, name, payload, timeout_ms, attempt,
+                               chain, meta, expires_ms
+                 )
+                 insert into tarsk_dead
+                     (id, job_id, queue, name, payload, timeout_ms, attempt, error, traceback,
+                      chain, meta, expires_ms)
+                 select id, job_id, queue, name, payload, timeout_ms, attempt, $3, $4,
+                        chain, meta, expires_ms
+                   from gone
+                 on conflict (id) do nothing",
+                &[row, run_lease, &error, &traceback],
+            )
+            .await?;
+        if keep > 0 {
+            // Trimmed on write like the Redis side, rather than on a timer:
+            // the row that pushes a queue over its cap is the one that should
+            // pay for the trim, and nothing else has to remember to run.
+            self.db()
+                .await?
+                .execute(
+                    "delete from tarsk_dead where id in (
+                         select id from tarsk_dead
+                          where queue = (select queue from tarsk_dead where id = $1)
+                          order by died_at desc offset $2)",
+                    &[row, &(keep as i64)],
+                )
+                .await?;
+        }
+        Ok(())
+    }
+}

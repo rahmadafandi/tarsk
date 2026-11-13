@@ -60,7 +60,7 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       # Default features are memory-only now, so the backends need naming or
-      # CI would stop compiling three quarters of broker.rs.
+      # CI would stop compiling three of the four broker modules.
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --lib
       - run: cargo test --lib --all-features

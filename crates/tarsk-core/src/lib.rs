@@ -1700,15 +1700,18 @@ async fn serve_inner(
                 // moment. Draining an idle child gets there just as well and
                 // costs nothing, so only work in flight is worth killing over.
                 if cfg.hard_max_rss > 0 && reading.rss.is_some_and(|b| b >= cfg.hard_max_rss) {
+                    if !inflight.is_empty() {
+                        // No waiting for a replacement that is still starting:
+                        // the child being killed is growing while it does, and
+                        // this is the limit that exists to protect the box. A
+                        // spare that arrives later finds nobody listening and
+                        // is dropped, which kills it.
+                        return Served { exit: Exit::OverHardLimit, spare };
+                    }
                     if spare.is_none() && arming {
                         spare = spare_rx.recv().await.flatten();
                     }
-                    let exit = if !inflight.is_empty() {
-                        Exit::OverHardLimit
-                    } else {
-                        Exit::Recycle("hard_max_rss")
-                    };
-                    return Served { exit, spare };
+                    return Served { exit: Exit::Recycle("hard_max_rss"), spare };
                 }
                 if let Some(reason) = reading.trigger {
                     if spare.is_none() && arming {

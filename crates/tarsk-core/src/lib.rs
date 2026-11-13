@@ -461,9 +461,16 @@ impl Shared {
             // Before the ack, so a crash between the two redelivers this step
             // rather than losing the rest of the chain. That can run a step
             // twice, which is the at-least-once this queue already promises.
-            self.advance_chain(&job, &outcome).await;
-            if self.broker.ack(&job.receipt).await.is_err() {
-                self.counters.broker_errors.fetch_add(1, Ordering::Relaxed);
+            //
+            // A push that *failed* gets the same treatment as one that never
+            // happened: no ack, so the lease runs out and this step comes back
+            // to try the hand-over again. Acking here dropped the rest of the
+            // chain with nothing but a counter to show for it.
+            if !self.advance_chain(&job, &outcome).await {
+                return;
+            }
+            if let Err(err) = self.broker.ack(&job.receipt).await {
+                self.broker_error("ack", err.as_ref());
             }
             self.record(job.task_id, outcome);
             return;
@@ -492,19 +499,23 @@ impl Shared {
     /// caller can hold a handle to the last one's result while the first is
     /// still being written. The supervisor only moves data: it never has to
     /// know what any of these names mean (spec §4.1).
-    async fn advance_chain(&self, job: &Job, outcome: &Outcome) {
+    ///
+    /// False only when there was a next step and the broker refused it. A
+    /// chain that cannot be read is not that: redelivering would not make it
+    /// readable, so the step still settles.
+    async fn advance_chain(&self, job: &Job, outcome: &Outcome) -> bool {
         if job.chain.is_empty() {
-            return;
+            return true;
         }
         let Ok(Value::Array(steps)) = rmpv::decode::read_value(&mut job.chain.as_slice()) else {
-            return;
+            return true;
         };
         let Some((next, rest)) = steps.split_first() else {
-            return;
+            return true;
         };
-        let Value::Array(f) = next else { return };
+        let Value::Array(f) = next else { return true };
         if f.len() < 6 {
-            return;
+            return true;
         }
         let (id, name, payload, timeout_ms, queue, feed) = (
             f[0].as_str().unwrap_or_default().to_string(),
@@ -541,11 +552,12 @@ impl Shared {
         if self.batch() {
             self.total.fetch_add(1, Ordering::SeqCst);
         }
-        if self.broker.push(next_job, Duration::ZERO).await.is_err() {
-            self.counters.broker_errors.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.counters.chained.fetch_add(1, Ordering::Relaxed);
+        if let Err(err) = self.broker.push(next_job, Duration::ZERO).await {
+            self.broker_error("queueing the next chain step", err.as_ref());
+            return false;
         }
+        self.counters.chained.fetch_add(1, Ordering::Relaxed);
+        true
     }
 
     /// A child died holding this job (spec §4.4) — same policy as any other
@@ -2090,12 +2102,23 @@ pub async fn supervise_until(
                             // caller to have asked for anything else.
                             expires_ms: 0,
                         };
-                        if shared.broker.push(job, Duration::ZERO).await.is_err() {
-                            shared
-                                .counters
-                                .broker_errors
-                                .fetch_add(1, Ordering::Relaxed);
-                        } else {
+                        // The election is already won, so nobody else will fire
+                        // this minute: a push that fails once has to be tried
+                        // again here or the run is skipped fleet-wide.
+                        let mut pushed = false;
+                        for _ in 0..3 {
+                            match shared.broker.push(job.clone(), Duration::ZERO).await {
+                                Ok(()) => {
+                                    pushed = true;
+                                    break;
+                                }
+                                Err(err) => {
+                                    shared.broker_error("queueing a cron run", err.as_ref());
+                                    tokio::time::sleep(Duration::from_secs(1)).await;
+                                }
+                            }
+                        }
+                        if pushed {
                             shared.counters.cron_fired.fetch_add(1, Ordering::Relaxed);
                         }
                     }

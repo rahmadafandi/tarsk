@@ -2596,7 +2596,11 @@ impl RedisBroker {
                 continue;
             }
             let (name, payload, timeout_ms) = entry_fields(entry);
+            // Entries buried before these fields were kept have none of them;
+            // the dead id stands in for the job's, as it always did.
             let job_id: String = entry.get("i").unwrap_or_else(|| entry.id.clone());
+            let chain: Vec<u8> = entry.get("c").unwrap_or_default();
+            let meta: Vec<u8> = entry.get("m").unwrap_or_default();
             // XADD then XDEL in one MULTI: a crash between them would either
             // lose the job or leave it in both places, and both are worse than
             // this being one round trip slower.
@@ -2613,6 +2617,12 @@ impl RedisBroker {
                 .arg(timeout_ms)
                 .arg("i")
                 .arg(&job_id)
+                .arg("c")
+                .arg(&chain)
+                .arg("m")
+                .arg(&meta)
+                .arg("x")
+                .arg(entry_expires(entry))
                 .cmd("XDEL")
                 .arg(&grave)
                 .arg(&entry.id)
@@ -2666,11 +2676,16 @@ impl RedisBroker {
             .arg(id)
             .query_async(&mut conn)
             .await?;
-        let (name, payload, timeout_ms) = entries
-            .ids
-            .first()
+        let entry = entries.ids.first();
+        let (name, payload, timeout_ms) = entry
             .map(entry_fields)
             .unwrap_or_else(|| (String::new(), Vec::new(), 0));
+        // Kept so a replay is the same job: its id is where the caller is
+        // waiting for a result, and its chain is the work still owed after it.
+        let job_id = entry.map(entry_id).unwrap_or_default();
+        let chain: Vec<u8> = entry.and_then(|e| e.get("c")).unwrap_or_default();
+        let meta: Vec<u8> = entry.and_then(|e| e.get("m")).unwrap_or_default();
+        let expires_ms = entry.map(entry_expires).unwrap_or(0);
         let mut trim: Vec<String> = Vec::new();
         if keep > 0 {
             // Approximate trimming, which Redis does at whole-node granularity
@@ -2693,6 +2708,14 @@ impl RedisBroker {
             .arg(payload)
             .arg("t")
             .arg(timeout_ms)
+            .arg("i")
+            .arg(job_id)
+            .arg("c")
+            .arg(chain)
+            .arg("m")
+            .arg(meta)
+            .arg("x")
+            .arg(expires_ms)
             .arg("e")
             .arg(error)
             .arg("tb")
@@ -3505,10 +3528,13 @@ impl PgBroker {
         let sql = "with gone as (
                        delete from tarsk_dead
                         where queue = $1 and ($2::bigint[] = '{}' or id = any($2))
-                    returning job_id, queue, name, payload, timeout_ms)
+                    returning job_id, queue, name, payload, timeout_ms, chain, meta,
+                              expires_ms)
                    insert into tarsk_jobs
-                       (job_id, queue, name, payload, timeout_ms, attempt, lease_until)
-                   select coalesce(job_id, ''), queue, name, payload, timeout_ms, 0, null
+                       (job_id, queue, name, payload, timeout_ms, attempt, lease_until,
+                        chain, meta, expires_ms)
+                   select coalesce(job_id, ''), queue, name, payload, timeout_ms, 0, null,
+                          chain, meta, expires_ms
                      from gone";
         let n = self.db().await?.execute(sql, &[&queue, &picked]).await?;
         Ok(n as usize)
@@ -3543,11 +3569,15 @@ impl PgBroker {
             .execute(
                 "with gone as (
                      delete from tarsk_jobs where id = $1 and run_lease = $2
-                     returning id, job_id, queue, name, payload, timeout_ms, attempt
+                     returning id, job_id, queue, name, payload, timeout_ms, attempt,
+                               chain, meta, expires_ms
                  )
                  insert into tarsk_dead
-                     (id, job_id, queue, name, payload, timeout_ms, attempt, error, traceback)
-                 select id, job_id, queue, name, payload, timeout_ms, attempt, $3, $4 from gone
+                     (id, job_id, queue, name, payload, timeout_ms, attempt, error, traceback,
+                      chain, meta, expires_ms)
+                 select id, job_id, queue, name, payload, timeout_ms, attempt, $3, $4,
+                        chain, meta, expires_ms
+                   from gone
                  on conflict (id) do nothing",
                 &[row, run_lease, &error, &traceback],
             )

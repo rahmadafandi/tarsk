@@ -234,12 +234,15 @@ struct Producer {
 #[pymethods]
 impl Producer {
     #[new]
-    fn new(broker_url: String) -> PyResult<Self> {
+    fn new(py: Python<'_>, broker_url: String) -> PyResult<Self> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
-        let broker = runtime
-            .block_on(Broker::connect(&broker_url, Vec::new()))
+        // Without the GIL, like every other call here: connecting to a broker
+        // that does not answer otherwise froze every Python thread in the
+        // process for the length of a TCP timeout.
+        let broker = py
+            .detach(|| runtime.block_on(Broker::connect(&broker_url, Vec::new())))
             .map_err(broker_err)?;
         Ok(Producer { runtime, broker })
     }

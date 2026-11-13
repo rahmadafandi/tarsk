@@ -745,6 +745,18 @@ impl Broker {
         }
     }
 
+    /// Hand back what this worker fetched ahead and will now never start.
+    ///
+    /// Only Redis reads ahead. A worker that stops claiming still owns the
+    /// entries it prefetched, and left alone they sit out their whole lease —
+    /// minutes, at the default timeout — before anyone else may run them.
+    pub async fn release_unstarted(&self) {
+        #[cfg(feature = "redis")]
+        if let Broker::Redis(b) = self {
+            b.release_unstarted().await;
+        }
+    }
+
     /// File a finished task's answer under its id, to expire after `ttl`.
     /// Only called for tasks that asked for it: writing every result to a
     /// broker nobody reads from is most of why Celery feels heavy (spec §2).
@@ -2140,6 +2152,28 @@ impl RedisBroker {
         claim.arg("JUSTID"); // no delivery-count bump: the reclaim will do that
         let _: redis::Value = claim.query_async(&mut conn).await?;
         Ok(())
+    }
+
+    async fn release_unstarted(&self) {
+        let held: Vec<Delivery> = self
+            .claimed
+            .lock()
+            .unwrap()
+            .drain(..)
+            .map(|(delivery, _, _)| delivery)
+            .collect();
+        for delivery in held {
+            // Best effort: one that cannot be handed back is still reclaimed
+            // when its lease runs out, which is what happened to all of them
+            // before this existed.
+            let _ = self
+                .requeue_as(
+                    &delivery.receipt,
+                    Duration::ZERO,
+                    Some(delivery.attempt.saturating_sub(1)),
+                )
+                .await;
+        }
     }
 
     async fn jobs(&self, queues: &[String], limit: usize) -> Res<Vec<Listed>> {

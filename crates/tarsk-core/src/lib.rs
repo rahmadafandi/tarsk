@@ -2108,6 +2108,7 @@ pub async fn supervise_until(
     for handle in slots {
         let _ = handle.await;
     }
+    shared.broker.release_unstarted().await;
     acceptor.abort();
     stopper.abort();
     if let Some(handle) = sweeper {

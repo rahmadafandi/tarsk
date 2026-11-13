@@ -2083,6 +2083,7 @@ pub async fn supervise_until(
         let shared = shared.clone();
         tokio::spawn(async move {
             let mut fired: Option<i64> = None;
+            let mut refused = std::collections::HashSet::new();
             while !shared.done.load(Ordering::SeqCst) {
                 let now = SystemTime::now()
                     .duration_since(SystemTime::UNIX_EPOCH)
@@ -2091,19 +2092,32 @@ pub async fn supervise_until(
                 let minute = now / 60;
                 if fired != Some(minute) {
                     fired = Some(minute);
-                    let due: Vec<(String, Spec)> = shared
+                    let scheduled: Vec<(String, Spec)> = shared
                         .specs
                         .lock()
                         .unwrap()
                         .iter()
                         .filter(|(_, spec)| !spec.cron.is_empty())
-                        .filter_map(|(name, spec)| {
-                            cron::parse(&spec.cron)
-                                .ok()
-                                .filter(|schedule| schedule.matches(minute * 60))
-                                .map(|_| (name.clone(), spec.clone()))
-                        })
+                        .map(|(name, spec)| (name.clone(), spec.clone()))
                         .collect();
+                    let mut due = Vec::new();
+                    for (name, spec) in scheduled {
+                        match cron::parse(&spec.cron) {
+                            Ok(schedule) if schedule.matches(minute * 60) => due.push((name, spec)),
+                            Ok(_) => {}
+                            // Said once per task. A schedule that cannot be
+                            // read never fires, and used to do so in silence.
+                            Err(why) => {
+                                if refused.insert(name.clone()) {
+                                    eprintln!(
+                                        "tarsk: {name} will never run on its schedule: \
+                                         cron {:?} is not valid ({why})",
+                                        spec.cron
+                                    );
+                                }
+                            }
+                        }
+                    }
                     for (name, spec) in due {
                         match shared.broker.claim_tick(&name, minute).await {
                             Ok(true) => {}

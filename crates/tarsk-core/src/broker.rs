@@ -874,10 +874,11 @@ impl LocalCoordination {
     }
 
     fn claim_tick(&self, name: &str, minute: i64) -> bool {
-        self.ticks
-            .lock()
-            .unwrap()
-            .insert((name.to_string(), minute))
+        let mut ticks = self.ticks.lock().unwrap();
+        // Only the last couple of minutes can still be contested; without
+        // this the set grew by one entry per schedule per minute, forever.
+        ticks.retain(|(_, seen)| *seen >= minute - 2);
+        ticks.insert((name.to_string(), minute))
     }
 }
 

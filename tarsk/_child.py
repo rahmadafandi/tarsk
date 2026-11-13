@@ -220,7 +220,7 @@ async def _shutdown(app, writer) -> None:
 
 
 async def _one(app, wire: Wire, app_spec: str, task_id: int, name: str, payload,
-               meta: bytes = b"", attempt: int = 1) -> None:
+               meta: bytes = b"", attempt: int = 1, job_id: str = "") -> None:
     """Run a single dispatched task and report it. Never raises."""
     task = app.registry.get(name)
     if task is None:
@@ -253,7 +253,10 @@ async def _one(app, wire: Wire, app_spec: str, task_id: int, name: str, payload,
 
         ctx = Context(
             name=name,
-            task_id=str(task_id),
+            # The id `send()` returned, so a trace started in `before_send`
+            # continues here. Batch jobs given as bare triples have none, and
+            # fall back to the supervisor's counter for the frame.
+            task_id=job_id or str(task_id),
             attempt=attempt,
             args=tuple(call_args),
             kwargs=call_kwargs,
@@ -369,9 +372,9 @@ async def main(socket_path: str, app_spec: str, child_id: int, slots: int = 1) -
     for _ in range(slots):
         await wire.send("Ready")
 
-    async def run_and_report(task_id, name, payload, meta, attempt):
+    async def run_and_report(task_id, name, payload, meta, attempt, job_id):
         try:
-            await _one(app, wire, app_spec, task_id, name, payload, meta, attempt)
+            await _one(app, wire, app_spec, task_id, name, payload, meta, attempt, job_id)
         except _SyncTimeout:
             # Nothing above is awaiting this task, so the exit has to happen
             # here — letting it settle into the task object would leave the
@@ -396,7 +399,10 @@ async def main(socket_path: str, app_spec: str, child_id: int, slots: int = 1) -
         task_id, name, payload = args[0], args[1], args[2]
         meta = args[3] if len(args) > 3 else b""
         attempt = args[4] if len(args) > 4 else 1
-        job = asyncio.create_task(run_and_report(task_id, name, payload, meta, attempt))
+        job_id = args[5] if len(args) > 5 else ""
+        job = asyncio.create_task(
+            run_and_report(task_id, name, payload, meta, attempt, job_id)
+        )
         running.add(job)
         job.add_done_callback(running.discard)
 

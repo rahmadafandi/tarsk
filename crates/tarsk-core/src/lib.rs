@@ -1529,6 +1529,9 @@ async fn serve_inner(
                     // backoff decisions use, so `ctx.attempt` agrees with why
                     // this delivery happened.
                     Value::from(job.attempt),
+                    // The id `send()` returned. `task_id` above is this
+                    // supervisor's own counter and means nothing outside it.
+                    Value::from(job.id.as_str()),
                 ]);
                 inflight.insert(job.task_id, job);
                 free -= 1;

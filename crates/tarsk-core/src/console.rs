@@ -34,6 +34,9 @@ const MAX_REQUEST: usize = 16 * 1024;
 /// is a console nobody can read and a supervisor doing work for nobody.
 const PAGE: usize = 100;
 
+/// How long a cancellation issued here is remembered, at the least.
+const CANCEL_TTL_MS: u64 = 86_400_000;
+
 /// Console connections served at once.
 ///
 /// Each one holds a task with a ten-second read window, and they live in the
@@ -309,11 +312,14 @@ async fn handle(
                 vec![id.clone()]
             };
             let outcome = match path {
-                "/cancel" => shared
-                    .broker
-                    .revoke(&queue, &id, 86_400_000)
-                    .await
-                    .map(|_| 1usize),
+                "/cancel" => {
+                    // A cancellation has to outlive the job it cancels. A day
+                    // covers anything already runnable; a delayed job's form
+                    // says how long it still has to wait, and gets that.
+                    let wanted: u64 = form_value(&request.body, "ms").parse().unwrap_or(0);
+                    let ttl = wanted.clamp(CANCEL_TTL_MS, 400 * CANCEL_TTL_MS);
+                    shared.broker.revoke(&queue, &id, ttl).await.map(|_| 1usize)
+                }
                 "/replay" => shared.broker.dead_replay(&queue, &ids).await,
                 "/purge" => shared.broker.dead_purge(&queue, &ids).await,
                 _ => return respond(&mut stream, 404, "text/plain", "no such action").await,
@@ -533,7 +539,11 @@ async fn dashboard(shared: &Arc<Shared>, guard: &Guard) -> String {
                 escape(&job.name),
                 when,
                 escape(&job.worker),
-                action(guard, "/cancel", &job.queue, &job.id, "cancel"),
+                action(guard, "/cancel", &job.queue, &job.id, "cancel", {
+                    // Negative age is time still to wait. An hour on top, so
+                    // the cancellation is still there when the job comes due.
+                    (job.age_ms < 0).then(|| job.age_ms.unsigned_abs() + 3_600_000)
+                }),
             ));
         }
         page.push_str("</table>");
@@ -553,7 +563,7 @@ async fn dashboard(shared: &Arc<Shared>, guard: &Guard) -> String {
         any_dead = true;
         page.push_str(&format!(
             "<table><tr><th>id<th>task<th>error<th>{}",
-            action(guard, "/purge", queue, "", "purge all")
+            action(guard, "/purge", queue, "", "purge all", None)
         ));
         for entry in dead {
             page.push_str(&format!(
@@ -561,7 +571,7 @@ async fn dashboard(shared: &Arc<Shared>, guard: &Guard) -> String {
                 escape(&entry.id),
                 escape(&entry.name),
                 escape(entry.error.lines().next().unwrap_or("")),
-                action(guard, "/replay", queue, &entry.id, "replay"),
+                action(guard, "/replay", queue, &entry.id, "replay", None),
             ));
             page.push_str(&format!(
                 "<tr class=tb><td colspan=4><pre>{}</pre>",
@@ -578,14 +588,24 @@ async fn dashboard(shared: &Arc<Shared>, guard: &Guard) -> String {
     page
 }
 
-fn action(guard: &Guard, path: &str, queue: &str, id: &str, label: &str) -> String {
+fn action(
+    guard: &Guard,
+    path: &str,
+    queue: &str,
+    id: &str,
+    label: &str,
+    keep_ms: Option<u64>,
+) -> String {
     if !guard.actions {
         return String::new();
     }
+    let keep = keep_ms
+        .map(|ms| format!("<input type=hidden name=ms value=\"{ms}\">"))
+        .unwrap_or_default();
     format!(
         "<form method=post action={path}>\
          <input type=hidden name=queue value=\"{}\">\
-         <input type=hidden name=id value=\"{}\">\
+         <input type=hidden name=id value=\"{}\">{keep}\
          <button>{label}</button></form>",
         escape(queue),
         escape(id)

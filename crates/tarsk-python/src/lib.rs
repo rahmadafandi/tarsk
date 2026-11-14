@@ -246,6 +246,24 @@ struct Producer {
     broker: Broker,
 }
 
+impl Producer {
+    /// Run one call on this producer's runtime, after letting its connections
+    /// catch up with the world.
+    ///
+    /// The runtime only turns while a call is inside it, so a connection the
+    /// server closed an hour ago is, as far as its driver knows, still open —
+    /// and the call would be the one to find out, by failing. Yielding first
+    /// gives the driver its turn to see the closed socket, and the broker then
+    /// reconnects before anything is sent rather than after something is lost.
+    fn wake_then<F: std::future::Future>(&self, call: F) -> F::Output {
+        self.runtime.block_on(async {
+            tokio::task::yield_now().await;
+            tokio::task::yield_now().await;
+            call.await
+        })
+    }
+}
+
 #[pymethods]
 impl Producer {
     #[new]
@@ -256,6 +274,8 @@ impl Producer {
         tarsk_core::broker::supports(&broker_url).map_err(PyValueError::new_err)?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
+            // Look at the sockets on every turn. See `wake_then`.
+            .event_interval(1)
             .build()?;
         // Without the GIL, like every other call here: connecting to a broker
         // that does not answer otherwise froze every Python thread in the
@@ -298,7 +318,7 @@ impl Producer {
         };
         let delay = Duration::from_secs_f64(delay.max(0.0));
         py.detach(|| {
-            self.runtime.block_on(async {
+            self.wake_then(async {
                 if !dedup_key.is_empty() {
                     // Reserve before pushing. The other order would let two
                     // callers both queue and only then discover one of them
@@ -331,7 +351,7 @@ impl Producer {
     /// context, because the broker cannot.
     fn result(&self, py: Python<'_>, id: String) -> PyResult<Option<Py<PyAny>>> {
         let found = py
-            .detach(|| self.runtime.block_on(self.broker.get_result(&id)))
+            .detach(|| self.wake_then(self.broker.get_result(&id)))
             .map_err(broker_err)?;
         match found {
             Some(blob) => Ok(Some(PyBytes::new(py, &blob).into_any().unbind())),
@@ -347,7 +367,7 @@ impl Producer {
     #[pyo3(signature = (id, queue="default", ttl=86400.0))]
     fn cancel(&self, py: Python<'_>, id: &str, queue: &str, ttl: f64) -> PyResult<()> {
         py.detach(|| {
-            self.runtime.block_on(
+            self.wake_then(
                 self.broker
                     .revoke(queue, id, (ttl.max(0.0) * 1000.0) as u64),
             )
@@ -359,7 +379,7 @@ impl Producer {
     #[pyo3(signature = (queues))]
     fn depth(&self, py: Python<'_>, queues: Vec<String>) -> PyResult<Vec<DepthRow>> {
         let rows = py
-            .detach(|| self.runtime.block_on(self.broker.depth_of(&queues)))
+            .detach(|| self.wake_then(self.broker.depth_of(&queues)))
             .map_err(broker_err)?;
         Ok(rows
             .into_iter()
@@ -371,7 +391,7 @@ impl Producer {
     #[pyo3(signature = (queues, limit=50))]
     fn jobs(&self, py: Python<'_>, queues: Vec<String>, limit: usize) -> PyResult<Vec<JobRow>> {
         let rows = py
-            .detach(|| self.runtime.block_on(self.broker.jobs(&queues, limit)))
+            .detach(|| self.wake_then(self.broker.jobs(&queues, limit)))
             .map_err(broker_err)?;
         Ok(rows
             .into_iter()
@@ -394,7 +414,7 @@ impl Producer {
     #[pyo3(signature = (queue="default", limit=50))]
     fn dead_list(&self, py: Python<'_>, queue: &str, limit: usize) -> PyResult<Vec<DeadRow>> {
         let found = py
-            .detach(|| self.runtime.block_on(self.broker.dead_list(queue, limit)))
+            .detach(|| self.wake_then(self.broker.dead_list(queue, limit)))
             .map_err(broker_err)?;
         Ok(found
             .into_iter()
@@ -405,14 +425,14 @@ impl Producer {
     /// Put dead letters back on the queue. Empty `ids` means all of them.
     #[pyo3(signature = (queue="default", ids=Vec::new()))]
     fn dead_replay(&self, py: Python<'_>, queue: &str, ids: Vec<String>) -> PyResult<usize> {
-        py.detach(|| self.runtime.block_on(self.broker.dead_replay(queue, &ids)))
+        py.detach(|| self.wake_then(self.broker.dead_replay(queue, &ids)))
             .map_err(broker_err)
     }
 
     /// Drop dead letters. Empty `ids` means all of them.
     #[pyo3(signature = (queue="default", ids=Vec::new()))]
     fn dead_purge(&self, py: Python<'_>, queue: &str, ids: Vec<String>) -> PyResult<usize> {
-        py.detach(|| self.runtime.block_on(self.broker.dead_purge(queue, &ids)))
+        py.detach(|| self.wake_then(self.broker.dead_purge(queue, &ids)))
             .map_err(broker_err)
     }
 }

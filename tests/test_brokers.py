@@ -1333,6 +1333,15 @@ def _b35_a_dropped_connection_comes_back(url, label, skip, app, env, log, produc
         if not _drop_connections(url, label):
             return
         time.sleep(1.0)
+        if scheme_is(url, ("postgres://", "postgresql://")):
+            # Here the producer notices before it sends, so not even the first
+            # call is lost. Redis reconnects on the error instead, and that one
+            # call is the price.
+            try:
+                producer.depth(["default"])
+            except BrokerError as why:
+                raise AssertionError(
+                    f"{label}: the first call after the drop still failed: {why}") from None
         _send_until_it_lands(lambda: app.registry["note"].send("after-the-drop"), label)
         # The suite's other producers lost their connections to the same
         # sweep, and each owes the one failed call that discovers it.

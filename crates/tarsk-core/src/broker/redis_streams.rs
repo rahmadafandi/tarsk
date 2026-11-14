@@ -63,6 +63,22 @@ fn delayed_key(queue: &str) -> String {
     format!("tarsk:{queue}:delayed")
 }
 
+/// The server's clock, in milliseconds, as the first lines of a script.
+///
+/// Every deadline this driver keeps in Redis — when a delayed job is due, when
+/// a slot or a cancellation lapses, how full a bucket is — is compared by more
+/// than one machine. Stamped with each machine's own clock, two hosts a few
+/// seconds apart disagreed about all of them: a rate limit refilled early for
+/// one and late for the other. Redis has one clock, and scripts can read it.
+///
+/// `replicate_commands` is what lets a script write after reading the time on
+/// Redis 5 and 6; from 7 on it is the default and the call does nothing.
+const LUA_NOW: &str = r"
+if redis.replicate_commands then redis.replicate_commands() end
+local t = redis.call('TIME')
+local now = t[1] * 1000 + math.floor(t[2] / 1000)
+";
+
 /// Move due jobs from the delayed set into the stream.
 ///
 /// This is the one place a Lua script earns its keep. Everywhere else the
@@ -70,13 +86,13 @@ fn delayed_key(queue: &str) -> String {
 /// here it must read what is due, decide, and write — and a crash between the
 /// XADD and the ZREM would leave the job scheduled *and* queued.
 ///
-/// KEYS[1] delayed zset · KEYS[2] stream · ARGV[1] now in ms · ARGV[2] batch size
+/// KEYS[1] delayed zset · KEYS[2] stream · ARGV[1] batch size. Follows `LUA_NOW`.
 ///
 /// ponytail: the per-job hash key is derived inside the script rather than
 /// declared in KEYS, which Redis Cluster forbids. Single-node only until
 /// someone needs otherwise; a hash tag on both keys is the fix.
 const PROMOTE_DUE: &str = r"
-local due = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, tonumber(ARGV[2]))
+local due = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', now, 'LIMIT', 0, tonumber(ARGV[1]))
 local moved = 0
 for _, id in ipairs(due) do
   local fields = redis.call('HGETALL', KEYS[1] .. ':' .. id)
@@ -226,12 +242,19 @@ impl RedisBroker {
             std::process::id(),
             self.next_delayed.fetch_add(1, Ordering::SeqCst)
         );
-        let due = now_ms() + delay.as_millis() as u64;
-        // MULTI, so a job is never scheduled without its payload or the reverse.
-        let _: redis::Value = redis::pipe()
-            .atomic()
-            .cmd("HSET")
-            .arg(format!("{key}:{id}"))
+        // One script, so a job is never scheduled without its payload or the
+        // reverse, and so "due" is measured on the clock that will promote it.
+        let script = redis::Script::new(&format!(
+            "{LUA_NOW}
+             redis.call('HSET', KEYS[2], unpack(ARGV, 2))
+             redis.call('ZADD', KEYS[1], now + tonumber(ARGV[1]), KEYS[3])
+             return 1"
+        ));
+        let _: i64 = script
+            .key(&key)
+            .key(format!("{key}:{id}"))
+            .key(&id)
+            .arg(delay.as_millis() as u64)
             .arg("n")
             .arg(&job.name)
             .arg("p")
@@ -246,11 +269,7 @@ impl RedisBroker {
             .arg(&job.meta)
             .arg("x")
             .arg(job.expires_ms)
-            .cmd("ZADD")
-            .arg(&key)
-            .arg(due)
-            .arg(&id)
-            .query_async(&mut conn)
+            .invoke_async(&mut conn)
             .await?;
         Ok(())
     }
@@ -308,10 +327,9 @@ impl RedisBroker {
         let mut moved = 0;
         for queue in &self.queues {
             let mut conn = self.conn.clone();
-            let promoted: usize = redis::Script::new(PROMOTE_DUE)
+            let promoted: usize = redis::Script::new(&format!("{LUA_NOW}{PROMOTE_DUE}"))
                 .key(delayed_key(queue))
                 .key(stream_key(queue))
-                .arg(now_ms())
                 .arg(128)
                 .invoke_async(&mut conn)
                 .await?;
@@ -794,23 +812,22 @@ impl RedisBroker {
         // Prune, count and add cannot be three commands: two workers would both
         // see the last slot free. A sorted set scored by expiry gives the prune
         // for free, which a counter would need a separate reaper for.
-        let script = redis::Script::new(
-            r"local now, until_ms, max = tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3])
+        let script = redis::Script::new(&format!(
+            "{LUA_NOW}
+              local until_ms, max = now + tonumber(ARGV[1]), tonumber(ARGV[2])
               redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, now)
               if redis.call('ZCARD', KEYS[1]) >= max
-                 and redis.call('ZSCORE', KEYS[1], ARGV[4]) == false then
+                 and redis.call('ZSCORE', KEYS[1], ARGV[3]) == false then
                 return 0
               end
-              redis.call('ZADD', KEYS[1], until_ms, ARGV[4])
+              redis.call('ZADD', KEYS[1], until_ms, ARGV[3])
               redis.call('PEXPIRE', KEYS[1], until_ms - now + 60000)
-              return 1",
-        );
+              return 1"
+        ));
         let mut conn = self.conn.clone();
-        let now = now_ms();
         let taken: i64 = script
             .key(slots_key(task))
-            .arg(now)
-            .arg(now + lease_ms.max(1))
+            .arg(lease_ms.max(1))
             .arg(max)
             .arg(job_id)
             .invoke_async(&mut conn)
@@ -832,10 +849,11 @@ impl RedisBroker {
         // Read-refill-write has to be one step or two workers both see the last
         // token. Lua is the only thing Redis offers that is; MULTI would not
         // help, since the decision depends on what the read returned.
-        let script = redis::Script::new(
-            r"local tokens = tonumber(redis.call('HGET', KEYS[1], 't'))
+        let script = redis::Script::new(&format!(
+            "{LUA_NOW}
+              local tokens = tonumber(redis.call('HGET', KEYS[1], 't'))
               local seen   = tonumber(redis.call('HGET', KEYS[1], 's'))
-              local rate, burst, now = tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3])
+              local rate, burst = tonumber(ARGV[1]), tonumber(ARGV[2])
               if tokens == nil then tokens = burst; seen = now end
               tokens = math.min(burst, tokens + math.max(0, now - seen) * rate / 1000)
               local wait = 0
@@ -848,26 +866,29 @@ impl RedisBroker {
               -- Long enough to refill from empty; a bucket nobody touches for
               -- that long is indistinguishable from a fresh one.
               redis.call('PEXPIRE', KEYS[1], math.ceil(burst * 1000 / rate) + 1000)
-              return wait",
-        );
+              return wait"
+        ));
         let mut conn = self.conn.clone();
         let wait: i64 = script
             .key(format!("tarsk:rate:{task}"))
             .arg(per_sec)
             .arg(burst)
-            .arg(now_ms())
             .invoke_async(&mut conn)
             .await?;
         Ok(wait.max(0) as u64)
     }
 
     pub(super) async fn revoke(&self, id: &str, ttl_ms: u64) -> Res<()> {
+        let script = redis::Script::new(&format!(
+            "{LUA_NOW}
+             return redis.call('ZADD', KEYS[1], now + tonumber(ARGV[1]), ARGV[2])"
+        ));
         let mut conn = self.conn.clone();
-        let _: i64 = redis::cmd("ZADD")
-            .arg(REVOKED)
-            .arg(now_ms() + ttl_ms)
+        let _: i64 = script
+            .key(REVOKED)
+            .arg(ttl_ms)
             .arg(id)
-            .query_async(&mut conn)
+            .invoke_async(&mut conn)
             .await?;
         Ok(())
     }
@@ -881,20 +902,15 @@ impl RedisBroker {
     }
 
     async fn revoked(&self, key: &str) -> Res<Vec<String>> {
-        let mut conn = self.conn.clone();
         // Prune and read in one round trip. A sorted set scored by expiry gives
         // per-member TTL, which a plain SET cannot.
-        let (_, live): (i64, Vec<String>) = redis::pipe()
-            .cmd("ZREMRANGEBYSCORE")
-            .arg(key)
-            .arg(0)
-            .arg(now_ms())
-            .cmd("ZRANGE")
-            .arg(key)
-            .arg(0)
-            .arg(-1)
-            .query_async(&mut conn)
-            .await?;
+        let script = redis::Script::new(&format!(
+            "{LUA_NOW}
+             redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, now)
+             return redis.call('ZRANGE', KEYS[1], 0, -1)"
+        ));
+        let mut conn = self.conn.clone();
+        let live: Vec<String> = script.key(key).invoke_async(&mut conn).await?;
         Ok(live)
     }
 

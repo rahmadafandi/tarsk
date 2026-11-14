@@ -1456,6 +1456,56 @@ def _b37_many_workers_share_one_cap(url, label, skip, app, env, log, producer):
     assert took >= 1.5, f"{label}: 15 tasks at 5/s across three workers took {took:.2f}s"
 
 
+def _b40_limits_hold_across_connections(url, label, skip, app, env, log, producer):
+    if "shared-concurrency" in skip:
+        print(f"  {label}: skip limits-across-connections — the limits are per worker on this broker")
+        return
+    # --- sixteen connections at once cannot overrun a cap or a bucket ----
+    # Three workers sharing a cap (block 37) rarely collide on the same
+    # instant. Sixteen producers released from one barrier always do, and each
+    # has its own connection, which is where a check that reads and then
+    # writes comes apart.
+    import threading
+
+    from tarsk._core import Producer
+
+    callers = [Producer(broker_url=url) for _ in range(16)]
+    stamp = os.urandom(4).hex()
+    for round_no in range(20):
+        barrier = threading.Barrier(len(callers))
+        got = []
+
+        def take(caller, n, task=f"cap-{stamp}-{round_no}"):
+            barrier.wait()
+            got.append(caller._acquire_slot(task, f"job-{n}", 2, 30_000))
+
+        threads = [threading.Thread(target=take, args=(c, n)) for n, c in enumerate(callers)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert sum(got) == 2, \
+            f"{label}: a cap of 2 let {sum(got)} of 16 simultaneous callers in (round {round_no})"
+
+    for round_no in range(20):
+        barrier = threading.Barrier(len(callers))
+        waits = []
+
+        def spend(caller, task=f"rate-{stamp}-{round_no}"):
+            barrier.wait()
+            # Three tokens, and a refill too slow to add a fourth meanwhile.
+            waits.append(caller._take_token(task, 0.001, 3))
+
+        threads = [threading.Thread(target=spend, args=(c,)) for c in callers]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        served = sum(1 for wait in waits if wait == 0)
+        assert served == 3, \
+            f"{label}: a bucket of 3 served {served} of 16 simultaneous callers (round {round_no})"
+
+
 def _b38_redis_only(url, label, skip, app, env, log, producer):
     if not scheme_is(url, ("redis://", "rediss://")):
         return
@@ -1479,6 +1529,38 @@ def _b38_redis_only(url, label, skip, app, env, log, producer):
         stop_worker(worker)
     assert {"delayed-by-0", "delayed-by-1"} <= set(seen), \
         f"{label}: one producer's delayed job replaced the other's: {seen}"
+
+    # --- what a stopping worker read ahead is handed back, not held ------
+    # Four children, each busy for seconds. The read that fed the fourth
+    # fetched four entries and could place one, so three sit in the worker's
+    # buffer with nobody free to take them — and that is when it is told to
+    # stop. It still owned those: they sat out a whole lease, half a minute
+    # for these, before anyone else could run them.
+    log.write_text("")
+    tags = [f"ahead-{i}" for i in range(12)]
+    for tag in tags:
+        app.registry["lingers"].send(tag)
+    worker = start_worker(env, TARSK_CHILDREN=4)
+    try:
+        deadline = time.time() + 60
+        while time.time() < deadline and \
+                len([t for t in tags_in(log) if t.endswith("-start")]) < 4:
+            time.sleep(0.05)
+        time.sleep(0.5)  # all four are mid-task, and the buffer is as full as it gets
+        os.kill(worker.pid, signal.SIGTERM)
+        worker.wait(timeout=30)
+    finally:
+        stop_worker(worker, hard=True)
+    ended = {f"{tag}-end" for tag in tags}
+    rescuer = start_worker(env, TARSK_SLOTS=50, TARSK_LEASE_GRACE=1)
+    try:
+        seen = wait_for(log, ended, timeout=20)
+    finally:
+        stop_worker(rescuer)
+    held = sorted(ended - set(seen))
+    assert not held, \
+        f"{label}: {len(held)} jobs the stopped worker had read ahead were still held " \
+        f"20s later: {held}"
 
     # --- the lease sweep reaches an entry behind 64 others ---------------
     # Seventy jobs in flight and inside their lease, then one stranded behind
@@ -1632,6 +1714,7 @@ def check_broker(url: str, label: str, skip: frozenset = frozenset()) -> None:
         _b37_many_workers_share_one_cap(url, label, skip, app, env, log, producer)
         _b38_redis_only(url, label, skip, app, env, log, producer)
         _b39_large_things_travel(url, label, skip, app, env, log, producer)
+        _b40_limits_hold_across_connections(url, label, skip, app, env, log, producer)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 

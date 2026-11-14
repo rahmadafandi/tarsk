@@ -265,3 +265,13 @@ def strands_once(tag):
 def fails_loudly(size):
     """Dies with a message the size of a deep recursion's traceback."""
     raise RuntimeError("x" * size)
+
+
+@app.task(name="lingers", timeout=30)
+def lingers(tag):
+    """Busy for a while, under the longest lease this app allows — so a copy
+    left stranded does not come back by itself while a test is still looking."""
+    _log(f"{tag}-start")
+    time.sleep(2.5)
+    _log(f"{tag}-end")
+    return tag

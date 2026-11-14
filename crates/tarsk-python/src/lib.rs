@@ -429,6 +429,31 @@ impl Producer {
             .map_err(broker_err)
     }
 
+    /// Take one of `task`'s concurrency slots for `job_id`, as a worker does
+    /// before it dispatches. True if there was room.
+    ///
+    /// Underscored: this is the supervisor's side of `max_concurrency`, here
+    /// so the limit can be tested from several connections at once — which a
+    /// single worker, pipelining down one, never does.
+    fn _acquire_slot(
+        &self,
+        py: Python<'_>,
+        task: &str,
+        job_id: &str,
+        cap: u32,
+        lease_ms: u64,
+    ) -> PyResult<bool> {
+        py.detach(|| self.wake_then(self.broker.acquire_slot(task, job_id, cap, lease_ms)))
+            .map_err(broker_err)
+    }
+
+    /// Take one of `task`'s rate-limit tokens: 0 if there was one, otherwise
+    /// the milliseconds until there will be. See `_acquire_slot`.
+    fn _take_token(&self, py: Python<'_>, task: &str, per_sec: f64, burst: u32) -> PyResult<u64> {
+        py.detach(|| self.wake_then(self.broker.take_token(task, per_sec, burst)))
+            .map_err(broker_err)
+    }
+
     /// Drop dead letters. Empty `ids` means all of them.
     #[pyo3(signature = (queue="default", ids=Vec::new()))]
     fn dead_purge(&self, py: Python<'_>, queue: &str, ids: Vec<String>) -> PyResult<usize> {

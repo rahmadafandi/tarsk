@@ -142,13 +142,14 @@ class Postgres:
         shutil.rmtree(self.dir, ignore_errors=True)
 
 
-def start_worker(env, **overrides):
+def start_worker(env, stderr=None, **overrides):
+    """`stderr` is a path to keep what the worker prints, for a test that reads it."""
+    sink = stderr or os.environ.get("TARSK_WORKER_ERR")
     return subprocess.Popen(
         [sys.executable, "tests/broker_worker.py"],
         env={**env, **{k: str(v) for k, v in overrides.items()}},
         stdout=subprocess.DEVNULL,
-        stderr=(open(os.environ["TARSK_WORKER_ERR"], "a") if os.environ.get("TARSK_WORKER_ERR")
-                else subprocess.DEVNULL),
+        stderr=open(sink, "a") if sink else subprocess.DEVNULL,
         start_new_session=True,
     )
 
@@ -1327,7 +1328,9 @@ def _b35_a_dropped_connection_comes_back(url, label, skip, app, env, log, produc
         return
 
     app.registry["note"].send("before-the-drop")
-    worker = start_worker(env, TARSK_LEASE_GRACE=1)
+    said = Path(env["TARSK_LOG"]).with_name("worker.err")
+    said.unlink(missing_ok=True)
+    worker = start_worker(env, stderr=str(said), TARSK_LEASE_GRACE=1)
     try:
         wait_for(log, {"before-the-drop"}, timeout=60)
         if not _drop_connections(url, label):
@@ -1351,7 +1354,15 @@ def _b35_a_dropped_connection_comes_back(url, label, skip, app, env, log, produc
     finally:
         stop_worker(worker)
     assert "after-the-drop" in seen, \
-        f"{label}: nothing ran after the connections were dropped — the worker never reconnected"
+        f"{label}: nothing ran after the connections were dropped — the worker never " \
+        f"reconnected. It printed:\n{said.read_text()}"
+    if scheme_is(url, ("redis://", "rediss://")):
+        # Its blocking read was in flight when the server hung up, so this
+        # worker did see an error — and has to have said what it was. The
+        # counter it used to move instead told an operator nothing.
+        printed = said.read_text()
+        assert "tarsk: broker error during claim:" in printed, \
+            f"{label}: the worker lost its connection and printed nothing about it:\n{printed}"
 
 
 def _b36_a_failed_send_frees_its_reservation(url, label, skip, app, env, log, producer):
@@ -1503,6 +1514,105 @@ def _b40_limits_hold_across_connections(url, label, skip, app, env, log, produce
         served = sum(1 for wait in waits if wait == 0)
         assert served == 3, \
             f"{label}: a bucket of 3 served {served} of 16 simultaneous callers (round {round_no})"
+
+
+def _record_last_run(url: str, task: str, minute: int) -> bool:
+    """Write the scheduler's own record of when `task` last ran. False if this
+    machine has no way to reach the store."""
+    if scheme_is(url, ("redis://", "rediss://")):
+        _redis_do(url, ("SET", f"tarsk:cron:last:{task}", minute))
+        return True
+    if scheme_is(url, ("postgres://", "postgresql://")) and shutil.which("psql"):
+        subprocess.run(
+            ["psql", url, "-tAc",
+             f"insert into tarsk_cron_runs (name, minute) values ('{task}', {minute}) "
+             f"on conflict (name) do update set minute = excluded.minute"],
+            capture_output=True, check=True)
+        return True
+    return False
+
+
+def _b41_a_missed_cron_run_is_caught_up(url, label, skip, app, env, log, producer):
+    if "cron-election" in skip:
+        print(f"  {label}: skip cron-catch-up — with no shared store there is no record of "
+              "the last run to catch up from")
+        return
+    # --- a run that came due while no worker was up fires when one returns
+    import datetime
+
+    log.write_text("")
+    now = datetime.datetime.now(datetime.UTC)
+    due = now - datetime.timedelta(minutes=10)
+    schedule = f"{due.minute} {due.hour} * * *"   # once a day, ten minutes ago
+    this_minute = int(now.timestamp()) // 60
+
+    # Never seen before: that run was not missed, it predates the schedule.
+    # Forgetting any record a previous run of this suite left is what makes
+    # "never seen" true on a server that keeps its data.
+    if not _record_last_run(url, "catches_up", this_minute + 10_000):
+        print(f"  {label}: skip cron-catch-up — no psql here to set the last run with")
+        return
+    worker = start_worker(env, TARSK_LEASE_GRACE=1, TARSK_TEST_CRON=schedule)
+    try:
+        time.sleep(8)
+        assert "caught-up" not in tags_in(log), \
+            f"{label}: fired with the last run recorded as later than the one due"
+    finally:
+        stop_worker(worker)
+
+    # Last ran twenty minutes ago, and came due ten minutes ago with nobody up.
+    _record_last_run(url, "catches_up", this_minute - 20)
+    pair = [start_worker(env, TARSK_LEASE_GRACE=1, TARSK_TEST_CRON=schedule) for _ in range(2)]
+    try:
+        seen = wait_for(log, {"caught-up"}, timeout=30)
+        time.sleep(8)  # room for a second firing, from either worker
+        seen = tags_in(log)
+    finally:
+        for worker in pair:
+            stop_worker(worker)
+    fired = seen.count("caught-up")
+    assert fired == 1, f"{label}: a run missed ten minutes ago fired {fired} times, wanted once"
+
+
+def _b42_connecting_beside_a_busy_worker(url, label, skip, app, env, log, producer):
+    if not scheme_is(url, ("postgres://", "postgresql://")):
+        return
+    # --- thirty producers connect while a worker is claiming, and none fails
+    # Every connection used to run the schema, taking a lock on the jobs table
+    # that a claim in progress could deadlock with — Postgres then killed one
+    # of the two, and it was as likely to be the worker's claim.
+    import threading
+
+    from tarsk._core import Producer
+
+    log.write_text("")
+    tags = {f"busy-{i}" for i in range(60)}
+    for tag in sorted(tags):
+        app.registry["note"].send(tag)
+    said = Path(env["TARSK_LOG"]).with_name("busy.err")
+    said.unlink(missing_ok=True)
+    failed = []
+
+    def connect():
+        try:
+            Producer(broker_url=url).depth(["default"])
+        except BrokerError as why:
+            failed.append(str(why))
+
+    worker = start_worker(env, stderr=str(said), TARSK_SLOTS=8, TARSK_LEASE_GRACE=1)
+    try:
+        threads = [threading.Thread(target=connect) for _ in range(30)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        seen = wait_for(log, tags, timeout=60)
+    finally:
+        stop_worker(worker)
+    assert not failed, f"{label}: {len(failed)} of 30 connections failed: {failed[0]}"
+    assert tags <= set(seen), f"{label}: lost {sorted(tags - set(seen))[:5]}"
+    assert "deadlock" not in said.read_text(), \
+        f"{label}: the worker hit a deadlock while others connected:\n{said.read_text()}"
 
 
 def _b38_redis_only(url, label, skip, app, env, log, producer):
@@ -1714,6 +1824,8 @@ def check_broker(url: str, label: str, skip: frozenset = frozenset()) -> None:
         _b38_redis_only(url, label, skip, app, env, log, producer)
         _b39_large_things_travel(url, label, skip, app, env, log, producer)
         _b40_limits_hold_across_connections(url, label, skip, app, env, log, producer)
+        _b41_a_missed_cron_run_is_caught_up(url, label, skip, app, env, log, producer)
+        _b42_connecting_beside_a_busy_worker(url, label, skip, app, env, log, producer)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 

@@ -275,3 +275,10 @@ def lingers(tag):
     time.sleep(2.5)
     _log(f"{tag}-end")
     return tag
+
+
+# A schedule a test chooses, so one can be made to have come due a few minutes
+# ago. Empty outside that test, which leaves this an ordinary task.
+@app.task(name="catches_up", cron=os.environ.get("TARSK_TEST_CRON", ""))
+def catches_up():
+    _log("caught-up")

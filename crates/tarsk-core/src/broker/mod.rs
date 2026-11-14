@@ -578,6 +578,70 @@ impl Broker {
         }
     }
 
+    /// Stop every worker taking from `queue`, or let them start again.
+    ///
+    /// For when the thing a queue's tasks call is down: the jobs stay queued
+    /// instead of burning their retries against it, and nothing else the
+    /// workers serve is held up. What is already running finishes. Refused on
+    /// AMQP for the reason cancellation is: there is no store every worker
+    /// can read.
+    pub async fn set_paused(&self, queue: &str, paused: bool) -> Res<()> {
+        match self {
+            Broker::Memory(b) => {
+                let mut held = b.held.lock().unwrap();
+                if paused {
+                    held.insert(queue.to_string());
+                } else {
+                    held.remove(queue);
+                }
+                Ok(())
+            }
+            #[cfg(feature = "redis")]
+            Broker::Redis(b) => b.set_paused(queue, paused).await,
+            #[cfg(feature = "postgres")]
+            Broker::Postgres(b) => b.set_paused(queue, paused).await,
+            #[cfg(feature = "amqp")]
+            Broker::Amqp(_) => Err(
+                "pausing a queue needs state every worker can read, and AMQP has no \
+                 shared store to hold it — use the Redis or Postgres broker, or stop \
+                 the workers that serve that queue"
+                    .into(),
+            ),
+        }
+    }
+
+    /// The queues paused just now, as the store has them.
+    pub async fn paused(&self) -> Res<Vec<String>> {
+        match self {
+            Broker::Memory(b) => Ok(b.held.lock().unwrap().iter().cloned().collect()),
+            #[cfg(feature = "redis")]
+            Broker::Redis(b) => b.paused().await,
+            #[cfg(feature = "postgres")]
+            Broker::Postgres(b) => b.paused().await,
+            #[cfg(feature = "amqp")]
+            Broker::Amqp(_) => Ok(Vec::new()),
+        }
+    }
+
+    /// Bring this worker's idea of what is paused up to date with the store.
+    /// Called on the timer that pulls cancellations.
+    pub async fn refresh_paused(&self) -> Res<()> {
+        match self {
+            #[cfg(feature = "redis")]
+            Broker::Redis(b) => {
+                let now = b.paused().await?.into_iter().collect();
+                *b.held.lock().unwrap() = now;
+            }
+            #[cfg(feature = "postgres")]
+            Broker::Postgres(b) => {
+                let now = b.paused().await?.into_iter().collect();
+                *b.held.lock().unwrap() = now;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     /// Every id cancelled and not yet expired, on any queue.
     ///
     /// Read as a set on a timer rather than asked per job: a lookup at every
@@ -965,6 +1029,38 @@ mod tests {
         broker.retry(&seen.receipt, wait).await.unwrap();
         let after = broker.claim(wait, wait).await.unwrap().unwrap();
         assert_eq!(after.attempt, 2);
+    }
+
+    #[tokio::test]
+    async fn a_paused_queue_is_passed_over_and_not_lost() {
+        let broker = Broker::connect("memory://", Vec::new()).await.unwrap();
+        let wait = Duration::ZERO;
+        for (queue, name) in [("slow", "first"), ("fast", "second"), ("slow", "third")] {
+            let job = NewJob {
+                id: name.into(),
+                queue: queue.into(),
+                name: name.into(),
+                payload: Vec::new(),
+                timeout_ms: 1_000,
+                meta: Vec::new(),
+                expires_ms: 0,
+                chain: Vec::new(),
+            };
+            broker.push(job, wait).await.unwrap();
+        }
+        broker.set_paused("slow", true).await.unwrap();
+        assert_eq!(broker.paused().await.unwrap(), vec!["slow".to_string()]);
+        // The job behind the paused ones is reachable; they are not.
+        let got = broker.claim(wait, wait).await.unwrap().unwrap();
+        assert_eq!(got.name, "second");
+        assert!(broker.claim(wait, wait).await.unwrap().is_none());
+        // And they are still there, in order, when the queue is let go.
+        broker.set_paused("slow", false).await.unwrap();
+        let mut rest = Vec::new();
+        while let Some(job) = broker.claim(wait, wait).await.unwrap() {
+            rest.push(job.name);
+        }
+        assert_eq!(rest, vec!["first", "third"]);
     }
 
     #[tokio::test]

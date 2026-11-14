@@ -319,6 +319,12 @@ async fn handle(
                     let ttl = cancel_ttl(&request.body);
                     shared.broker.revoke(&queue, &id, ttl).await.map(|_| 1usize)
                 }
+                "/pause" => shared.broker.set_paused(&queue, true).await.map(|_| 1usize),
+                "/resume" => shared
+                    .broker
+                    .set_paused(&queue, false)
+                    .await
+                    .map(|_| 1usize),
                 "/replay" => shared.broker.dead_replay(&queue, &ids).await,
                 "/purge" => shared.broker.dead_purge(&queue, &ids).await,
                 _ => return respond(&mut stream, 404, "text/plain", "no such action").await,
@@ -351,7 +357,7 @@ async fn handle(
                 &mut stream,
                 403,
                 "text/plain",
-                "read only: set TARSK_ADMIN_ACTIONS=1 to allow cancel, replay and purge",
+                "read only: set TARSK_ADMIN_ACTIONS=1 to allow cancel, replay, purge and pause",
             )
             .await
         }
@@ -512,15 +518,29 @@ async fn dashboard(shared: &Arc<Shared>, guard: &Guard) -> String {
         );
     }
 
-    page.push_str("<h2>Queues</h2><table><tr><th>queue<th>ready<th>running<th>delayed<th>dead");
+    // A backend with nowhere to keep a pause refuses the question; the column
+    // is then simply empty rather than the page failing.
+    let paused = shared.broker.paused().await.unwrap_or_default();
+    page.push_str("<h2>Queues</h2><table><tr><th>queue<th>ready<th>running<th>delayed<th>dead<th>");
     for row in &depth {
+        let held = paused.contains(&row.queue);
         page.push_str(&format!(
-            "<tr><td>{}<td class=n>{}<td class=n>{}<td class=n>{}<td class=n>{}",
+            "<tr><td>{}{}<td class=n>{}<td class=n>{}<td class=n>{}<td class=n>{}<td>{}",
             escape(&row.queue),
+            if held {
+                " <span class=\"s delayed\">paused</span>"
+            } else {
+                ""
+            },
             row.ready,
             row.in_flight,
             row.delayed,
-            row.dead
+            row.dead,
+            if held {
+                action(guard, "/resume", &row.queue, "", "resume", None)
+            } else {
+                action(guard, "/pause", &row.queue, "", "pause", None)
+            },
         ));
     }
     page.push_str("</table>");

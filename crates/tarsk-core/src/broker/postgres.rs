@@ -45,6 +45,10 @@ create table if not exists tarsk_cron_runs (
     minute  bigint not null
 );
 
+create table if not exists tarsk_paused (
+    queue text primary key
+);
+
 create table if not exists tarsk_results (
     id         text        primary key,
     blob       bytea       not null,
@@ -180,6 +184,10 @@ pub struct PgBroker {
     url: String,
     pub(super) reconnects: AtomicU64,
     pub(super) queues: Vec<String>,
+    /// Queues this worker has been told not to take from. A copy of what the
+    /// store says, refreshed on the timer that pulls cancellations, so a claim
+    /// does not pay a round trip to learn that nothing is paused.
+    pub(super) held: Mutex<std::collections::HashSet<String>>,
     stores: AtomicU64,
     /// The same identity Redis gets for free from its consumer group. Postgres
     /// has no equivalent, so a claim writes it down.
@@ -240,6 +248,7 @@ impl PgBroker {
             link: tokio::sync::Mutex::new(Arc::new(Self::open(url).await?)),
             url: url.to_string(),
             reconnects: AtomicU64::new(0),
+            held: Mutex::new(std::collections::HashSet::new()),
             queues,
             stores: AtomicU64::new(0),
         })
@@ -288,6 +297,35 @@ impl PgBroker {
         Ok(())
     }
 
+    /// The queues this worker serves, less the paused ones, in their order.
+    fn active(&self) -> Vec<String> {
+        let held = self.held.lock().unwrap();
+        self.queues
+            .iter()
+            .filter(|queue| !held.contains(*queue))
+            .cloned()
+            .collect()
+    }
+
+    pub(super) async fn set_paused(&self, queue: &str, paused: bool) -> Res<()> {
+        let sql = if paused {
+            "insert into tarsk_paused (queue) values ($1) on conflict do nothing"
+        } else {
+            "delete from tarsk_paused where queue = $1"
+        };
+        self.db().await?.execute(sql, &[&queue]).await?;
+        Ok(())
+    }
+
+    pub(super) async fn paused(&self) -> Res<Vec<String>> {
+        let rows = self
+            .db()
+            .await?
+            .query("select queue from tarsk_paused", &[])
+            .await?;
+        Ok(rows.iter().map(|row| row.get(0)).collect())
+    }
+
     pub(super) async fn push_many(&self, jobs: Vec<NewJob>) -> Res<()> {
         // One statement, so one transaction: all the rows or none. Columns
         // travel as arrays and are unzipped by the server, which keeps this a
@@ -332,13 +370,16 @@ impl PgBroker {
         // measures the wait.
         let deadline = tokio::time::Instant::now() + block;
         loop {
+            let queues = self.active();
+            if queues.is_empty() {
+                // Everything this worker serves is paused.
+                tokio::time::sleep(block).await;
+                return Ok(None);
+            }
             let rows = self
                 .db()
                 .await?
-                .query(
-                    PG_CLAIM,
-                    &[&self.queues, &grace.as_secs_f64(), &self.consumer],
-                )
+                .query(PG_CLAIM, &[&queues, &grace.as_secs_f64(), &self.consumer])
                 .await?;
             if let Some(row) = rows.first() {
                 let run_lease: i64 = row.get(4);

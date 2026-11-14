@@ -85,6 +85,9 @@ pub struct MemoryBroker {
     next_id: AtomicU64,
     results: Mutex<HashMap<String, (Vec<u8>, std::time::Instant)>>,
     pub(super) revoked: Mutex<HashMap<String, std::time::Instant>>,
+    /// Queues nothing may be taken from. Here the store and the worker's copy
+    /// of it are the same thing.
+    pub(super) held: Mutex<std::collections::HashSet<String>>,
     /// Makes `push` fail, for the tests of what happens when an enqueue does.
     /// This broker cannot fail one on its own, and the real ones can.
     #[cfg(test)]
@@ -120,15 +123,20 @@ impl MemoryBroker {
     }
 
     pub(super) fn claim(&self) -> Option<Delivery> {
+        let held = self.held.lock().unwrap().clone();
+        let mut jobs = self.jobs.lock().unwrap();
         let id = {
             let mut ready = self.ready.lock().unwrap();
             let now = std::time::Instant::now();
-            let position = ready
-                .iter()
-                .position(|(_, due)| due.is_none_or(|d| d <= now))?;
+            let position = ready.iter().position(|(id, due)| {
+                due.is_none_or(|d| d <= now)
+                    && (held.is_empty()
+                        || jobs
+                            .get(id)
+                            .is_none_or(|(job, _, _)| !held.contains(&job.queue)))
+            })?;
             ready.remove(position)?.0
         };
-        let mut jobs = self.jobs.lock().unwrap();
         let (job, attempt, ready_ms) = jobs.get_mut(&id)?;
         *attempt += 1;
         Some(Delivery {

@@ -117,6 +117,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="how long to remember the cancellation. Must outlive the job: "
                              "something scheduled for next week needs a week")
 
+    sub.add_parser("pause", parents=[single_queue],
+                   help="stop every worker taking from a queue; what is running finishes")
+    sub.add_parser("resume", parents=[single_queue], help="let a paused queue go again")
+
     dead = sub.add_parser("dead", parents=[single_queue],
                           help="inspect and replay the dead letters")
     dead.add_argument("action", choices=["list", "show", "replay", "purge"])
@@ -250,11 +254,17 @@ def main(argv: list[str] | None = None) -> int:
         from ._core import Producer
 
         wanted = [q.strip() for q in args.queues.split(",") if q.strip()]
-        rows = Producer(broker_url=args.broker).depth(wanted)
+        producer = Producer(broker_url=args.broker)
+        rows = producer.depth(wanted)
+        try:
+            paused = set(producer.paused())
+        except Exception:  # noqa: BLE001 — a backend that cannot pause has none paused
+            paused = set()
         width = max((len(r[0]) for r in rows), default=5)
         print(f"{'queue':<{width}}  {'ready':>8} {'running':>8} {'delayed':>8} {'dead':>8}")
         for queue, ready, running, delayed, dead in rows:
-            print(f"{queue:<{width}}  {ready:>8} {running:>8} {delayed:>8} {dead:>8}")
+            held = "  paused" if queue in paused else ""
+            print(f"{queue:<{width}}  {ready:>8} {running:>8} {delayed:>8} {dead:>8}{held}")
         if not rows:
             print("(no such queue, or nothing has ever been sent to it)")
         return 0
@@ -287,6 +297,13 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"    {_proto.unpack_result(meta)}")
         print(f"\n{len(rows)} shown of at most {args.limit}. "
               f"`tarsk status` for the totals.", file=sys.stderr)
+        return 0
+    if args.command in ("pause", "resume"):
+        from ._core import Producer
+
+        Producer(broker_url=args.broker).pause(args.queue, args.command == "pause")
+        print(f"{args.queue}: paused; jobs already running finish, new sends still queue"
+              if args.command == "pause" else f"{args.queue}: resumed")
         return 0
     if args.command == "cancel":
         from ._core import Producer

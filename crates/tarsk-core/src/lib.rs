@@ -2229,6 +2229,9 @@ pub async fn supervise_until(
                     Ok(ids) => *shared.revoked.lock().unwrap() = ids.into_iter().collect(),
                     Err(err) => shared.broker_error("reading cancellations", err.as_ref()),
                 }
+                if let Err(err) = shared.broker.refresh_paused().await {
+                    shared.broker_error("reading paused queues", err.as_ref());
+                }
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
         })

@@ -34,6 +34,10 @@ pub struct RedisBroker {
     blocking: redis::aio::ConnectionManager,
     consumer: String,
     pub(super) queues: Vec<String>,
+    /// Queues this worker has been told not to take from. A copy of what the
+    /// store says, refreshed on the timer that pulls cancellations, so a claim
+    /// does not pay a round trip to learn that nothing is paused.
+    pub(super) held: Mutex<std::collections::HashSet<String>>,
     /// Shortest timeout registered anywhere, the floor for the pending sweep.
     pub(super) min_timeout_ms: AtomicU64,
     /// Slack added to every job's own timeout before its lease is considered
@@ -152,6 +156,9 @@ fn revoked_key(queue: &str) -> String {
 /// read so a cancel issued before an upgrade survives it.
 const REVOKED: &str = "tarsk:revoked";
 
+/// The queues nobody may take from just now.
+const PAUSED: &str = "tarsk:paused";
+
 impl RedisBroker {
     pub(super) async fn connect(url: &str, queues: Vec<String>) -> Res<RedisBroker> {
         let client = redis::Client::open(url)?;
@@ -208,6 +215,7 @@ impl RedisBroker {
                     .map(|d| d.as_nanos() as u64)
                     .unwrap_or(0),
             ),
+            held: Mutex::new(std::collections::HashSet::new()),
             claimed: Mutex::new(VecDeque::new()),
             prefetch: AtomicU64::new(1),
             prefetch_cap: AtomicU64::new(DEFAULT_PREFETCH_CAP),
@@ -450,8 +458,15 @@ impl RedisBroker {
         batch: u64,
         block: Duration,
     ) -> Res<Option<redis::streams::StreamReadReply>> {
-        if self.queues.len() > 1 {
-            for queue in &self.queues {
+        let queues = self.active();
+        if queues.is_empty() {
+            // Everything this worker serves is paused. Wait out the block
+            // like an empty queue would, rather than spin on a no-op.
+            tokio::time::sleep(block).await;
+            return Ok(None);
+        }
+        if queues.len() > 1 {
+            for queue in &queues {
                 let reply = self
                     .read_streams(std::slice::from_ref(queue), batch, None)
                     .await?;
@@ -470,8 +485,37 @@ impl RedisBroker {
         // in 201ms, no BLOCK in 0.1ms. A worker with N slots pays that stall
         // once per Ready, serially — 100 slots put ~10 seconds between a chain
         // step's Ack and the dispatch of the next step, which read as a hang.
-        self.read_streams(&self.queues, batch, (!block.is_zero()).then_some(block))
+        self.read_streams(&queues, batch, (!block.is_zero()).then_some(block))
             .await
+    }
+
+    /// The queues this worker serves, less the paused ones, in their order.
+    fn active(&self) -> Vec<String> {
+        let held = self.held.lock().unwrap();
+        self.queues
+            .iter()
+            .filter(|queue| !held.contains(*queue))
+            .cloned()
+            .collect()
+    }
+
+    pub(super) async fn set_paused(&self, queue: &str, paused: bool) -> Res<()> {
+        let mut conn = self.conn.clone();
+        let _: i64 = redis::cmd(if paused { "SADD" } else { "SREM" })
+            .arg(PAUSED)
+            .arg(queue)
+            .query_async(&mut conn)
+            .await?;
+        Ok(())
+    }
+
+    pub(super) async fn paused(&self) -> Res<Vec<String>> {
+        let mut conn = self.conn.clone();
+        let queues: Vec<String> = redis::cmd("SMEMBERS")
+            .arg(PAUSED)
+            .query_async(&mut conn)
+            .await?;
+        Ok(queues)
     }
 
     pub(super) async fn claim(&self, block: Duration) -> Res<Option<Delivery>> {

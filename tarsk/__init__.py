@@ -656,6 +656,20 @@ class App:
         """
         self.producer().cancel(task_id, queue=queue, ttl=ttl)
 
+    def pause(self, queue: str = "default") -> None:
+        """Stop every worker taking jobs from `queue`. Takes effect within a second.
+
+        For when whatever that queue's tasks call is down: the jobs wait where
+        they are instead of spending their retries against it, and the
+        workers' other queues carry on. Jobs already running finish; sending
+        to the queue still works. `resume` lets it go again.
+        """
+        self.producer().pause(queue, True)
+
+    def resume(self, queue: str = "default") -> None:
+        """Let workers take from `queue` again. See `pause`."""
+        self.producer().pause(queue, False)
+
     def result(self, task_id: str) -> "AsyncResult":
         """Handle for reading back a task that set `result_ttl`."""
         return AsyncResult(self, task_id)

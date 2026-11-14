@@ -404,6 +404,22 @@ impl Producer {
         .map_err(broker_err)
     }
 
+    /// Stop every worker taking from `queue`, or let them start again.
+    #[pyo3(signature = (queue="default", paused=true))]
+    fn pause(&self, py: Python<'_>, queue: &str, paused: bool) -> PyResult<()> {
+        py.detach(|| self.wake_then(self.broker.set_paused(queue, paused)))
+            .map_err(broker_err)
+    }
+
+    /// The queues paused just now.
+    fn paused(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        let mut queues = py
+            .detach(|| self.wake_then(self.broker.paused()))
+            .map_err(broker_err)?;
+        queues.sort();
+        Ok(queues)
+    }
+
     /// Backlog per queue: (queue, ready, in flight, delayed, dead).
     #[pyo3(signature = (queues))]
     fn depth(&self, py: Python<'_>, queues: Vec<String>) -> PyResult<Vec<DepthRow>> {

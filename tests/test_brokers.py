@@ -1665,6 +1665,40 @@ class _on_queue:
         self.spec = dataclasses.replace(task.spec, queue=queue)
 
 
+def _b44_a_paused_queue_waits(url, label, skip, app, env, log, producer):
+    if "cancel" in skip:
+        print(f"  {label}: skip pause — this broker has no store every worker can read")
+        return
+    # --- a paused queue is left alone, its neighbour is not, and it resumes
+    log.write_text("")
+    app.pause("default")
+    try:
+        assert producer.paused() == ["default"], producer.paused()
+        app.registry["note"].send("held-back")
+        app.registry["urgent"].send("unaffected")       # the queue called "high"
+        worker = start_worker(env, TARSK_QUEUES="high,default", TARSK_LEASE_GRACE=1)
+        try:
+            seen = wait_for(log, {"unaffected"}, timeout=60)
+            time.sleep(3)
+            seen = tags_in(log)
+            assert "unaffected" in seen, f"{label}: pausing one queue stopped another"
+            assert "held-back" not in seen, f"{label}: a paused queue was served: {seen}"
+            out = subprocess.run([sys.executable, "-m", "tarsk._cli", "status"],
+                                 env=env, capture_output=True, text=True, timeout=60)
+            assert "paused" in out.stdout, f"{label}: status does not say so:\n{out.stdout}"
+
+            # Let go from the command line, and the same worker picks it up.
+            subprocess.run([sys.executable, "-m", "tarsk._cli", "resume"],
+                           env=env, check=True, capture_output=True, timeout=60)
+            seen = wait_for(log, {"held-back"}, timeout=30)
+            assert "held-back" in seen, f"{label}: the queue never resumed"
+        finally:
+            stop_worker(worker)
+    finally:
+        app.resume("default")
+    assert producer.paused() == [], producer.paused()
+
+
 def _b38_redis_only(url, label, skip, app, env, log, producer):
     if not scheme_is(url, ("redis://", "rediss://")):
         return
@@ -1877,6 +1911,7 @@ def check_broker(url: str, label: str, skip: frozenset = frozenset()) -> None:
         _b41_a_missed_cron_run_is_caught_up(url, label, skip, app, env, log, producer)
         _b42_connecting_beside_a_busy_worker(url, label, skip, app, env, log, producer)
         _b43_a_batch_arrives_whole(url, label, skip, app, env, log, producer)
+        _b44_a_paused_queue_waits(url, label, skip, app, env, log, producer)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 

@@ -1,6 +1,8 @@
 [project]
 name = "tarsk"
-version = "0.3.0"
+# The version is Cargo's. maturin reads it from the workspace, so there is one
+# number to change for a release rather than two that can disagree.
+dynamic = ["version"]
 description = "Memory-bounded task queue for Python with a Rust runtime"
 readme = "README.md"
 requires-python = ">=3.11"

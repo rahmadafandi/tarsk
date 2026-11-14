@@ -1479,6 +1479,10 @@ def _b40_limits_hold_across_connections(url, label, skip, app, env, log, produce
 
     from tarsk._core import Producer
 
+    if not hasattr(Producer, "_acquire_slot"):
+        print(f"  {label}: skip limits-across-connections — this build has no test hooks "
+              "(maturin develop -F test-hooks)")
+        return
     callers = [Producer(broker_url=url) for _ in range(16)]
     stamp = os.urandom(4).hex()
     for round_no in range(20):

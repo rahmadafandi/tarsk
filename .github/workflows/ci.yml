@@ -39,7 +39,7 @@ jobs:
       # -F: pyproject.toml is the `tarsk` distribution now, which is memory
       # only. The source tree is where every backend is tested, so it gets all
       # of them — the per-distribution wheels are built in `distributions`.
-      - run: .venv/bin/maturin develop --release -F redis,postgres,amqp
+      - run: .venv/bin/maturin develop --release -F redis,postgres,amqp,test-hooks
 
       - run: .venv/bin/python tests/test_ipc.py
       - run: .venv/bin/python tests/test_recycle.py
@@ -94,7 +94,7 @@ jobs:
         run: |
           python -m venv .venv
           .venv/bin/pip install -q maturin msgpack
-          .venv/bin/maturin develop --release -F redis,postgres,amqp
+          .venv/bin/maturin develop --release -F redis,postgres,amqp,test-hooks
           .venv/bin/python tests/rss_probe.py
           .venv/bin/python tests/test_ipc.py
           .venv/bin/python tests/test_recycle.py

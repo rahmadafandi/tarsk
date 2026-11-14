@@ -438,7 +438,9 @@ impl Producer {
     ///
     /// Underscored: this is the supervisor's side of `max_concurrency`, here
     /// so the limit can be tested from several connections at once — which a
-    /// single worker, pipelining down one, never does.
+    /// single worker, pipelining down one, never does. Only in a build with
+    /// the `test-hooks` feature.
+    #[cfg(feature = "test-hooks")]
     fn _acquire_slot(
         &self,
         py: Python<'_>,
@@ -453,6 +455,7 @@ impl Producer {
 
     /// Take one of `task`'s rate-limit tokens: 0 if there was one, otherwise
     /// the milliseconds until there will be. See `_acquire_slot`.
+    #[cfg(feature = "test-hooks")]
     fn _take_token(&self, py: Python<'_>, task: &str, per_sec: f64, burst: u32) -> PyResult<u64> {
         py.detach(|| self.wake_then(self.broker.take_token(task, per_sec, burst)))
             .map_err(broker_err)

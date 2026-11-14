@@ -133,7 +133,7 @@ Without it, any Python 3.11+ and a recent stable Rust will build: the wheel is a
 python -m venv .venv && .venv/bin/pip install maturin msgpack
 # Every backend in one build: the published wheels take one each, the source
 # tree is where all four are tested.
-.venv/bin/maturin develop --release -F redis,postgres,amqp
+.venv/bin/maturin develop --release -F redis,postgres,amqp,test-hooks
 
 .venv/bin/python tests/test_ipc.py       # protocol, timeouts, retries
 .venv/bin/python tests/test_recycle.py   # the ceiling, soft timeouts, middleware

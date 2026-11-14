@@ -19,6 +19,9 @@ memory = ["tarsk-core/memory"]
 redis = ["tarsk-core/redis", "dep:rustls"]
 postgres = ["tarsk-core/postgres", "dep:rustls"]
 amqp = ["tarsk-core/amqp", "dep:rustls"]
+# Producer methods that exist so the tests can drive a limit from many
+# connections at once. Off in every published wheel.
+test-hooks = []
 
 [dependencies]
 tarsk-core = { path = "../tarsk-core", default-features = false }

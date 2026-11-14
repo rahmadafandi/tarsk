@@ -173,7 +173,8 @@ def test_hard_ceiling_holds_past_the_soft_one():
         assert sup.stats["children_hard_killed"] == 1, sup.stats
         # Ten megabytes every tenth of a second: stopped near the limit, not
         # at the end of the run.
-        held = int(marker.read_text())
+        # The last whole line: the kill can land in the middle of the next.
+        held = int([line for line in marker.read_text().split("\n") if line][-1])
         assert held <= 260, f"it was holding {held} MB when it was stopped"
         assert sup.stats["child_rss_peak"] < 320 * MB, sup.stats["child_rss_peak"] // MB
     finally:

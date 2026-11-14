@@ -237,7 +237,10 @@ def balloons(megabytes, marker=""):
     for held in range(10, megabytes + 1, 10):
         hoard.append(bytearray(10 * 1024 * 1024))
         if marker:
-            Path(marker).write_text(str(held))
+            # Appended, a line a step: this task is killed mid-run by design,
+            # and a file rewritten each time can be caught truncated and empty.
+            with open(marker, "a") as progress:
+                progress.write(f"{held}\n")
         time.sleep(0.1)
     time.sleep(1.5)
     return len(hoard)

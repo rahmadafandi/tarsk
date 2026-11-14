@@ -81,6 +81,9 @@ jobs:
         with:
           python-version: "3.12"
       - uses: dtolnay/rust-toolchain@stable
+      # This job builds every backend, which is rustls, lapin and the Postgres
+      # driver from scratch, and it was the only test job doing so uncached.
+      - uses: Swatinem/rust-cache@v2
       - name: Install Redis and Postgres
         run: |
           brew install -q redis postgresql@16

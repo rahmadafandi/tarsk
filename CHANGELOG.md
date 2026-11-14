@@ -1,6 +1,32 @@
 # Changelog
 
-## Unreleased
+## 0.3.0
+
+### Upgrading from 0.2
+
+Nothing in your tasks has to change. Four things are worth knowing before you roll it out:
+
+- **Broker failures raise `tarsk.BrokerError`, not `ValueError`.** Code that caught
+  `ValueError` around `send()`, `result()` or `cancel()` to survive an outage no longer
+  catches it. A URL this build has no backend for is still a `ValueError`.
+- **Upgrade the workers together where you can.** A 0.2 worker does not read where 0.3
+  keeps cancellations on Redis, so a cancel sent by a 0.3 producer is ignored by it; and
+  while both versions are running, each elects cron runs its own way, so a schedule can
+  fire once from each.
+- **Postgres changes its schema on the first 0.3 connection:** tables `tarsk_schema` and
+  `tarsk_cron_runs`, three columns on `tarsk_dead`, one on `tarsk_buckets`, and the function
+  `tarsk_acquire_slot`. It needs no downtime, and a 0.2 worker keeps running against it.
+- **On RabbitMQ, a message too large for 0.2 to have sent at all** — a chain, meta or
+  traceback past about 64KB — is written in a form a 0.2 worker cannot read. Everything
+  smaller is written as before.
+
+### Added
+
+- **`tarsk.BrokerError`.** Everything that talks to the broker from your process raised
+  `ValueError`, so retrying on an outage meant retrying on your own bad arguments too.
+- **A cron run missed while no worker was up is caught up.** The most recent one, once,
+  within a day. A schedule seen for the first time does not fire for a minute before it
+  existed.
 
 ### Fixed
 
@@ -55,6 +81,20 @@
 - `tarsk jobs --state …` filtered after `--limit`, so it could print nothing while
   matching jobs existed.
 - ctrl-C on `tarsk worker` ended a clean drain with a `KeyboardInterrupt` traceback.
+- **Postgres: a claim no longer reads the whole backlog.** It filtered on an `OR` and
+  sorted the result, so each claim scanned every waiting job — 126ms a claim with 200,000
+  queued, against 0.3ms now.
+- **RabbitMQ: a chain, meta or traceback over about 128KB closed the connection.** They
+  rode in the message headers, which travel in one frame. The send failed, or a job whose
+  traceback was too long could not be dead-lettered and came back without end.
+- **Redis: deadlines are kept on the server's clock.** Delayed jobs, concurrency slots, rate
+  limits and cancellations were stamped by each client and compared by all of them, so
+  hosts a few seconds apart disagreed about when anything was due.
+- **Postgres: a producer loses no call to a dropped connection.** It notices before it
+  sends. On Redis the call that finds the connection gone still fails once.
+- `cancel(ttl=float("inf"))` wrapped into the past on Redis and was forgotten at once. A
+  cancellation now lasts at most ten years.
+- A queue name containing a quote or a newline corrupted the `/metrics` output.
 - **Cron: `7` is Sunday.** `0 0 * * 7` was refused, and a schedule that cannot be parsed
   was dropped without a word. It is now reported once on the worker's stderr.
 - **Console without a token answers only as `127.0.0.1`, `localhost` or `[::1]`.** The
@@ -75,10 +115,13 @@
 - `set_progress` no longer holds up a child's other frames while it is written.
 - `Task.send`, `send_async`, `send_in`, `send_at` and `si` carry the handler's signature,
   so a type checker sees a wrong argument at the call site.
-- Redis: cancellations are stored under one key, `tarsk:revoked`. The per-queue keys
-  0.2.1 wrote are still read.
-- Postgres: adds `tarsk_schema`, three columns on `tarsk_dead`, one on `tarsk_buckets`
-  and the function `tarsk_acquire_slot`. Applied automatically on first connect.
+- Redis: cancellations are stored under one key, `tarsk:revoked`, and each schedule's last
+  run under `tarsk:cron:last:<task>`. The per-queue cancellation keys 0.2 wrote are still
+  read.
+- Postgres: the schema additions listed under *Upgrading*, applied on first connect and
+  not again until the schema next changes. `tarsk_cron` is no longer used.
+- A producer's `send` is about 2% slower: it now gives its connection a turn to notice it
+  has been closed before sending on it.
 - The release workflow runs the full CI before it builds anything to publish.
 
 ## 0.2.1

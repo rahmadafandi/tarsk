@@ -27,6 +27,10 @@ a build without the backend your URL asks for names the package you want.
 > `pip uninstall tarsk` and install the package for your broker. Nothing in your code
 > changes. See [CHANGELOG.md](CHANGELOG.md).
 
+> **Upgrading from 0.2:** broker failures now raise `tarsk.BrokerError` instead of
+> `ValueError`, and the workers of a fleet are best upgraded together. The four things worth
+> knowing are at the top of [CHANGELOG.md](CHANGELOG.md).
+
 > **Status: early.** The version badge above reads live from PyPI — a number written here
 > went stale twice before this sentence replaced it. Wheels for Linux (glibc and musl,
 > x86_64 and aarch64), macOS universal2 and Windows x64, on Python 3.11 through 3.14

@@ -12,11 +12,17 @@ import datetime
 import decimal
 import struct
 import uuid
-from typing import Any
+from typing import Any, cast
 
 import msgpack
 
 _LEN = struct.Struct(">I")
+
+
+def _packb(value: Any, **options: Any) -> bytes:
+    # msgpack's own signature admits None, which it returns only when handed a
+    # stream to write into. Nothing here does.
+    return cast(bytes, msgpack.packb(value, **options))
 
 # ponytail: fixed ceiling. Raise it, or make it a supervisor flag, only once a
 # real payload trips it — an unbounded length prefix is a remote OOM.
@@ -24,7 +30,7 @@ MAX_FRAME = 32 * 1024 * 1024
 
 
 def encode(tag: str, *args: Any) -> bytes:
-    body = msgpack.packb([tag, *args], use_bin_type=True)
+    body = _packb([tag, *args], use_bin_type=True)
     return _LEN.pack(len(body)) + body
 
 
@@ -81,7 +87,7 @@ def _extend(obj: Any) -> msgpack.ExtType:
         # round trip that a float would round off.
         return msgpack.ExtType(
             _TIMEDELTA,
-            msgpack.packb([obj.days, obj.seconds, obj.microseconds]),
+            _packb([obj.days, obj.seconds, obj.microseconds]),
         )
     if isinstance(obj, decimal.Decimal):
         # As text. A Decimal that came back as a float would be the exact bug
@@ -90,9 +96,9 @@ def _extend(obj: Any) -> msgpack.ExtType:
     if isinstance(obj, uuid.UUID):
         return msgpack.ExtType(_UUID, obj.bytes)
     if isinstance(obj, frozenset):
-        return msgpack.ExtType(_FROZENSET, msgpack.packb(list(obj), default=_extend))
+        return msgpack.ExtType(_FROZENSET, _packb(list(obj), default=_extend))
     if isinstance(obj, set):
-        return msgpack.ExtType(_SET, msgpack.packb(list(obj), default=_extend))
+        return msgpack.ExtType(_SET, _packb(list(obj), default=_extend))
     raise TypeError(
         f"cannot send a {type(obj).__name__}: tarsk carries JSON-shaped values plus "
         "datetime, date, time, timedelta, Decimal, UUID, set and frozenset. Convert it "
@@ -135,7 +141,7 @@ def pack_args(args: tuple, kwargs: dict) -> bytes:
     # Raises on an unknown type, unlike pack_result below. The difference is
     # deliberate: here nothing has happened yet and the caller can fix the call,
     # there the task has already run and its side effects are already spent.
-    return msgpack.packb([list(args), kwargs], use_bin_type=True, default=_extend)
+    return _packb([list(args), kwargs], use_bin_type=True, default=_extend)
 
 
 def unpack_args(payload: bytes) -> tuple[list, dict]:
@@ -145,7 +151,7 @@ def unpack_args(payload: bytes) -> tuple[list, dict]:
 
 def pack_chain(rows: list) -> bytes:
     """The steps after the first, as the supervisor will read them."""
-    return msgpack.packb(rows, use_bin_type=True, default=_extend)
+    return _packb(rows, use_bin_type=True, default=_extend)
 
 
 def _extend_or_describe(obj: Any) -> Any:
@@ -160,7 +166,7 @@ def pack_result(value: Any) -> bytes:
     # ponytail: degrades an unserializable return value instead of failing.
     # Nacking here would redeliver a task that already ran its side effects; the
     # result backend is off by default anyway (spec §4.3).
-    return msgpack.packb(value, use_bin_type=True, default=_extend_or_describe)
+    return _packb(value, use_bin_type=True, default=_extend_or_describe)
 
 
 def unpack_result(payload: bytes) -> Any:

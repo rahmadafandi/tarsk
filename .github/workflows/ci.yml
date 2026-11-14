@@ -102,6 +102,9 @@ jobs:
       # Pyflakes-level only; the rule set is in pyproject.toml. The package
       # ships py.typed and nothing had ever looked at the Python.
       - run: pipx run ruff check tarsk tests packaging
+      # The package ships py.typed and typed signatures for send(); this is
+      # what holds them to it. msgpack is installed so its import resolves.
+      - run: pip install msgpack && pipx run pyright
 
   test-macos:
     # The wheel has been built for macOS since the first CI commit and nothing

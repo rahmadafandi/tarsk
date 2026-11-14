@@ -14,6 +14,7 @@ import os
 import signal
 import sys
 import traceback
+from typing import Callable
 
 from . import Context, Reject, Retry, SoftTimeout, Task, _finish, load_app
 from . import _proto
@@ -94,8 +95,8 @@ class _Control:
 
     __slots__ = ("stop",)
 
-    def __init__(self):
-        self.stop = None
+    def __init__(self) -> None:
+        self.stop: Callable[[], None] | None = None
 
 
 class _Cancelled(Exception):
@@ -232,7 +233,9 @@ async def _connect(address: str):
     loop = asyncio.get_running_loop()
     reader = asyncio.StreamReader()
     protocol = asyncio.StreamReaderProtocol(reader)
-    transport, _ = await loop.create_pipe_connection(lambda: protocol, address)
+    # Only the Windows event loop has this, and only Windows reaches here.
+    connect = getattr(loop, "create_pipe_connection")
+    transport, _ = await connect(lambda: protocol, address)
     return reader, asyncio.StreamWriter(transport, protocol, reader, loop)
 
 

@@ -57,6 +57,12 @@ python-source = "."
 features = ["pyo3/extension-module"]
 include = [{ path = "tarsk/py.typed", format = "sdist" }]
 
+[tool.pyright]
+# The package only. The tests and benches are scripts that reach into its
+# internals on purpose, and a checker's opinion of them is not the point.
+include = ["tarsk"]
+pythonVersion = "3.11"
+
 [tool.ruff]
 target-version = "py311"
 

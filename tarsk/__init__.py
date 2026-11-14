@@ -17,7 +17,7 @@ import os
 import re
 import secrets
 from dataclasses import dataclass, field
-from typing import Callable, Generic, ParamSpec, TypeVar
+from typing import Any, Callable, Generic, ParamSpec, TypeVar
 
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -158,7 +158,7 @@ class Context:
     cancelled: bool = False
     #: Set by the worker. Sends progress to the supervisor, which is the only
     #: process here holding a broker connection (spec §4.1).
-    _emit: object = None
+    _emit: Callable[[Any], None] | None = None
 
     def set_progress(self, value) -> None:
         """Publish where this task has got to, readable via AsyncResult.
@@ -476,7 +476,11 @@ class App:
                     f"{fn.__qualname__}: soft_timeout={soft_timeout}s must be less than "
                     f"timeout={t}s, or it would never fire"
                 )
-            if soft_timeout and not inspect.iscoroutinefunction(fn):
+            # Asked of a copy typed loosely: `iscoroutinefunction` narrows what
+            # it is given, and narrowing `fn` here would change the type of the
+            # Task built from it below.
+            handler: Any = fn
+            if soft_timeout and not inspect.iscoroutinefunction(handler):
                 # A Python thread cannot be interrupted (spec §4.5), so there is
                 # nowhere to raise this. Refusing beats accepting a flag that
                 # silently does nothing for the handler that asked for it.

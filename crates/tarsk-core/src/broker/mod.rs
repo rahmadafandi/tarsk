@@ -526,6 +526,12 @@ impl Broker {
     /// `queue` is recorded where the store has a column for it and decides
     /// nothing: cancellations are matched by id alone.
     pub async fn revoke(&self, queue: &str, id: &str, ttl_ms: u64) -> Res<()> {
+        // Ten years is as good as forever, and unlike forever it can be added
+        // to a clock. `ttl=float("inf")` used to wrap round into the past on
+        // Redis, where the cancellation was pruned by the next read, and to
+        // panic outright on the memory broker.
+        const LONGEST_MS: u64 = 10 * 365 * 86_400_000;
+        let ttl_ms = ttl_ms.min(LONGEST_MS);
         match self {
             Broker::Memory(b) => b.revoke(id, ttl_ms),
             #[cfg(feature = "redis")]
@@ -910,6 +916,13 @@ mod tests {
         broker.retry(&seen.receipt, wait).await.unwrap();
         let after = broker.claim(wait, wait).await.unwrap().unwrap();
         assert_eq!(after.attempt, 2);
+    }
+
+    #[tokio::test]
+    async fn a_cancellation_can_be_asked_to_last_forever() {
+        let broker = Broker::connect("memory://", Vec::new()).await.unwrap();
+        broker.revoke("default", "j", u64::MAX).await.unwrap();
+        assert_eq!(broker.revoked_all().await.unwrap(), vec!["j".to_string()]);
     }
 
     #[tokio::test]

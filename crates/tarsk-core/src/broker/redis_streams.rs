@@ -145,7 +145,7 @@ fn revoked_key(queue: &str) -> String {
 }
 
 /// Where cancellations live: one set for every queue, because an id is unique
-/// without one. `revoked_key` is where 0.2.1 and earlier wrote them, still
+/// without one. `revoked_key` is where 0.2 wrote them, still
 /// read so a cancel issued before an upgrade survives it.
 const REVOKED: &str = "tarsk:revoked";
 

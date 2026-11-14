@@ -151,7 +151,21 @@ const REVOKED: &str = "tarsk:revoked";
 
 impl RedisBroker {
     pub(super) async fn connect(url: &str, queues: Vec<String>) -> Res<RedisBroker> {
-        let client = redis::Client::open(url)?;
+        use redis::IntoConnectionInfo;
+        let mut info = url.into_connection_info()?;
+        // RESP3 unless the URL says otherwise. It is what lets the connection
+        // manager hear a disconnect when it happens: on RESP2 it finds out
+        // only when a command fails, so a producer that had been idle lost
+        // the first call it made after every failover. `?protocol=2` is still
+        // honoured, and is what a Redis older than 6 needs.
+        if !url.contains("protocol=") {
+            let settings = info
+                .redis_settings()
+                .clone()
+                .set_protocol(redis::ProtocolVersion::RESP3);
+            info = info.set_redis_settings(settings);
+        }
+        let client = redis::Client::open(info)?;
         // Managers rather than bare connections: they reconnect after a
         // failover or a restart, where a multiplexed connection stays closed
         // and leaves a worker that is up, healthy to its orchestrator, and

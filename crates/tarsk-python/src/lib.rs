@@ -17,9 +17,24 @@ use tarsk_core::{
     build_cfg, console, io_err, new_shared, socket_dir, supervise, transport, Outcome,
 };
 
-/// A broker failure as Python sees it, with its causes attached.
+/// A broker failure as Python sees it: `tarsk.BrokerError`, causes attached.
+///
+/// The class lives in the Python package, not here, because children import
+/// that package and must never import this module to do it — so it is looked
+/// up when an error actually happens. ValueError is the fallback for a
+/// `tarsk` too old or too broken to have it, which is what this raised before.
 fn broker_err(err: Box<dyn std::error::Error + Send + Sync>) -> PyErr {
-    PyValueError::new_err(tarsk_core::broker::describe(err.as_ref()))
+    let message = tarsk_core::broker::describe(err.as_ref());
+    Python::attach(|py| {
+        let raised = py
+            .import("tarsk")
+            .and_then(|module| module.getattr("BrokerError"))
+            .and_then(|class| class.call1((message.as_str(),)));
+        match raised {
+            Ok(error) => PyErr::from_value(error),
+            Err(_) => PyValueError::new_err(message),
+        }
+    })
 }
 
 fn to_python(py: Python<'_>, outcomes: Vec<(u64, Outcome)>) -> PyResult<Vec<Py<PyAny>>> {
@@ -235,6 +250,10 @@ struct Producer {
 impl Producer {
     #[new]
     fn new(py: Python<'_>, broker_url: String) -> PyResult<Self> {
+        // A URL this build has no backend for is the caller's mistake and not
+        // the broker's, so it stays a ValueError — and names the package to
+        // install, which no amount of retrying would have found.
+        tarsk_core::broker::supports(&broker_url).map_err(PyValueError::new_err)?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;

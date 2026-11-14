@@ -33,6 +33,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 os.chdir(ROOT)
 
+from tarsk import BrokerError  # noqa: E402
+
 def _find_pg() -> Path | None:
     """Where initdb lives, on Debian and on Homebrew.
 
@@ -1316,7 +1318,7 @@ def _b35_a_dropped_connection_comes_back(url, label, skip, app, env, log, produc
             stop_worker(worker)
         try:
             producer.depth([f"result:{held}"])
-        except ValueError:
+        except BrokerError:
             pass
         else:
             raise AssertionError(f"{label}: the conflicting declare was expected to fail")
@@ -1368,7 +1370,7 @@ def _b36_a_failed_send_frees_its_reservation(url, label, skip, app, env, log, pr
         broken = "no\x00such"  # Postgres refuses a NUL in text
     try:
         once.options(queue=broken, dedup_key=key, dedup_ttl=60).send("freed")
-    except ValueError:
+    except BrokerError:
         pass
     else:
         raise AssertionError(f"{label}: the send to {broken!r} was expected to fail")
@@ -1864,7 +1866,7 @@ def test_postgres_tls_is_compiled_in():
     for mode in ("require", "verify-full"):
         try:
             Producer(broker_url=f"postgres://u:p@127.0.0.1:1/db?sslmode={mode}")
-        except ValueError as exc:
+        except BrokerError as exc:
             text = str(exc)
             assert "invalid connection string" not in text, f"{mode} rejected outright: {text}"
             assert "TLS handshake" not in text, f"{mode} has no TLS support: {text}"
@@ -1886,7 +1888,7 @@ def test_tls_is_compiled_in():
     # get far enough to succeed for the wrong reason.
     try:
         Producer(broker_url="rediss://127.0.0.1:1/0")
-    except ValueError as exc:
+    except BrokerError as exc:
         assert "feature is not enabled" not in str(exc), "redis built without TLS"
         assert "CryptoProvider" not in str(exc), "rustls has no crypto provider selected"
     else:

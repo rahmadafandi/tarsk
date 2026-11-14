@@ -141,6 +141,25 @@ fn unsupported(url: &str) -> String {
     }
 }
 
+/// Whether this build has a backend for `url` at all.
+///
+/// Separate from connecting so a caller can tell the two failures apart: a
+/// URL no backend here will take is a mistake in the URL or the install, and
+/// stays wrong however often it is retried; a backend that could not be
+/// reached may be there in a second.
+pub fn supports(url: &str) -> Result<(), String> {
+    let served = url == "memory://"
+        || url.is_empty()
+        || (cfg!(feature = "redis") && scheme_is(url, REDIS_SCHEMES))
+        || (cfg!(feature = "postgres") && scheme_is(url, POSTGRES_SCHEMES))
+        || (cfg!(feature = "amqp") && scheme_is(url, AMQP_SCHEMES));
+    if served {
+        Ok(())
+    } else {
+        Err(unsupported(url))
+    }
+}
+
 /// Queue key. Shared rather than Redis-only: the AMQP broker names its
 /// queues with it too, so gating it with the Redis driver takes AMQP down.
 #[cfg(any(feature = "redis", feature = "amqp"))]

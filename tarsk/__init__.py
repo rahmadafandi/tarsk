@@ -24,7 +24,7 @@ P = ParamSpec("P")
 R = TypeVar("R")
 
 __all__ = [
-    "App", "AsyncResult", "Chain", "Context", "Depends", "Group", "Signature",
+    "App", "AsyncResult", "BrokerError", "Chain", "Context", "Depends", "Group", "Signature",
     "Task", "TaskFailed", "TaskSpec", "Reject", "Retry", "SoftTimeout",
     "chain", "group", "load_app",
 ]
@@ -759,6 +759,20 @@ def load_app(spec: str) -> App:
     if not isinstance(app, App):
         raise TypeError(f"{spec} is {type(app).__name__}, not an App")
     return app
+
+
+class BrokerError(Exception):
+    """The broker could not be reached, or refused what it was asked.
+
+    Raised by everything that talks to one from this process — `send`,
+    `result`, `cancel`, and the listing calls behind the CLI. It is its own
+    type so that a caller can retry or queue locally on an outage without
+    also swallowing its own mistakes: a bad argument, or a broker URL this
+    build has no backend for, is still a `ValueError`.
+
+    The message carries the driver's cause, which is where the useful part
+    usually is.
+    """
 
 
 class SoftTimeout(Exception):

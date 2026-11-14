@@ -303,6 +303,33 @@ def test_each_send_mints_its_own_id():
     assert pinned.send() == pinned.send() == "mine", "an explicit id must be kept"
 
 
+def test_a_broker_failure_has_its_own_type():
+    """An outage is a BrokerError; a URL no backend takes is still a ValueError.
+
+    They were both ValueError, so retrying on one meant retrying on the other,
+    and on every bad argument as well.
+    """
+    from tarsk import BrokerError
+    from tarsk._core import Producer, backends
+
+    assert not issubclass(BrokerError, ValueError)
+    try:
+        Producer(broker_url="carrier-pigeon://coop/0")
+    except ValueError as why:
+        assert "unsupported broker url" in str(why), why
+    else:
+        raise AssertionError("a scheme nothing serves was accepted")
+
+    if "redis" not in backends():
+        raise SkipTest("needs a build with a network backend to fail to reach")
+    try:
+        Producer(broker_url="redis://127.0.0.1:1/0")  # nothing listens on port 1
+    except BrokerError as why:
+        assert str(why), "the error carries no cause"
+    else:
+        raise AssertionError("connecting to a dead port should not succeed")
+
+
 def test_a_forked_process_gets_its_own_producer():
     """A producer made before a fork must not be the one the child sends on."""
     if not hasattr(os, "fork"):
@@ -387,6 +414,7 @@ if __name__ == "__main__":
                   test_waiting_for_a_slot_is_not_an_attempt,
                   test_a_worker_dependency_resolves_once,
                   test_each_send_mints_its_own_id,
+                  test_a_broker_failure_has_its_own_type,
                   test_a_forked_process_gets_its_own_producer,
                   test_connecting_does_not_hold_the_gil):
         try:

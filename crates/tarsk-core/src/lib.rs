@@ -2227,7 +2227,11 @@ pub async fn supervise_until(
                     .map(|d| d.as_secs() as i64)
                     .unwrap_or(0);
                 let minute = now / 60;
-                if fired != Some(minute) {
+                // Not until a child has registered: before that there are no
+                // schedules to read, and marking the minute done anyway cost a
+                // freshly started worker the rest of it before it looked again.
+                let registered = shared.registry.lock().unwrap().is_some();
+                if registered && fired != Some(minute) {
                     fired = Some(minute);
                     fire_due(&shared, minute, &mut cron).await;
                 }

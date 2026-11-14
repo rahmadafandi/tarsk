@@ -1526,6 +1526,38 @@ def _b38_redis_only(url, label, skip, app, env, log, producer):
         stranded.unlink(missing_ok=True)
 
 
+def _b39_large_things_travel(url, label, skip, app, env, log, producer):
+    # --- a chain, a meta and a traceback each too big for an AMQP frame ----
+    # RabbitMQ carries a message's headers in one frame of at most 131,072
+    # bytes, and that is where all three used to ride: the send failed, or a
+    # job that could not be dead-lettered came back for ever.
+    from tarsk import chain
+
+    big = 200_000
+    before = count_dead(url)
+    steps = chain(app.registry["shout"].si("first"), app.registry["shout"].si("y" * big))
+    steps.send()
+    tagged = app.registry["labelled"].options(meta={"trace": "t", "blob": "m" * big}).send("big")
+    app.registry["fails_loudly"].send(big)
+    worker = start_worker(env, TARSK_LEASE_GRACE=1)
+    try:
+        tail = app.result(steps.result_id).get(timeout=60)
+        assert tail == "Y" * big, f"{label}: the chain's large step arrived as {len(tail)} bytes"
+        meta = app.result(tagged).get(timeout=60)
+        assert len(meta["blob"]) == big, f"{label}: the meta arrived as {len(meta['blob'])} bytes"
+        deadline = time.time() + 60
+        while time.time() < deadline and count_dead(url) <= before:
+            time.sleep(0.2)
+        parked = [e for e in producer.dead_list(queue="default", limit=50)
+                  if e[1] == "fails_loudly"]
+        assert parked, f"{label}: the job with the large traceback never reached the dead letters"
+        assert len(parked[-1][3]) > big, \
+            f"{label}: its traceback was cut to {len(parked[-1][3])} bytes"
+    finally:
+        stop_worker(worker)
+        producer.dead_purge(queue="default")
+
+
 def check_broker(url: str, label: str, skip: frozenset = frozenset()) -> None:
     """`skip` names capability blocks a broker cannot express, by design.
 
@@ -1590,6 +1622,7 @@ def check_broker(url: str, label: str, skip: frozenset = frozenset()) -> None:
         _b36_a_failed_send_frees_its_reservation(url, label, skip, app, env, log, producer)
         _b37_many_workers_share_one_cap(url, label, skip, app, env, log, producer)
         _b38_redis_only(url, label, skip, app, env, log, producer)
+        _b39_large_things_travel(url, label, skip, app, env, log, producer)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 

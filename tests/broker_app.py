@@ -259,3 +259,9 @@ def strands_once(tag):
         time.sleep(60)
     _log(tag)
     return tag
+
+
+@app.task(name="fails_loudly")
+def fails_loudly(size):
+    """Dies with a message the size of a deep recursion's traceback."""
+    raise RuntimeError("x" * size)

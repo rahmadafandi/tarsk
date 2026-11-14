@@ -83,18 +83,99 @@ fn amqp_header_bytes(headers: &lapin::types::FieldTable, key: &str) -> Vec<u8> {
     }
 }
 
-/// The record, read back off the headers `encode` wrote.
-fn amqp_record_from(headers: &lapin::types::FieldTable, data: &[u8]) -> AmqpRecord {
-    AmqpRecord {
+/// Past this many bytes of chain, meta and failure text, a message carries
+/// them in its body instead of its headers.
+///
+/// AMQP sends a message's headers as one frame, and a frame has a ceiling the
+/// server sets — 131,072 bytes on RabbitMQ unless someone raised it. A chain
+/// whose steps carry real payloads, or the traceback of a RecursionError, goes
+/// straight through that, and the server answers by closing the connection: the
+/// send fails, or worse, a job that could not be dead-lettered is redelivered
+/// for ever. Half the ceiling, to leave room for everything else in the frame.
+const INLINE_LIMIT: usize = 64 * 1024;
+
+/// Marks a body that is an envelope rather than the bare payload.
+const ENVELOPE: &str = "tarsk-body";
+
+/// `[payload, chain, meta, [[key, value], …]]`, msgpack. The pairs are the
+/// headers that would have been text: what failed, and its traceback.
+fn seal(record: &AmqpRecord, extra: &[(&str, &str)]) -> Vec<u8> {
+    use rmpv::Value;
+    let pairs = extra
+        .iter()
+        .map(|(key, value)| Value::Array(vec![Value::from(*key), Value::from(*value)]))
+        .collect();
+    let envelope = Value::Array(vec![
+        Value::Binary(record.payload.clone()),
+        Value::Binary(record.chain.clone()),
+        Value::Binary(record.meta.clone()),
+        Value::Array(pairs),
+    ]);
+    let mut out = Vec::new();
+    // Writing to a Vec cannot fail.
+    let _ = rmpv::encode::write_value(&mut out, &envelope);
+    out
+}
+
+/// What an envelope held: payload, chain, meta, and the text pairs.
+type Opened = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<(String, String)>);
+
+fn open(data: &[u8]) -> Option<Opened> {
+    use rmpv::Value;
+    let Ok(Value::Array(parts)) = rmpv::decode::read_value(&mut &data[..]) else {
+        return None;
+    };
+    let bytes = |at: usize| parts.get(at)?.as_slice().map(<[u8]>::to_vec);
+    let pairs = match parts.get(3) {
+        Some(Value::Array(pairs)) => pairs
+            .iter()
+            .filter_map(|pair| {
+                let pair = pair.as_array()?;
+                Some((
+                    pair.first()?.as_str()?.to_string(),
+                    pair.get(1)?.as_str()?.to_string(),
+                ))
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    Some((bytes(0)?, bytes(1)?, bytes(2)?, pairs))
+}
+
+/// The record, read back off the headers `encode` wrote — and off the body,
+/// when the message was too large to keep everything in its headers.
+///
+/// The second half of the result is the text an envelope carried, which the
+/// dead-letter listing reads; for a message that fitted, it is in the headers
+/// and this is empty.
+fn amqp_read(
+    headers: &lapin::types::FieldTable,
+    data: &[u8],
+) -> (AmqpRecord, Vec<(String, String)>) {
+    let sealed = amqp_header_u64(headers, ENVELOPE) == 2;
+    let (payload, chain, meta, pairs) = sealed.then(|| open(data)).flatten().unwrap_or_else(|| {
+        (
+            data.to_vec(),
+            amqp_header_bytes(headers, "tarsk-chain"),
+            amqp_header_bytes(headers, "tarsk-meta"),
+            Vec::new(),
+        )
+    });
+    let record = AmqpRecord {
         id: amqp_header_str(headers, "tarsk-id"),
         name: amqp_header_str(headers, "tarsk-name"),
-        payload: data.to_vec(),
+        payload,
         timeout_ms: amqp_header_u64(headers, "tarsk-timeout-ms") as u32,
-        chain: amqp_header_bytes(headers, "tarsk-chain"),
-        meta: amqp_header_bytes(headers, "tarsk-meta"),
+        chain,
+        meta,
         expires_ms: amqp_header_u64(headers, "tarsk-expires-ms"),
         attempt: amqp_header_u64(headers, "tarsk-attempt") as u32,
-    }
+    };
+    (record, pairs)
+}
+
+fn amqp_record_from(headers: &lapin::types::FieldTable, data: &[u8]) -> AmqpRecord {
+    amqp_read(headers, data).0
 }
 
 impl AmqpBroker {
@@ -198,11 +279,16 @@ impl AmqpBroker {
         Ok(name)
     }
 
+    /// The headers, and the body if it has to be an envelope.
+    ///
+    /// A message that fits is written exactly as 0.2 wrote it, so a worker
+    /// that has not been upgraded reads it. Only one that could not have been
+    /// published at all before is written the new way.
     fn encode(
         record: &AmqpRecord,
         ready_at_ms: u64,
         extra: &[(&str, &str)],
-    ) -> lapin::BasicProperties {
+    ) -> (lapin::BasicProperties, Option<Vec<u8>>) {
         use lapin::types::AMQPValue;
         let mut headers = lapin::types::FieldTable::default();
         headers.insert(
@@ -229,24 +315,33 @@ impl AmqpBroker {
             "tarsk-ready-at".into(),
             AMQPValue::LongLongInt(ready_at_ms as i64),
         );
-        if !record.chain.is_empty() {
-            headers.insert(
-                "tarsk-chain".into(),
-                AMQPValue::ByteArray(record.chain.clone().into()),
-            );
+        let bulk = record.chain.len()
+            + record.meta.len()
+            + extra.iter().map(|(_, value)| value.len()).sum::<usize>();
+        let body = (bulk > INLINE_LIMIT).then(|| seal(record, extra));
+        if body.is_some() {
+            headers.insert(ENVELOPE.into(), AMQPValue::LongLongInt(2));
+        } else {
+            if !record.chain.is_empty() {
+                headers.insert(
+                    "tarsk-chain".into(),
+                    AMQPValue::ByteArray(record.chain.clone().into()),
+                );
+            }
+            if !record.meta.is_empty() {
+                headers.insert(
+                    "tarsk-meta".into(),
+                    AMQPValue::ByteArray(record.meta.clone().into()),
+                );
+            }
+            for (key, value) in extra {
+                headers.insert((*key).into(), AMQPValue::LongString((*value).into()));
+            }
         }
-        if !record.meta.is_empty() {
-            headers.insert(
-                "tarsk-meta".into(),
-                AMQPValue::ByteArray(record.meta.clone().into()),
-            );
-        }
-        for (key, value) in extra {
-            headers.insert((*key).into(), AMQPValue::LongString((*value).into()));
-        }
-        lapin::BasicProperties::default()
+        let properties = lapin::BasicProperties::default()
             .with_delivery_mode(2)
-            .with_headers(headers)
+            .with_headers(headers);
+        (properties, body)
     }
 
     async fn publish_record(
@@ -256,6 +351,7 @@ impl AmqpBroker {
         ready_at_ms: u64,
         extra: &[(&str, &str)],
     ) -> Res<()> {
+        let (properties, envelope) = Self::encode(record, ready_at_ms, extra);
         self.link()
             .await?
             .channel
@@ -263,8 +359,8 @@ impl AmqpBroker {
                 "".into(),
                 target.into(),
                 lapin::options::BasicPublishOptions::default(),
-                &record.payload,
-                Self::encode(record, ready_at_ms, extra),
+                envelope.as_deref().unwrap_or(&record.payload),
+                properties,
             )
             .await?
             .await?;
@@ -479,8 +575,16 @@ impl AmqpBroker {
                 break;
             };
             let empty = lapin::types::FieldTable::default();
-            let headers = msg.properties.headers().as_ref().unwrap_or(&empty).clone();
-            let record = amqp_record_from(&headers, &msg.data);
+            let mut headers = msg.properties.headers().as_ref().unwrap_or(&empty).clone();
+            let (record, pairs) = amqp_read(&headers, &msg.data);
+            // Put back where the listings look for it. In memory a header has
+            // no ceiling; it was only ever the wire that did.
+            for (key, value) in pairs {
+                headers.insert(
+                    key.as_str().into(),
+                    lapin::types::AMQPValue::LongString(value.into()),
+                );
+            }
             let ready = amqp_header_u64(&headers, "tarsk-ready-at");
             seen.push((record, ready, headers, msg.acker.clone()));
         }
@@ -693,5 +797,91 @@ impl AmqpBroker {
         }
         self.requeue_all(keep).await?;
         Ok(hit)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(chain: usize, meta: usize) -> AmqpRecord {
+        AmqpRecord {
+            id: "id".into(),
+            name: "task".into(),
+            payload: b"payload".to_vec(),
+            timeout_ms: 1_000,
+            chain: vec![7; chain],
+            meta: vec![9; meta],
+            expires_ms: 5,
+            attempt: 2,
+        }
+    }
+
+    fn round_trip(
+        record: &AmqpRecord,
+        extra: &[(&str, &str)],
+    ) -> (bool, AmqpRecord, Vec<(String, String)>) {
+        let (properties, body) = AmqpBroker::encode(record, 0, extra);
+        let headers = properties.headers().clone().unwrap();
+        let sealed = body.is_some();
+        let (read, pairs) = amqp_read(&headers, body.as_deref().unwrap_or(&record.payload));
+        (sealed, read, pairs)
+    }
+
+    #[test]
+    fn a_message_that_fits_is_written_as_it_always_was() {
+        // Headers only, bare payload: the form a 0.2 worker reads.
+        let small = record(100, 100);
+        let (sealed, read, pairs) = round_trip(&small, &[("tarsk-error", "boom")]);
+        assert!(!sealed);
+        assert!(pairs.is_empty(), "small text stays in the headers");
+        assert_eq!(
+            (read.payload, read.chain.len(), read.meta.len()),
+            (b"payload".to_vec(), 100, 100)
+        );
+    }
+
+    #[test]
+    fn a_message_too_large_for_its_headers_goes_in_the_body() {
+        // Each of these alone is past RabbitMQ's 131,072-byte frame.
+        let traceback = "x".repeat(300_000);
+        for (big, extra) in [
+            (record(200_000, 0), vec![]),
+            (record(0, 200_000), vec![]),
+            (
+                record(10, 10),
+                vec![
+                    ("tarsk-error", "RecursionError"),
+                    ("tarsk-traceback", traceback.as_str()),
+                ],
+            ),
+        ] {
+            let (properties, body) = AmqpBroker::encode(&big, 0, &extra);
+            let headers = properties.headers().clone().unwrap();
+            assert!(body.is_some(), "a 200KB header would have been refused");
+            let mut wire = Vec::new();
+            for (key, value) in headers.inner() {
+                wire.push(key.as_str().len() + format!("{value:?}").len());
+            }
+            assert!(
+                wire.iter().sum::<usize>() < 4_096,
+                "the headers are still large: {wire:?}"
+            );
+
+            let (sealed, read, pairs) = round_trip(&big, &extra);
+            assert!(sealed);
+            assert_eq!(read.payload, big.payload);
+            assert_eq!(read.chain, big.chain);
+            assert_eq!(read.meta, big.meta);
+            assert_eq!(
+                (read.id.as_str(), read.attempt, read.expires_ms),
+                ("id", 2, 5)
+            );
+            let expected: Vec<(String, String)> = extra
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            assert_eq!(pairs, expected);
+        }
     }
 }

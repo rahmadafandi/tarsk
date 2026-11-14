@@ -1906,6 +1906,110 @@ async fn slot(shared: Arc<Shared>, cfg: Arc<Cfg>) {
     }
 }
 
+/// How far back a missed cron run is still worth firing, in minutes.
+///
+/// A day: long enough to cover a deploy that went wrong overnight, short
+/// enough that a worker switched back on after a month does not start by
+/// running last month's reports.
+const CRON_CATCH_UP_MINUTES: i64 = 24 * 60;
+
+/// What one supervisor remembers about its schedules between minutes.
+#[derive(Default)]
+struct CronState {
+    /// Schedules already reported as unparseable, so each is said once.
+    refused: std::collections::HashSet<String>,
+    /// The due minute last settled for each schedule, here or by another
+    /// worker. Saves asking the broker every minute about a nightly job that
+    /// was fired hours ago.
+    settled: HashMap<String, i64>,
+}
+
+/// Fire every schedule whose latest due minute nobody has fired yet.
+///
+/// Usually that minute is `now`. When it is earlier, the run came due while
+/// no worker was up to fire it — a deploy, an outage — and it is fired once,
+/// now, rather than skipped. Once, however many runs were missed: an hourly
+/// job down for six hours gets one run when it returns, not six.
+///
+/// Cron lives with the supervisor because that is the only process that has
+/// the registry and no user code in it.
+async fn fire_due(shared: &Arc<Shared>, now: i64, state: &mut CronState) {
+    let scheduled: Vec<(String, Spec)> = shared
+        .specs
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, spec)| !spec.cron.is_empty())
+        .map(|(name, spec)| (name.clone(), spec.clone()))
+        .collect();
+    for (name, spec) in scheduled {
+        let schedule = match cron::parse(&spec.cron) {
+            Ok(schedule) => schedule,
+            // Said once per task. A schedule that cannot be read never fires,
+            // and used to do so in silence.
+            Err(why) => {
+                if state.refused.insert(name.clone()) {
+                    eprintln!(
+                        "tarsk: {name} will never run on its schedule: \
+                         cron {:?} is not valid ({why})",
+                        spec.cron
+                    );
+                }
+                continue;
+            }
+        };
+        let Some(due) = schedule.last_match(now, CRON_CATCH_UP_MINUTES) else {
+            continue;
+        };
+        if state.settled.get(&name).is_some_and(|seen| *seen >= due) {
+            continue;
+        }
+        match shared.broker.claim_run(&name, due, now).await {
+            Ok(won) => {
+                state.settled.insert(name.clone(), due);
+                if !won {
+                    continue; // another worker has it, or it was never ours
+                }
+            }
+            Err(err) => {
+                shared.broker_error("the cron election", err.as_ref());
+                continue;
+            }
+        }
+        let job = NewJob {
+            id: format!("cron-{name}-{due}"),
+            queue: spec.queue.clone(),
+            name: name.clone(),
+            payload: no_arguments(),
+            timeout_ms: spec.timeout_ms as u32,
+            chain: Vec::new(),
+            meta: Vec::new(),
+            // The registration decides. A cron tick has no caller to have
+            // asked for anything else.
+            expires_ms: 0,
+        };
+        // The election is already won, so nobody else will fire this run: a
+        // push that fails once has to be tried again here or it is skipped
+        // fleet-wide.
+        let mut pushed = false;
+        for _ in 0..3 {
+            match shared.broker.push(job.clone(), Duration::ZERO).await {
+                Ok(()) => {
+                    pushed = true;
+                    break;
+                }
+                Err(err) => {
+                    shared.broker_error("queueing a cron run", err.as_ref());
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+        if pushed {
+            shared.counters.cron_fired.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Outcomes, counters, every child exit code, and the fatal error if there
 /// was one.
 pub type Report = (
@@ -2086,7 +2190,7 @@ pub async fn supervise_until(
         let shared = shared.clone();
         tokio::spawn(async move {
             let mut fired: Option<i64> = None;
-            let mut refused = std::collections::HashSet::new();
+            let mut cron = CronState::default();
             while !shared.done.load(Ordering::SeqCst) {
                 let now = SystemTime::now()
                     .duration_since(SystemTime::UNIX_EPOCH)
@@ -2095,73 +2199,7 @@ pub async fn supervise_until(
                 let minute = now / 60;
                 if fired != Some(minute) {
                     fired = Some(minute);
-                    let scheduled: Vec<(String, Spec)> = shared
-                        .specs
-                        .lock()
-                        .unwrap()
-                        .iter()
-                        .filter(|(_, spec)| !spec.cron.is_empty())
-                        .map(|(name, spec)| (name.clone(), spec.clone()))
-                        .collect();
-                    let mut due = Vec::new();
-                    for (name, spec) in scheduled {
-                        match cron::parse(&spec.cron) {
-                            Ok(schedule) if schedule.matches(minute * 60) => due.push((name, spec)),
-                            Ok(_) => {}
-                            // Said once per task. A schedule that cannot be
-                            // read never fires, and used to do so in silence.
-                            Err(why) => {
-                                if refused.insert(name.clone()) {
-                                    eprintln!(
-                                        "tarsk: {name} will never run on its schedule: \
-                                         cron {:?} is not valid ({why})",
-                                        spec.cron
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    for (name, spec) in due {
-                        match shared.broker.claim_tick(&name, minute).await {
-                            Ok(true) => {}
-                            Ok(false) => continue, // another worker has this minute
-                            Err(err) => {
-                                shared.broker_error("the cron election", err.as_ref());
-                                continue;
-                            }
-                        }
-                        let job = NewJob {
-                            id: format!("cron-{name}-{minute}"),
-                            queue: spec.queue.clone(),
-                            name: name.clone(),
-                            payload: no_arguments(),
-                            timeout_ms: spec.timeout_ms as u32,
-                            chain: Vec::new(),
-                            meta: Vec::new(),
-                            // The registration decides. A cron tick has no
-                            // caller to have asked for anything else.
-                            expires_ms: 0,
-                        };
-                        // The election is already won, so nobody else will fire
-                        // this minute: a push that fails once has to be tried
-                        // again here or the run is skipped fleet-wide.
-                        let mut pushed = false;
-                        for _ in 0..3 {
-                            match shared.broker.push(job.clone(), Duration::ZERO).await {
-                                Ok(()) => {
-                                    pushed = true;
-                                    break;
-                                }
-                                Err(err) => {
-                                    shared.broker_error("queueing a cron run", err.as_ref());
-                                    tokio::time::sleep(Duration::from_secs(1)).await;
-                                }
-                            }
-                        }
-                        if pushed {
-                            shared.counters.cron_fired.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
+                    fire_due(&shared, minute, &mut cron).await;
                 }
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
@@ -2539,6 +2577,106 @@ mod settle_tests {
 
         let seen = requeued(&shared).await;
         assert_eq!(seen, expected, "settles reached the broker out of order");
+    }
+
+    /// What the scheduler queued, as (job id, task name), oldest first.
+    async fn queued(shared: &Arc<Shared>) -> Vec<(String, String)> {
+        let mut seen = Vec::new();
+        while let Some(job) = shared.try_job(Duration::ZERO).await {
+            seen.push((job.id.clone(), job.name.clone()));
+            shared.broker.ack(&job.receipt).await.unwrap();
+        }
+        seen
+    }
+
+    fn scheduled(shared: &Arc<Shared>, name: &str, cron: &str) {
+        let mut spec = retried_once("default");
+        spec.cron = cron.into();
+        shared.specs.lock().unwrap().insert(name.into(), spec);
+    }
+
+    /// 2026-08-13T17:04Z in minutes since the epoch — the Thursday cron.rs uses.
+    const NOW: i64 = 1_786_640_640 / 60;
+
+    #[tokio::test]
+    async fn a_schedule_fires_once_for_the_minute_it_is_due() {
+        let shared = on_memory().await;
+        scheduled(&shared, "every", "* * * * *");
+        let mut state = CronState::default();
+        fire_due(&shared, NOW, &mut state).await;
+        fire_due(&shared, NOW, &mut state).await; // the same minute, asked twice
+        assert_eq!(
+            queued(&shared).await,
+            vec![(format!("cron-every-{NOW}"), "every".to_string())]
+        );
+        // And a second supervisor, with nothing remembered, loses the election.
+        fire_due(&shared, NOW, &mut CronState::default()).await;
+        assert!(
+            queued(&shared).await.is_empty(),
+            "two workers fired one minute"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_missed_while_nothing_was_up_is_caught_up_once() {
+        let shared = on_memory().await;
+        scheduled(&shared, "hourly", "0 * * * *");
+        let mut state = CronState::default();
+        let on_the_hour = NOW - 4; // 17:00
+        fire_due(&shared, on_the_hour, &mut state).await;
+        assert_eq!(queued(&shared).await.len(), 1, "the 17:00 run");
+
+        // Every worker gone from 17:01 to 23:30: six runs came due and none
+        // was fired. A fresh supervisor fires the latest of them, once.
+        let back = on_the_hour + 6 * 60 + 30;
+        let mut fresh = CronState::default();
+        fire_due(&shared, back, &mut fresh).await;
+        fire_due(&shared, back + 1, &mut fresh).await;
+        assert_eq!(
+            queued(&shared).await,
+            vec![(
+                format!("cron-hourly-{}", on_the_hour + 6 * 60),
+                "hourly".to_string()
+            )],
+            "one catch-up run, for the most recent hour missed"
+        );
+        // After which it is an ordinary schedule again.
+        fire_due(&shared, on_the_hour + 7 * 60, &mut fresh).await;
+        assert_eq!(queued(&shared).await.len(), 1, "the 00:00 run");
+    }
+
+    #[tokio::test]
+    async fn a_schedule_seen_for_the_first_time_does_not_run_late() {
+        // Deployed at 17:04 with a job due at 03:00: there is no record of it
+        // ever having run, and that is not the same as its having been missed.
+        let shared = on_memory().await;
+        scheduled(&shared, "nightly", "0 3 * * *");
+        fire_due(&shared, NOW, &mut CronState::default()).await;
+        assert!(
+            queued(&shared).await.is_empty(),
+            "fired for a minute before it existed"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cron_run_survives_a_failed_enqueue() {
+        let shared = on_memory().await;
+        scheduled(&shared, "every", "* * * * *");
+        memory(&shared).refuse_pushes.store(true, Ordering::SeqCst);
+        // The first two pushes fail and the third is let through: the run is
+        // queued, where it used to be dropped at the first failure.
+        let unblock = {
+            let shared = shared.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(1_500)).await;
+                memory(&shared).refuse_pushes.store(false, Ordering::SeqCst);
+            })
+        };
+        fire_due(&shared, NOW, &mut CronState::default()).await;
+        unblock.await.unwrap();
+        assert_eq!(shared.counters.broker_errors.load(Ordering::Relaxed), 2);
+        assert_eq!(shared.counters.cron_fired.load(Ordering::Relaxed), 1);
+        assert_eq!(queued(&shared).await.len(), 1);
     }
 
     /// One job carrying a one-step chain, claimed and ready to be settled.

@@ -255,19 +255,29 @@ impl RedisBroker {
         Ok(())
     }
 
-    pub(super) async fn claim_tick(&self, name: &str, minute: i64) -> Res<bool> {
+    pub(super) async fn claim_run(&self, name: &str, due: i64, now: i64) -> Res<bool> {
+        // Read, compare and write in one step, or two workers both see the
+        // old value and both fire. One key a schedule, holding the last minute
+        // anyone fired it for. See `Broker::claim_run` for the first-sight rule.
+        let script = redis::Script::new(
+            r"local last = tonumber(redis.call('GET', KEYS[1]))
+              local due, now = tonumber(ARGV[1]), tonumber(ARGV[2])
+              if not last then last = now - 1 end
+              if due > last then
+                redis.call('SET', KEYS[1], due)
+                return 1
+              end
+              redis.call('SET', KEYS[1], last)
+              return 0",
+        );
         let mut conn = self.conn.clone();
-        // NX is the whole election: one SET wins, the rest see the key. The TTL
-        // only has to outlive the minute it guards.
-        let won: Option<String> = redis::cmd("SET")
-            .arg(format!("tarsk:cron:{name}:{minute}"))
-            .arg(1)
-            .arg("NX")
-            .arg("EX")
-            .arg(120)
-            .query_async(&mut conn)
+        let won: i64 = script
+            .key(format!("tarsk:cron:last:{name}"))
+            .arg(due)
+            .arg(now)
+            .invoke_async(&mut conn)
             .await?;
-        Ok(won.is_some())
+        Ok(won == 1)
     }
 
     pub(super) async fn store_result(&self, id: &str, blob: Vec<u8>, ttl: Duration) -> Res<()> {

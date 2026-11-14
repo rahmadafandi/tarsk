@@ -36,10 +36,13 @@ alter table tarsk_jobs add column if not exists expires_ms bigint not null defau
 create index if not exists tarsk_jobs_ready on tarsk_jobs (queue, id) where lease_until is null;
 create index if not exists tarsk_jobs_leased on tarsk_jobs (lease_until) where lease_until is not null;
 
-create table if not exists tarsk_cron (
-    name    text   not null,
-    minute  bigint not null,
-    primary key (name, minute)
+-- The last minute each schedule was fired for. One row a schedule: `tarsk_cron`,
+-- which 0.2 used, held a row per schedule per minute and could only answer
+-- whether one exact minute had been fired, which is not enough to catch a
+-- missed one up.
+create table if not exists tarsk_cron_runs (
+    name    text   primary key,
+    minute  bigint not null
 );
 
 create table if not exists tarsk_results (
@@ -359,26 +362,25 @@ impl PgBroker {
         Ok(())
     }
 
-    pub(super) async fn claim_tick(&self, name: &str, minute: i64) -> Res<bool> {
-        // The primary key is the election: exactly one insert can succeed.
-        let inserted = self
-            .db()
-            .await?
+    pub(super) async fn claim_run(&self, name: &str, due: i64, now: i64) -> Res<bool> {
+        let db = self.db().await?;
+        // First sight: start the record just behind the present. See
+        // `Broker::claim_run`.
+        db.execute(
+            "insert into tarsk_cron_runs (name, minute) values ($1, $2)
+             on conflict (name) do nothing",
+            &[&name, &(now - 1)],
+        )
+        .await?;
+        // The row lock is the election: the second writer waits, then finds
+        // the minute already moved and updates nothing.
+        let moved = db
             .execute(
-                "insert into tarsk_cron (name, minute) values ($1, $2) on conflict do nothing",
-                &[&name, &minute],
+                "update tarsk_cron_runs set minute = $2 where name = $1 and minute < $2",
+                &[&name, &due],
             )
             .await?;
-        if inserted == 1 {
-            self.db()
-                .await?
-                .execute(
-                    "delete from tarsk_cron where minute < $1",
-                    &[&(minute - 120)],
-                )
-                .await?;
-        }
-        Ok(inserted == 1)
+        Ok(moved == 1)
     }
 
     pub(super) async fn store_result(&self, id: &str, blob: Vec<u8>, ttl: Duration) -> Res<()> {

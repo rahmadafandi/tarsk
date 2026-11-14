@@ -737,18 +737,28 @@ impl Broker {
         }
     }
 
-    /// Win the right to fire `name` for `minute`, fleet-wide. Returns false if
-    /// another worker already has it — without this every worker fires every
-    /// schedule, which is the failure mode of bolting cron onto a worker pool.
-    pub async fn claim_tick(&self, name: &str, minute: i64) -> Res<bool> {
+    /// Win the right to fire `name` for the minute it was last due, fleet-wide.
+    ///
+    /// True for exactly one caller per due minute, and only if that minute is
+    /// later than the last one anybody fired for. Without the election every
+    /// worker fires every schedule, which is the failure mode of bolting cron
+    /// onto a worker pool.
+    ///
+    /// "Later than the last one fired" rather than "this minute, once" is what
+    /// lets a missed run be caught up: `due` may be in the past, and it still
+    /// wins if nothing has fired since. `now` matters only the first time a
+    /// schedule is seen at all, when there is no last run to compare with:
+    /// the record then starts just behind the present, so deploying a nightly
+    /// job at noon does not run it at noon.
+    pub async fn claim_run(&self, name: &str, due: i64, now: i64) -> Res<bool> {
         match self {
-            Broker::Memory(b) => Ok(b.local.claim_tick(name, minute)),
+            Broker::Memory(b) => Ok(b.local.claim_run(name, due, now)),
             #[cfg(feature = "redis")]
-            Broker::Redis(b) => b.claim_tick(name, minute).await,
+            Broker::Redis(b) => b.claim_run(name, due, now).await,
             #[cfg(feature = "postgres")]
-            Broker::Postgres(b) => b.claim_tick(name, minute).await,
+            Broker::Postgres(b) => b.claim_run(name, due, now).await,
             #[cfg(feature = "amqp")]
-            Broker::Amqp(b) => Ok(b.local.claim_tick(name, minute)),
+            Broker::Amqp(b) => Ok(b.local.claim_run(name, due, now)),
         }
     }
 
@@ -903,24 +913,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_ticks_do_not_accumulate() {
+    async fn a_run_is_claimed_once_and_only_forwards() {
         // Irrefutable when only the memory broker is compiled in.
         #[allow(irrefutable_let_patterns)]
         let Broker::Memory(broker) = Broker::connect("memory://", Vec::new()).await.unwrap() else {
             unreachable!()
         };
-        assert!(broker.local.claim_tick("nightly", 100));
-        assert!(
-            !broker.local.claim_tick("nightly", 100),
-            "one winner per minute"
-        );
-        for minute in 101..400 {
-            assert!(broker.local.claim_tick("nightly", minute));
+        let local = &broker.local;
+        // Due now, first time seen: fires, once.
+        assert!(local.claim_run("nightly", 100, 100));
+        assert!(!local.claim_run("nightly", 100, 100), "one winner per run");
+        // A later run that came due while nobody was looking is still claimed
+        // when someone looks, and an older one never is.
+        assert!(local.claim_run("nightly", 160, 200));
+        assert!(!local.claim_run("nightly", 130, 200), "ran backwards");
+        // New here, and last due an hour ago: that hour was never ours to fire.
+        assert!(!local.claim_run("weekly", 140, 200));
+        assert!(local.claim_run("weekly", 201, 201));
+        // One record a schedule, however long it runs.
+        for minute in 202..600 {
+            local.claim_run("nightly", minute, minute);
         }
-        assert!(
-            broker.local.ticks.lock().unwrap().len() <= 3,
-            "ticks were kept forever"
-        );
+        assert_eq!(local.runs.lock().unwrap().len(), 2);
     }
 
     #[test]

@@ -148,9 +148,41 @@ impl Schedule {
     }
 }
 
+impl Schedule {
+    /// The latest minute at or before `now_minute` that this matches, looking
+    /// back no further than `lookback` minutes.
+    ///
+    /// Minutes since the epoch on both sides. This is what catching up asks:
+    /// not "is it due now" but "when was it last due", so a run that came due
+    /// while nothing was awake to fire it can still be found.
+    pub fn last_match(&self, now_minute: i64, lookback: i64) -> Option<i64> {
+        (0..=lookback)
+            .map(|back| now_minute - back)
+            .find(|minute| self.matches(minute * 60))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_last_due_minute_is_found_looking_back() {
+        let now = THU / 60; // 17:04
+        let hourly = parse("0 * * * *").unwrap();
+        assert_eq!(hourly.last_match(now, 1440), Some(now - 4)); // 17:00
+                                                                 // Due this very minute: that minute, not an earlier one.
+        assert_eq!(
+            parse("4 17 * * *").unwrap().last_match(now, 1440),
+            Some(now)
+        );
+        // Last due further back than we are willing to look: nothing.
+        assert_eq!(parse("0 3 * * *").unwrap().last_match(now, 60), None);
+        assert_eq!(
+            parse("0 3 * * *").unwrap().last_match(now, 1440),
+            Some(now - (14 * 60 + 4))
+        );
+    }
 
     /// 2026-08-13T17:04:00Z, a Thursday.
     const THU: i64 = 1_786_640_640;

@@ -13,7 +13,8 @@ use super::*;
 /// between the two.
 #[derive(Default)]
 pub(super) struct LocalCoordination {
-    pub(super) ticks: Mutex<std::collections::HashSet<(String, i64)>>,
+    /// The last minute each schedule was fired for.
+    pub(super) runs: Mutex<HashMap<String, i64>>,
     buckets: Mutex<HashMap<String, (f64, std::time::Instant)>>,
     slots: Mutex<HashMap<String, HashMap<String, std::time::Instant>>>,
 }
@@ -56,12 +57,18 @@ impl LocalCoordination {
         }
     }
 
-    pub(super) fn claim_tick(&self, name: &str, minute: i64) -> bool {
-        let mut ticks = self.ticks.lock().unwrap();
-        // Only the last couple of minutes can still be contested; without
-        // this the set grew by one entry per schedule per minute, forever.
-        ticks.retain(|(_, seen)| *seen >= minute - 2);
-        ticks.insert((name.to_string(), minute))
+    pub(super) fn claim_run(&self, name: &str, due: i64, now: i64) -> bool {
+        let mut runs = self.runs.lock().unwrap();
+        // Never seen before: start the record just behind the present, so a
+        // schedule that is new here does not fire for a minute it was never
+        // registered for. See `Broker::claim_run`.
+        let last = runs.entry(name.to_string()).or_insert(now - 1);
+        if due > *last {
+            *last = due;
+            true
+        } else {
+            false
+        }
     }
 }
 

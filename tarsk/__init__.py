@@ -1043,26 +1043,8 @@ class AsyncResult:
         self.app.cancel(self.task_id, queue=queue, ttl=ttl, interrupt=interrupt)
 
     async def get_async(self, timeout: float = 30.0, poll: float = 0.05):
-        """Wait for the answer without blocking the event loop.
-
-        The blocking version sleeps between polls, so a handler awaiting a
-        result would hold the loop for up to `timeout` — thirty seconds by
-        default, which is not a hiccup but an outage.
-        """
-        deadline = time.monotonic() + timeout
-        while True:
-            found = await asyncio.to_thread(self._fetch)
-            if found is not None:
-                ok, payload, error_type, traceback = found
-                if ok:
-                    return _unpack(payload)
-                raise TaskFailed(error_type, traceback)
-            if time.monotonic() >= deadline:
-                raise TimeoutError(
-                    f"no result for {self.task_id} after {timeout}s — still running, "
-                    "never kept, or expired"
-                )
-            await asyncio.sleep(poll)
+        """Wait for the answer without blocking the event loop."""
+        return await asyncio.to_thread(self.get, timeout, poll)
 
     def progress(self):
         """The last value the task published, or None."""
@@ -1074,23 +1056,24 @@ class AsyncResult:
     def get(self, timeout: float = 30.0, poll: float = 0.05):
         """Block until the answer lands, then return it or raise `TaskFailed`.
 
-        ponytail: polls. A blocking read needs pub/sub on the broker, which is
-        worth adding the day someone is waiting on tasks often enough to care.
+        On Redis and Postgres the broker says when the result is stored, so
+        the answer arrives when it exists and waiting costs nothing meanwhile.
+        `poll` is from when this asked every so often instead; it is accepted
+        and no longer used. RabbitMQ cannot announce a result and is still
+        asked, twenty times a second.
         """
-        deadline = time.monotonic() + timeout
-        while True:
-            found = self._fetch()
-            if found is not None:
-                ok, payload, error_type, traceback = found
-                if ok:
-                    return _unpack(payload)
-                raise TaskFailed(error_type, traceback)
-            if time.monotonic() >= deadline:
-                raise TimeoutError(
-                    f"no result for {self.task_id} after {timeout}s — still running, "
-                    "never kept, or expired"
-                )
-            time.sleep(poll)
+        from . import _proto
+
+        blob = self.app.producer().wait_result(self.task_id, timeout)
+        if blob is None:
+            raise TimeoutError(
+                f"no result for {self.task_id} after {timeout}s — still running, "
+                "never kept, or expired"
+            )
+        ok, payload, error_type, traceback = _proto.unpack_result(blob)
+        if ok:
+            return _unpack(payload)
+        raise TaskFailed(error_type, traceback)
 
 
 def _unpack(payload: bytes):

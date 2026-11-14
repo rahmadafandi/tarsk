@@ -187,6 +187,15 @@ returning tarsk_jobs.id, name, payload, attempt, run_lease, job_id, picked.ready
           chain, meta, expires_ms
 ";
 
+/// The half of a Postgres connection that reads the socket. Named because it
+/// is long, and because the listener needs to hold one itself.
+type PgConnection = tokio_postgres::Connection<
+    tokio_postgres::Socket,
+    <tokio_postgres_rustls::MakeRustlsConnect as tokio_postgres::tls::MakeTlsConnect<
+        tokio_postgres::Socket,
+    >>::Stream,
+>;
+
 pub struct PgBroker {
     /// Replaced when the server goes away. A `Client` whose connection has
     /// ended fails every query from then on, and nothing short of a new one
@@ -194,6 +203,7 @@ pub struct PgBroker {
     link: tokio::sync::Mutex<Arc<tokio_postgres::Client>>,
     url: String,
     pub(super) reconnects: AtomicU64,
+    pub(super) wake: Arc<Wake>,
     pub(super) queues: Vec<String>,
     /// Queues this worker has been told not to take from. A copy of what the
     /// store says, refreshed on the timer that pulls cancellations, so a claim
@@ -206,7 +216,7 @@ pub struct PgBroker {
 }
 
 impl PgBroker {
-    async fn open(url: &str) -> Res<tokio_postgres::Client> {
+    async fn dial(url: &str) -> Res<(tokio_postgres::Client, PgConnection)> {
         // A TLS connector is always supplied, which is not the same as always
         // using TLS: tokio-postgres reads sslmode from the URL and defaults to
         // `prefer`, so a local server without TLS still connects and a managed
@@ -229,6 +239,11 @@ impl PgBroker {
             .replace("sslmode=verify-full", "sslmode=require")
             .replace("sslmode=verify-ca", "sslmode=require");
         let (client, connection) = tokio_postgres::connect(&url, tls).await?;
+        Ok((client, connection))
+    }
+
+    async fn open(url: &str) -> Res<tokio_postgres::Client> {
+        let (client, connection) = Self::dial(url).await?;
         // The connection future drives the socket; dropping it closes the link.
         tokio::spawn(async move {
             let _ = connection.await;
@@ -259,10 +274,67 @@ impl PgBroker {
             link: tokio::sync::Mutex::new(Arc::new(Self::open(url).await?)),
             url: url.to_string(),
             reconnects: AtomicU64::new(0),
+            wake: Arc::default(),
             held: Mutex::new(std::collections::HashSet::new()),
             queues,
             stores: AtomicU64::new(0),
         })
+    }
+
+    /// Start hearing NOTIFY, once, for as long as this broker lives.
+    ///
+    /// A connection of its own: a session that has said LISTEN receives
+    /// notifications between its queries, and the one the queries go down is
+    /// not read from unless a query is waiting. Reconnects by itself, and
+    /// while it is down `wake.live` is false and waiters go back to polling.
+    pub(super) fn listen(&self) {
+        use std::future::Future;
+        use std::task::Poll;
+        if self.wake.started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let (url, wake) = (self.url.clone(), self.wake.clone());
+        tokio::spawn(async move {
+            loop {
+                if let Ok((client, mut connection)) = Self::dial(&url).await {
+                    // LISTEN is a query like any other, and only makes
+                    // progress while the connection is being read — which is
+                    // this same loop. So both are driven from one poll.
+                    let asked = client.batch_execute("listen tarsk_jobs; listen tarsk_results");
+                    tokio::pin!(asked);
+                    let mut listening = false;
+                    loop {
+                        let message = std::future::poll_fn(|cx| {
+                            if !listening {
+                                match asked.as_mut().poll(cx) {
+                                    Poll::Ready(Ok(())) => {
+                                        listening = true;
+                                        wake.live.store(true, Ordering::Relaxed);
+                                    }
+                                    Poll::Ready(Err(_)) => return Poll::Ready(None),
+                                    Poll::Pending => {}
+                                }
+                            }
+                            connection.poll_message(cx)
+                        })
+                        .await;
+                        match message {
+                            Some(Ok(tokio_postgres::AsyncMessage::Notification(said))) => {
+                                if said.channel() == "tarsk_jobs" {
+                                    wake.jobs.notify_waiters();
+                                } else {
+                                    wake.results.notify_waiters();
+                                }
+                            }
+                            Some(Ok(_)) => {}
+                            Some(Err(_)) | None => break,
+                        }
+                    }
+                }
+                wake.live.store(false, Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        });
     }
 
     /// The live client, reconnecting first if the last one died.
@@ -286,12 +358,19 @@ impl PgBroker {
         self.db()
             .await?
             .execute(
-                "insert into tarsk_jobs
-                     (job_id, queue, name, payload, timeout_ms, lease_until, chain, meta,
-                      expires_ms)
-                 values ($6, $1, $2, $3, $4, case when $5::double precision > 0
-                     then now() + make_interval(secs => $5::double precision) else null end,
-                     $7, $8, $9)",
+                // The NOTIFY rides in the same statement, so it costs no round
+                // trip and is delivered when the row is: a worker waiting for
+                // work is told there is some, instead of asking forty times a
+                // second whether there might be.
+                "with queued as (
+                     insert into tarsk_jobs
+                         (job_id, queue, name, payload, timeout_ms, lease_until, chain, meta,
+                          expires_ms)
+                     values ($6, $1, $2, $3, $4, case when $5::double precision > 0
+                         then now() + make_interval(secs => $5::double precision) else null end,
+                         $7, $8, $9)
+                     returning 1)
+                 select pg_notify('tarsk_jobs', '') from queued",
                 &[
                     &job.queue,
                     &job.name,
@@ -362,10 +441,13 @@ impl PgBroker {
         self.db()
             .await?
             .execute(
-                "insert into tarsk_jobs
-                     (job_id, queue, name, payload, timeout_ms, chain, meta, expires_ms)
-                 select * from unnest($1::text[], $2::text[], $3::text[], $4::bytea[],
-                                      $5::int[], $6::bytea[], $7::bytea[], $8::bigint[])",
+                "with queued as (
+                     insert into tarsk_jobs
+                         (job_id, queue, name, payload, timeout_ms, chain, meta, expires_ms)
+                     select * from unnest($1::text[], $2::text[], $3::text[], $4::bytea[],
+                                          $5::int[], $6::bytea[], $7::bytea[], $8::bigint[])
+                     returning 1)
+                 select pg_notify('tarsk_jobs', '') from (select count(*) from queued) once",
                 &[
                     &ids, &queues, &names, &payloads, &timeouts, &chains, &metas, &expires,
                 ],
@@ -379,8 +461,14 @@ impl PgBroker {
         // pickup latency to the round trip; it costs a dedicated connection to
         // hold the notification stream, which is not worth it until someone
         // measures the wait.
+        self.listen();
         let deadline = tokio::time::Instant::now() + block;
         loop {
+            // Armed before the query, so a job queued between the query
+            // coming back empty and the wait beginning still ends the wait.
+            let queued = self.wake.jobs.notified();
+            tokio::pin!(queued);
+            queued.as_mut().enable();
             let queues = self.active();
             if queues.is_empty() {
                 // Everything this worker serves is paused.
@@ -413,10 +501,32 @@ impl PgBroker {
                     },
                 }));
             }
-            if tokio::time::Instant::now() >= deadline {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
                 return Ok(None);
             }
-            tokio::time::sleep(Duration::from_millis(25).min(block)).await;
+            // Told when work arrives, so there is nothing to poll for. What a
+            // notification cannot announce is a job coming due — a delay
+            // running out, a lease lapsing — and those are found when the
+            // block ends and the caller asks again. With no listener, the
+            // short poll this replaced.
+            let listening = self.wake.live.load(Ordering::Relaxed);
+            let nap = if listening {
+                deadline - now
+            } else {
+                Duration::from_millis(25).min(block)
+            };
+            tokio::select! {
+                _ = &mut queued => {}
+                _ = tokio::time::sleep(nap) => {
+                    if listening {
+                        // The block is over and nothing was announced. The
+                        // caller asks again at once, and that is the look for
+                        // jobs that came due; a second one here is wasted.
+                        return Ok(None);
+                    }
+                }
+            }
         }
     }
 
@@ -551,10 +661,13 @@ impl PgBroker {
         self.db()
             .await?
             .execute(
-                "insert into tarsk_results (id, blob, expires_at)
-                 values ($1, $2, now() + make_interval(secs => $3::double precision))
-                 on conflict (id) do update set blob = excluded.blob,
-                                                expires_at = excluded.expires_at",
+                "with stored as (
+                     insert into tarsk_results (id, blob, expires_at)
+                     values ($1, $2, now() + make_interval(secs => $3::double precision))
+                     on conflict (id) do update set blob = excluded.blob,
+                                                    expires_at = excluded.expires_at
+                     returning 1)
+                 select pg_notify('tarsk_results', '') from stored",
                 &[&id, &blob, &ttl.as_secs_f64()],
             )
             .await?;

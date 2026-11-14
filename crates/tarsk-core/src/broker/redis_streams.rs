@@ -32,6 +32,9 @@ pub struct RedisBroker {
     /// the acks and the rate-limit script behind a 250ms wait each time — the
     /// sweep was timing out and requeued jobs were never coming back.
     blocking: redis::aio::ConnectionManager,
+    /// Kept to open the subscription a result-waiter listens on.
+    client: redis::Client,
+    pub(super) wake: Arc<Wake>,
     consumer: String,
     pub(super) queues: Vec<String>,
     /// Queues this worker has been told not to take from. A copy of what the
@@ -156,6 +159,11 @@ fn revoked_key(queue: &str) -> String {
 /// read so a cancel issued before an upgrade survives it.
 const REVOKED: &str = "tarsk:revoked";
 
+/// Where a stored result is announced. One channel for all of them: a waiter
+/// that is woken looks for its own, which is one GET, and a channel an id
+/// would be a subscription an id.
+const RESULTS_CHANNEL: &str = "tarsk:results";
+
 /// The queues nobody may take from just now.
 const PAUSED: &str = "tarsk:paused";
 
@@ -201,6 +209,8 @@ impl RedisBroker {
         Ok(RedisBroker {
             conn,
             blocking,
+            client,
+            wake: Arc::default(),
             consumer: format!("tarsk-{}", std::process::id()),
             queues,
             last_used_ms: AtomicU64::new(now_ms()),
@@ -403,14 +413,47 @@ impl RedisBroker {
         let mut conn = self.conn.clone();
         // PX rather than a sweeper: an expiry the server enforces cannot be
         // forgotten by a worker that died holding the job of forgetting it.
-        let _: redis::Value = redis::cmd("SET")
+        // And said aloud, in the same MULTI: whoever is waiting for this id
+        // is subscribed to the channel, and hears it without having to ask.
+        let _: redis::Value = redis::pipe()
+            .atomic()
+            .cmd("SET")
             .arg(result_key(id))
             .arg(blob)
             .arg("PX")
             .arg(ttl.as_millis().max(1) as u64)
+            .cmd("PUBLISH")
+            .arg(RESULTS_CHANNEL)
+            .arg(id)
             .query_async(&mut conn)
             .await?;
         Ok(())
+    }
+
+    /// Start hearing about stored results, once, for as long as this broker
+    /// lives. Reconnects by itself; while it is down `wake.live` is false and
+    /// waiters go back to asking.
+    pub(super) fn listen(&self) {
+        use futures_util::StreamExt;
+        if self.wake.started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let (client, wake) = (self.client.clone(), self.wake.clone());
+        tokio::spawn(async move {
+            loop {
+                if let Ok(mut pubsub) = client.get_async_pubsub().await {
+                    if pubsub.subscribe(RESULTS_CHANNEL).await.is_ok() {
+                        wake.live.store(true, Ordering::Relaxed);
+                        let mut stored = pubsub.on_message();
+                        while stored.next().await.is_some() {
+                            wake.results.notify_waiters();
+                        }
+                    }
+                }
+                wake.live.store(false, Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        });
     }
 
     pub(super) async fn get_result(&self, id: &str) -> Res<Option<Vec<u8>>> {

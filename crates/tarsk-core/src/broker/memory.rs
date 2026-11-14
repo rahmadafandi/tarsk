@@ -126,6 +126,7 @@ pub struct MemoryBroker {
     #[cfg(test)]
     pub(crate) refuse_pushes: std::sync::atomic::AtomicBool,
     pub(super) local: LocalCoordination,
+    pub(super) wake: Arc<Wake>,
 }
 
 impl MemoryBroker {
@@ -190,6 +191,9 @@ impl MemoryBroker {
             .lock()
             .unwrap()
             .insert(id.to_string(), (blob, std::time::Instant::now() + ttl));
+        // In one process the store and the announcement are the same act.
+        self.wake.live.store(true, Ordering::Relaxed);
+        self.wake.results.notify_waiters();
         Ok(())
     }
 

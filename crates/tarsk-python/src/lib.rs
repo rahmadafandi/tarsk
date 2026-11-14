@@ -388,6 +388,18 @@ impl Producer {
         }
     }
 
+    /// The stored envelope for `id`, waiting up to `timeout` seconds for it.
+    ///
+    /// One call for the whole wait, with the GIL released: the broker says
+    /// when the result is stored, so there is no loop here asking for it.
+    fn wait_result(&self, py: Python<'_>, id: String, timeout: f64) -> PyResult<Option<Py<PyAny>>> {
+        let timeout = Duration::from_secs_f64(timeout.clamp(0.0, 86_400.0 * 365.0));
+        let found = py
+            .detach(|| self.wake_then(self.broker.wait_result(&id, timeout)))
+            .map_err(broker_err)?;
+        Ok(found.map(|blob| PyBytes::new(py, &blob).into_any().unbind()))
+    }
+
     /// Cancel a job so it is never dispatched.
     ///
     /// Takes effect within a second — the supervisor pulls cancellations on a

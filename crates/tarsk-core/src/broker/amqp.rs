@@ -42,6 +42,9 @@ pub struct AmqpBroker {
     link: tokio::sync::Mutex<Arc<AmqpLink>>,
     url: String,
     pub(super) reconnects: AtomicU64,
+    /// Never signalled: AMQP has no way to announce a stored result, so
+    /// whoever waits on this broker falls back to asking.
+    pub(super) wake: Arc<Wake>,
     pub(super) queues: Vec<String>,
     /// Queues declared this run, so steady-state publishes skip the declare.
     /// Only queues without `x-expires` are cached: a delay queue deletes
@@ -210,6 +213,7 @@ impl AmqpBroker {
             link: tokio::sync::Mutex::new(Arc::new(Self::open(url).await?)),
             url: url.to_string(),
             reconnects: AtomicU64::new(0),
+            wake: Arc::default(),
             queues,
             declared: Mutex::new(std::collections::HashSet::new()),
             local: LocalCoordination::default(),

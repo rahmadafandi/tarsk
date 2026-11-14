@@ -18,7 +18,6 @@
 // here with `use super::*` rather than each repeating the list.
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(any(feature = "postgres", feature = "amqp"))]
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -41,6 +40,29 @@ pub use postgres::PgBroker;
 pub use redis_streams::RedisBroker;
 
 pub type Res<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+/// What a broker's waiters sleep on instead of a timer.
+///
+/// Two things here were polled: a Postgres worker asking for work forty times
+/// a second while there was none, and a caller asking whether its result had
+/// arrived twenty times a second until it had. Both brokers can say so
+/// themselves — NOTIFY, and a Redis channel — and this is where the saying
+/// arrives.
+///
+/// `live` is whether anything is actually listening. A waiter that trusted a
+/// listener that had died would sleep through everything, so while it is
+/// false the old short poll is what is used.
+// Which fields are read depends on which backends are compiled in; the full
+// build reads them all and still gets the lint.
+#[cfg_attr(not(all(feature = "redis", feature = "postgres")), allow(dead_code))]
+#[derive(Default)]
+pub(crate) struct Wake {
+    pub(crate) jobs: tokio::sync::Notify,
+    pub(crate) results: tokio::sync::Notify,
+    pub(crate) live: std::sync::atomic::AtomicBool,
+    /// Set once a listener has been started, so it is started once.
+    pub(crate) started: std::sync::atomic::AtomicBool,
+}
 
 /// An error with its causes, on one line.
 ///
@@ -977,6 +999,62 @@ impl Broker {
         }
     }
 
+    fn wake(&self) -> &Wake {
+        match self {
+            Broker::Memory(b) => &b.wake,
+            #[cfg(feature = "redis")]
+            Broker::Redis(b) => &b.wake,
+            #[cfg(feature = "postgres")]
+            Broker::Postgres(b) => &b.wake,
+            #[cfg(feature = "amqp")]
+            Broker::Amqp(b) => &b.wake,
+        }
+    }
+
+    /// The stored result for `id`, waiting up to `timeout` for it to arrive.
+    ///
+    /// Woken by the broker when a result is stored, on Redis and Postgres,
+    /// rather than asking every 50ms whether one has been. The answer comes
+    /// as soon as it exists, and a caller waiting on a slow task costs the
+    /// broker nothing while it waits. Where nothing is listening — AMQP, or a
+    /// listener that has lost its connection — it falls back to asking.
+    pub async fn wait_result(&self, id: &str, timeout: Duration) -> Res<Option<Vec<u8>>> {
+        match self {
+            #[cfg(feature = "redis")]
+            Broker::Redis(b) => b.listen(),
+            #[cfg(feature = "postgres")]
+            Broker::Postgres(b) => b.listen(),
+            _ => {}
+        }
+        let wake = self.wake();
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            // Armed before the look, so a result stored between the look and
+            // the wait still wakes this.
+            let stored = wake.results.notified();
+            tokio::pin!(stored);
+            stored.as_mut().enable();
+            if let Some(blob) = self.get_result(id).await? {
+                return Ok(Some(blob));
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Ok(None);
+            }
+            // A listener can miss a message across a reconnect, so even a
+            // live one is checked up on once a second.
+            let nap = if wake.live.load(Ordering::Relaxed) {
+                Duration::from_secs(1)
+            } else {
+                Duration::from_millis(50)
+            };
+            tokio::select! {
+                _ = &mut stored => {}
+                _ = tokio::time::sleep(nap.min(deadline - now)) => {}
+            }
+        }
+    }
+
     pub async fn get_result(&self, id: &str) -> Res<Option<Vec<u8>>> {
         match self {
             Broker::Memory(b) => Ok(b.get_result(id)),
@@ -1062,6 +1140,42 @@ mod tests {
         broker.retry(&seen.receipt, wait).await.unwrap();
         let after = broker.claim(wait, wait).await.unwrap().unwrap();
         assert_eq!(after.attempt, 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_waiter_is_woken_by_the_result_and_not_by_a_timer() {
+        let broker = Arc::new(Broker::connect("memory://", Vec::new()).await.unwrap());
+        let waiter = {
+            let broker = broker.clone();
+            tokio::spawn(async move {
+                let began = tokio::time::Instant::now();
+                let got = broker
+                    .wait_result("r", Duration::from_secs(30))
+                    .await
+                    .unwrap();
+                (got, began.elapsed())
+            })
+        };
+        // Time is paused, so the only thing that advances it is a sleep
+        // running out. 200ms in, the result is stored…
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        broker
+            .store_result("r", b"done".to_vec(), Duration::from_secs(60))
+            .await
+            .unwrap();
+        let (got, waited) = waiter.await.unwrap();
+        assert_eq!(got.as_deref(), Some(&b"done"[..]));
+        // …and the waiter has it then, not at its next one-second look.
+        assert!(waited < Duration::from_millis(250), "woke after {waited:?}");
+
+        // Nothing ever stored: it gives up at the deadline, empty-handed.
+        let began = tokio::time::Instant::now();
+        let none = broker
+            .wait_result("never", Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert_eq!(none, None);
+        assert!(began.elapsed() >= Duration::from_secs(3));
     }
 
     #[tokio::test]

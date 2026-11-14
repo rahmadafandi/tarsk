@@ -23,6 +23,13 @@ It takes effect within a second: the supervisor pulls cancellations as a set on 
 than asking the broker about every job it is about to run, which would put a round trip on the
 dispatch path of every task to answer "no" for almost all of them.
 
+**A cancellation finds its job by id.** `--queue` on the command line and `queue=` in Python
+are still accepted and decide nothing. They used to: a cancel that named the wrong queue —
+including the default, for a job on any other — reported success and the job ran anyway. The
+one thing a cancellation still needs from you is `ttl`, how long to remember it, which has to
+outlive the job: something scheduled for next week needs a week. The console works that out
+from the job's due time.
+
 **A job that has already started is not interrupted.** The supervisor could tell the child to
 drop it, but a handler that has begun has usually begun doing the thing you wanted stopped —
 written the row, called the API — and a queue that reports "cancelled" for work that
@@ -31,6 +38,49 @@ half-happened is worse than one that admits it finished.
 Neither command needs `--app`. A cancellation is an id and a dead letter is a name, a payload
 and a traceback; none of them needs your code to be importable, which matters exactly when the
 reason the tasks died is that it is not.
+
+## Stopping a worker
+
+SIGTERM, or ctrl-C, and the worker stops taking work at once: what its children are running
+finishes, nothing new is claimed, and it exits. Anything it had read ahead and not started is
+handed back for another worker rather than held until its lease runs out.
+
+The signal can go to the supervisor alone, as an orchestrator sends it, or to the whole process
+group, as a terminal and systemd's default `KillMode` do. Children ignore the one meant for the
+supervisor and wait to be told to drain, so in both cases a running task ends because it
+finished and not because it was cut off.
+
+How long that takes is the longest task in flight, up to its own `timeout`. Give the
+orchestrator's grace period at least that — `terminationGracePeriodSeconds`,
+`TimeoutStopSec` — or the kill it sends at the end of it lands on a task mid-run, and that task
+comes back to another worker when its lease expires.
+
+## When the broker goes away
+
+A failover, a restart, a connection idle too long for some middlebox: workers and producers
+both reconnect. A worker keeps trying for as long as it is up and prints what the broker said,
+at most one line every five seconds:
+
+```
+tarsk: broker error during claim: db error: FATAL: terminating connection due to administrator command
+```
+
+A producer raises `tarsk.BrokerError` — its own type, so the code around a `send()` can retry
+or queue locally on an outage without also catching its own mistakes, which are still
+`ValueError`:
+
+```python
+from tarsk import BrokerError
+
+try:
+    task_id = send_receipt.send(order.id)
+except BrokerError:
+    outbox.keep(order.id)       # the broker is away; this is not a bug in the call
+```
+
+On Postgres a producer notices a dropped connection before it sends and loses no call. On
+Redis the call that discovers the drop fails and the next one succeeds, because that driver
+reconnects on the error rather than ahead of it.
 
 ## Seeing the backlog
 
@@ -91,6 +141,10 @@ destroy work. Three defaults follow from that:
 - Binding anywhere but loopback **refuses to start** without `TARSK_ADMIN_TOKEN`. The flag that
   was harmless for metrics yesterday exposes an admin console today, and a warning nobody reads
   is not a control.
+- Without a token it answers only when addressed as `127.0.0.1`, `localhost` or `[::1]`. A
+  loopback bind keeps other machines out and does nothing about DNS rebinding, where a page on
+  another site points its own hostname at your loopback and the browser then treats this
+  console as part of that site. The request still arrives under the attacker's name.
 - With a token set, the page asks for it over HTTP Basic — user `tarsk`, password the token —
   compared in constant time.
 - Cancel, replay and purge are **off** until `TARSK_ADMIN_ACTIONS=1`. A console reached by

@@ -177,8 +177,19 @@ UTC is the whole timezone story, deliberately. A local schedule has to answer wh
 daily" means on the night a clock jumps, and every answer is someone's outage.
 
 The schedule lives with the supervisor, because that is the only process holding the registry
-and no user code. Firing is elected per minute through the broker, so running ten workers still
-runs the task once.
+and no user code. Each run is elected through the broker, so running ten workers still runs
+the task once.
+
+**A run that came due while no worker was up is caught up.** When a worker returns it fires the
+most recent run that was missed — once, however many were: an hourly job that was down for six
+hours gets one run, not six. It looks back a day and no further, so a worker switched on after
+a month does not start by running last month's reports. A schedule seen for the first time is
+not owed anything: deploying a nightly job at noon does not run it at noon. If a late run is
+worse than none, give the task an `expires`.
+
+`7` is Sunday as well as `0`. An expression that cannot be read is reported once on the
+worker's stderr, and that task then never fires — it is worth looking for the line after
+adding a schedule.
 
 
 ---

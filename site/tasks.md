@@ -78,6 +78,11 @@ one task at a time and is the first thing to revisit if that changes.
 global would have been, except `app.override(provider, fake)` can replace it in a test. Pass
 `scope="task"` to resolve per call.
 
+`ctx.task_id` is the id `send()` returned, in the producer and in the worker alike, so a trace
+begun in `before_send` has something to join on when the handler runs. `ctx.attempt` counts
+runs: a job handed back because it was over its rate limit or its concurrency cap has waited,
+not failed, and is not charged for it.
+
 `execute` runs in the worker; `before_send(ctx)` runs in the producer before the job is
 serialised and may add to `ctx.kwargs`, which is how a trace id gets attached to work that has
 not left the process yet. Neither can run in the supervisor:
@@ -100,6 +105,11 @@ def parse(blob, ctx=Depends(Context)):
 delays the moment someone looks at it. `Retry` is still charged an attempt: a retry that costs
 nothing is an infinite loop with extra steps, and the thing being waited on is usually the
 thing least able to absorb one.
+
+A handler that raises `TimeoutError` of its own — a socket, `asyncio.timeout()`,
+`Future.result()` — has raised, and is retried like any other failure, traceback and all. It is
+not confused with the task's own `timeout`, which is the one that ends the attempt from
+outside.
 
 `ctx.set_progress(value)` is readable through `app.result(task_id).progress()`, kept under the
 same TTL as the result. The worker has no broker connection — that is what keeps its imports

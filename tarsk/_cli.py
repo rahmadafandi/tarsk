@@ -18,6 +18,24 @@ _SIZE = re.compile(r"^\s*([0-9]*\.?[0-9]+)\s*([KMGT]?)i?B?\s*$", re.IGNORECASE)
 _SCALE = {"": 1, "K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
 
 
+def _say(message: str, level: str = "info") -> None:
+    """One line on stderr, in the format the supervisor uses for its own.
+
+    `TARSK_LOG_FORMAT=json` makes each line an object; see the Rust side for
+    why. Both halves of a worker print through the same switch, or a log
+    pipeline would be handed JSON with prose mixed into it.
+    """
+    if os.environ.get("TARSK_LOG_FORMAT") == "json":
+        import json
+        import time
+
+        message = json.dumps({"ts": round(time.time(), 3), "level": level,
+                              "logger": "tarsk", "message": message})
+    else:
+        message = f"tarsk: {message}"
+    print(message, file=sys.stderr)
+
+
 def parse_size(text: str) -> int:
     """`400MB`, `1.5G`, `512K`, or a plain byte count."""
     match = _SIZE.match(text)
@@ -284,15 +302,14 @@ def main(argv: list[str] | None = None) -> int:
     from ._supervisor import Supervisor
 
     slots = args.slots
-    print(f"tarsk: {args.children} children x {slots} "
-          f"{'slot' if slots == 1 else 'slots'}", file=sys.stderr)
+    _say(f"{args.children} children x {slots} {'slot' if slots == 1 else 'slots'}")
     if args.max_rss and slots > 1:
         # Not a warning about a choice this made — a fact about the one the
         # caller made. The ceiling still fires; what it cannot promise is that
         # overshoot stops at a single task.
-        print(f"tarsk: --max-rss with {slots} slots — a child is retired when it crosses, "
-              f"but up to {slots} tasks are running when it does, so overshoot is their "
-              "peak, not one task's. --slots 1 for the tightest bound.", file=sys.stderr)
+        _say(f"--max-rss with {slots} slots — a child is retired when it crosses, "
+             f"but up to {slots} tasks are running when it does, so overshoot is their "
+             "peak, not one task's. --slots 1 for the tightest bound.")
 
     supervisor = Supervisor(
         args.app,

@@ -11,6 +11,7 @@
 pub mod broker;
 pub mod console;
 mod cron;
+mod log;
 mod metrics;
 pub mod transport;
 
@@ -381,11 +382,11 @@ impl Shared {
         reported.0 = Some(Instant::now());
         drop(reported);
         if skipped > 0 {
-            eprintln!(
-                "tarsk: broker error during {during}: {err} ({skipped} more since the last report)"
+            log::alert!(
+                "broker error during {during}: {err} ({skipped} more since the last report)"
             );
         } else {
-            eprintln!("tarsk: broker error during {during}: {err}");
+            log::alert!("broker error during {during}: {err}");
         }
     }
 
@@ -854,9 +855,14 @@ fn no_arguments() -> Vec<u8> {
 
 /// One definition of every counter, shared by the Python return value and the
 /// Prometheus text so the two can never drift.
-fn counter_list(counters: &Counters) -> Vec<(&'static str, u64)> {
+fn counter_list(shared: &Shared) -> Vec<(&'static str, u64)> {
+    let counters = &shared.counters;
     let load = |value: &AtomicU64| value.load(Ordering::Relaxed);
     vec![
+        // How often the broker connection had to be made again. A number that
+        // climbs is a network or a broker worth looking at before it is an
+        // outage; Redis reconnects inside its driver and is not counted.
+        ("broker_reconnects", shared.broker.reconnects()),
         ("children_rejected", load(&counters.rejected)),
         ("children_spawned", load(&counters.spawns)),
         ("children_recycled", load(&counters.recycles)),
@@ -1979,8 +1985,8 @@ async fn fire_due(shared: &Arc<Shared>, now: i64, state: &mut CronState) {
             // and used to do so in silence.
             Err(why) => {
                 if state.refused.insert(name.clone()) {
-                    eprintln!(
-                        "tarsk: {name} will never run on its schedule: \
+                    log::alert!(
+                        "{name} will never run on its schedule: \
                          cron {:?} is not valid ({why})",
                         spec.cron
                     );
@@ -2207,7 +2213,7 @@ pub async fn supervise_until(
             let own = sys.process(me).map(|p| p.memory()).unwrap_or(0);
             metrics::render(
                 &shared.metrics,
-                &counter_list(&shared.counters),
+                &counter_list(&shared),
                 &shared.reasons.lock().unwrap(),
                 own,
             )
@@ -2279,7 +2285,7 @@ pub async fn supervise_until(
     }
 
     let registry = shared.registry.lock().unwrap();
-    let mut stats: HashMap<String, u64> = counter_list(&shared.counters)
+    let mut stats: HashMap<String, u64> = counter_list(&shared)
         .into_iter()
         .map(|(name, value)| (name.to_string(), value))
         .collect();

@@ -178,6 +178,7 @@ pub struct PgBroker {
     /// brings it back.
     link: tokio::sync::Mutex<Arc<tokio_postgres::Client>>,
     url: String,
+    pub(super) reconnects: AtomicU64,
     pub(super) queues: Vec<String>,
     stores: AtomicU64,
     /// The same identity Redis gets for free from its consumer group. Postgres
@@ -238,6 +239,7 @@ impl PgBroker {
             consumer: format!("tarsk-{}", std::process::id()),
             link: tokio::sync::Mutex::new(Arc::new(Self::open(url).await?)),
             url: url.to_string(),
+            reconnects: AtomicU64::new(0),
             queues,
             stores: AtomicU64::new(0),
         })
@@ -252,6 +254,7 @@ impl PgBroker {
         let mut link = self.link.lock().await;
         if link.is_closed() {
             *link = Arc::new(Self::open(&self.url).await?);
+            self.reconnects.fetch_add(1, Ordering::Relaxed);
         }
         Ok(link.clone())
     }

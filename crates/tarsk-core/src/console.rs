@@ -200,16 +200,16 @@ where
     let guard = match guard(&addr) {
         Ok(guard) => guard,
         Err(why) => {
-            eprintln!("tarsk: {why}");
+            crate::log::alert!("{why}");
             return;
         }
     };
     let Ok(listener) = TcpListener::bind(&addr).await else {
-        eprintln!("tarsk: could not bind {addr}");
+        crate::log::alert!("could not bind {addr}");
         return;
     };
-    eprintln!(
-        "tarsk: console on http://{addr}/ ({}, {})",
+    crate::log::note!(
+        "console on http://{addr}/ ({}, {})",
         if guard.expect.is_empty() {
             "no auth"
         } else {
@@ -326,8 +326,8 @@ async fn handle(
             // Destroying work with no record of it is the part of a console
             // that gets noticed a week later. Basic auth gives one account, so
             // the peer address is as close to "who" as this can get.
-            eprintln!(
-                "tarsk: console {} queue={} id={} from={} -> {}",
+            crate::log::note!(
+                "console {} queue={} id={} from={} -> {}",
                 path.trim_start_matches('/'),
                 queue,
                 if id.is_empty() { "(all)" } else { &id },

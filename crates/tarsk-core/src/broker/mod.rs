@@ -789,6 +789,17 @@ impl Broker {
         }
     }
 
+    /// How many times this broker has had to open its connection again.
+    pub fn reconnects(&self) -> u64 {
+        match self {
+            #[cfg(feature = "postgres")]
+            Broker::Postgres(b) => b.reconnects.load(Ordering::Relaxed),
+            #[cfg(feature = "amqp")]
+            Broker::Amqp(b) => b.reconnects.load(Ordering::Relaxed),
+            _ => 0,
+        }
+    }
+
     /// Give an idle connection the chance to find out it has been closed,
     /// before the caller sends anything it would mind losing. Only Redis needs
     /// asking; see `RedisBroker::refresh`.

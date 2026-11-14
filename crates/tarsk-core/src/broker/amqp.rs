@@ -41,6 +41,7 @@ pub struct AmqpBroker {
     /// one failed for the rest of the process's life.
     link: tokio::sync::Mutex<Arc<AmqpLink>>,
     url: String,
+    pub(super) reconnects: AtomicU64,
     pub(super) queues: Vec<String>,
     /// Queues declared this run, so steady-state publishes skip the declare.
     /// Only queues without `x-expires` are cached: a delay queue deletes
@@ -199,6 +200,7 @@ impl AmqpBroker {
         let mut link = self.link.lock().await;
         if !link.conn.status().connected() || !link.channel.status().connected() {
             *link = Arc::new(Self::open(&self.url).await?);
+            self.reconnects.fetch_add(1, Ordering::Relaxed);
         }
         Ok(link.clone())
     }
@@ -207,6 +209,7 @@ impl AmqpBroker {
         let broker = AmqpBroker {
             link: tokio::sync::Mutex::new(Arc::new(Self::open(url).await?)),
             url: url.to_string(),
+            reconnects: AtomicU64::new(0),
             queues,
             declared: Mutex::new(std::collections::HashSet::new()),
             local: LocalCoordination::default(),

@@ -118,14 +118,14 @@ count, but the only way to bound it at one task is `--slots 1`.
 
 ## What is missing
 
-- No chord. `chain` and `group` are here; fanning back in to a callback is not
+- RabbitMQ is the basic backend: jobs, retries, delays, chains and results, and none of the
+  things that need a store every worker can read — cancel, pause, dedup, chords, shared limits
 - Windows runs the suites that need no broker, since neither Redis nor Postgres ships for it.
   Everything else — the channel, recycling, the memory ceiling — is tested there
 
 ## Running the tests
 
-The toolchain is pinned in [`mise.toml`](mise.toml) — Rust 1.100.0 and Python 3.14.3, the
-versions the published numbers were produced with. With [mise](https://mise.jdx.dev) installed,
+The toolchain is pinned in [`mise.toml`](mise.toml) — Rust 1.100.0 and Python 3.14.3. With [mise](https://mise.jdx.dev) installed,
 `mise install` fetches both and entering the directory creates `.venv` from the pinned Python.
 Without it, any Python 3.11+ and a recent stable Rust will build: the wheel is abi3-py311.
 
@@ -137,7 +137,7 @@ python -m venv .venv && .venv/bin/pip install maturin msgpack
 
 .venv/bin/python tests/test_ipc.py       # protocol, timeouts, retries
 .venv/bin/python tests/test_recycle.py   # the ceiling, soft timeouts, middleware
-.venv/bin/python tests/test_brokers.py   # all four brokers end to end
+.venv/bin/python tests/test_brokers.py   # all four brokers end to end; name one to run it alone
 cargo test --lib                         # cron, console, socket permissions
 ```
 

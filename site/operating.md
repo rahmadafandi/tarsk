@@ -30,14 +30,59 @@ one thing a cancellation still needs from you is `ttl`, how long to remember it,
 outlive the job: something scheduled for next week needs a week. The console works that out
 from the job's due time.
 
-**A job that has already started is not interrupted.** The supervisor could tell the child to
+**A job that has already started is not interrupted, unless you ask.** The supervisor could tell the child to
 drop it, but a handler that has begun has usually begun doing the thing you wanted stopped —
 written the row, called the API — and a queue that reports "cancelled" for work that
 half-happened is worse than one that admits it finished.
 
+`app.cancel(task_id, interrupt=True)` asks. An async handler is cancelled where it is waiting:
+it sees `asyncio.CancelledError` with `ctx.cancelled` set, which is what tells this from a
+deadline or a worker shutting down, and whatever it had already done stays done — so it is for
+work that can be abandoned halfway. A sync handler runs in a thread, which cannot be
+interrupted, and finishes regardless.
+
+A cancelled job is settled and gone, started or not: not retried, and not left in the dead
+letters where a replay would bring back something its caller asked to be rid of. If it keeps a
+result, the result says `Cancelled`.
+
 Neither command needs `--app`. A cancellation is an id and a dead letter is a name, a payload
 and a traceback; none of them needs your code to be importable, which matters exactly when the
 reason the tasks died is that it is not.
+
+## Pausing a queue
+
+```
+tarsk pause --queue reports      # every worker stops taking from it, within a second
+tarsk resume --queue reports
+```
+
+`app.pause("reports")` and `app.resume("reports")` from Python, and a button beside each queue
+in the console. For when whatever a queue's tasks call is down: the jobs wait where they are
+instead of spending their retries against it, and the workers' other queues carry on. Jobs
+already running finish, sending to the queue still works, and `tarsk status` marks it
+`paused`. It is a property of the queue, held in the broker, so it survives a worker restart
+and applies to workers started later — remember to resume it.
+
+## Which task is leaking
+
+The ceiling tells you a worker grew. It does not tell you what grew it, and that is the next
+question. `/metrics` and the console answer it per task, with two numbers:
+
+- **Objects kept** — how many objects each run left the interpreter holding, counted inside
+  the worker around every call. A task that cleans up after itself comes out near zero, and
+  one that does not is the leak. `tarsk_task_kept_objects{task=…}`.
+- **Growth** — how much the worker's memory rose while the task ran, read by the supervisor
+  whenever a ceiling is set. `tarsk_task_rss_growth_bytes_total{task=…}`.
+
+Read the first for *who* and the second for *how much*. They can disagree, and when they do
+the first is right: an allocator hands the memory one task freed to the next task that asks,
+so a leak is paid for by whoever allocates after it. Measured with a leaking task and a tidy
+one taking turns, the tidy one was charged 40 MB of growth and the leak 16 — and the leak kept
+738 objects to the tidy task's 42.
+
+Both are exact with `--slots 1`. Above that, tasks that overlap are in each other's numbers:
+good for ranking, not for accounting. Objects are a count, not a size, so a task that leaks
+one enormous buffer scores low on it and high on growth.
 
 ## Stopping a worker
 
@@ -64,6 +109,11 @@ at most one line every five seconds:
 ```
 tarsk: broker error during claim: db error: FATAL: terminating connection due to administrator command
 ```
+
+`TARSK_LOG_FORMAT=json` turns every line a worker prints into one JSON object with a level
+and a timestamp, for a log pipeline that cannot do anything with prose. `broker_reconnects`
+in the stats and on `/metrics` counts how often Postgres or RabbitMQ had to be connected to
+again; a number that climbs is a network worth looking at before it is an outage.
 
 A producer raises `tarsk.BrokerError` — its own type, so the code around a `send()` can retry
 or queue locally on an outage without also catching its own mistakes, which are still

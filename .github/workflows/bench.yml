@@ -53,7 +53,7 @@ jobs:
         run: |
           python -m venv .venv
           .venv/bin/pip install -q maturin celery taskiq taskiq-redis redis
-          .venv/bin/maturin develop --release
+          .venv/bin/maturin develop --release -F redis
 
       - name: Run the benchmark
         run: .venv/bin/python bench/run.py ${{ inputs.scenarios }} | tee bench-output.md

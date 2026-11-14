@@ -1,5 +1,43 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Which task leaks.** `/metrics`, the console and batch stats say, per task, how many
+  objects each run left the interpreter holding and how much the worker's memory rose while
+  it ran. The first names the leak; the second is its size, and a poor guide to its author.
+- **Chords.** `chord(group(...), callback.s())` runs the callback once every member has
+  finished, with their results in order. Not on RabbitMQ.
+- **`app.send_many(...)`.** Many jobs in one round trip, and on Redis and Postgres all of
+  them or none. Groups and chords are sent this way.
+- **Cancelling a job that is already running.** `app.cancel(task_id, interrupt=True)`
+  cancels an async handler where it is waiting, with `ctx.cancelled` set.
+- **Pausing a queue.** `app.pause(queue)`, `tarsk pause`, and a console button. Not on
+  RabbitMQ.
+- **`backoff_base=` and `backoff_max=`** on a task, where the wait between retries was one
+  second doubling to sixty-four.
+- **Providers that clean up.** A `Depends` provider may `yield` its value; what follows
+  runs when the value is done with.
+- **`TARSK_LOG_FORMAT=json`**, and a `broker_reconnects` counter.
+- Type stubs for the compiled module, and `pyright` in CI.
+
+### Changed
+
+- **`result.get()` no longer polls** on Redis and Postgres: the broker says when the result
+  is stored. Send-to-result fell from 53ms to 2ms on Redis and from 55ms to 9ms on
+  Postgres. `poll=` is accepted and unused.
+- **A Postgres worker is told about new work** instead of asking for it forty times a
+  second: an idle worker went from 82 transactions a second to 19.
+- **A cancelled job is settled and dropped.** It used to be retried, cancelled again each
+  time, and left in the dead letters where a replay would run it.
+- RabbitMQ is documented as the basic backend, with a table of what it does not do.
+- Postgres adds `tarsk_chords` and `tarsk_paused`; Redis adds `tarsk:paused`,
+  `tarsk:chord:<id>` and the `tarsk:results` channel.
+- The version lives in `Cargo.toml` alone. The producer's test hooks are behind a
+  `test-hooks` build feature and are not in published wheels.
+- The pinned toolchain is Rust 1.100.
+
 ## 0.3.0
 
 ### Upgrading from 0.2

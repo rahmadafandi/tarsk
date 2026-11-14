@@ -83,6 +83,20 @@ begun in `before_send` has something to join on when the handler runs. `ctx.atte
 runs: a job handed back because it was over its rate limit or its concurrency cap has waited,
 not failed, and is not charged for it.
 
+A provider may `yield` its value instead of returning it, and what follows the `yield` runs
+when the value is done with — after the call for `scope="task"`, whether the handler returned
+or raised, and as the worker drains for the default `scope="worker"`:
+
+```python
+def a_session():
+    session = Session()
+    yield session
+    session.close()
+
+@app.task()
+def sync_account(account_id, db=Depends(a_session, scope="task")): ...
+```
+
 `execute` runs in the worker; `before_send(ctx)` runs in the producer before the job is
 serialised and may add to `ctx.kwargs`, which is how a trace id gets attached to work that has
 not left the process yet. Neither can run in the supervisor:
@@ -105,6 +119,12 @@ def parse(blob, ctx=Depends(Context)):
 delays the moment someone looks at it. `Retry` is still charged an attempt: a retry that costs
 nothing is an infinite loop with extra steps, and the thing being waited on is usually the
 thing least able to absorb one.
+
+`backoff="exp"` waits one second, then two, doubling to sixty-four, each jittered so a
+dependency coming back is not hit by every retry at once. `backoff_base=` and `backoff_max=`
+move both ends, in seconds: a task retrying a lock wants `backoff_base=0.05`, one calling
+something that takes minutes to recover wants a longer ceiling. `"fixed"` waits the base every
+time and `"none"` not at all.
 
 A handler that raises `TimeoutError` of its own — a socket, `asyncio.timeout()`,
 `Future.result()` — has raised, and is retried like any other failure, traceback and all. It is

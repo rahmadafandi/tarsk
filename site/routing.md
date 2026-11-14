@@ -43,9 +43,23 @@ Redis Streams, Postgres, and RabbitMQ. The first two are the full-featured pair:
 neither needing lease renewal — a task's timeout is capped, so a lease cannot outlive a known
 ceiling.
 
-**RabbitMQ, or anything speaking AMQP 0.9.1**, is the third production option: `amqp://` and
-`amqps://`. It changes the trade rather than just the dependency, because AMQP is a message
-transport with no shared store, and that cuts both ways.
+**RabbitMQ, or anything speaking AMQP 0.9.1**, is the basic backend: `amqp://` and `amqps://`.
+It delivers jobs and delivers them well, and that is the whole of what it does, because AMQP
+is a message transport with no shared store. Choose it when RabbitMQ is what you already run
+and jobs are what you need moved. If you want any of the things in the right-hand column
+below, choose Redis or Postgres; they are not on a roadmap for AMQP, because there is nowhere
+in the protocol to put them.
+
+| | Redis, Postgres | RabbitMQ |
+|---|---|---|
+| delivery, retries, delays, priority, chains, groups, results, dead letters | yes | yes |
+| rate limits, `max_concurrency` | one limit across every worker | one limit *per worker* |
+| cron | elected once, missed runs caught up | fires once per worker, not caught up |
+| cancel, pause, send dedup, chords | yes | refused, with an error that says why |
+| `result.get()` | told when the result lands | asks twenty times a second |
+| `tarsk status` | ready, running, delayed, dead | ready and dead |
+
+That cuts both ways.
 
 What it does better than a lease can: an unacked delivery is redelivered the *instant* the
 worker's connection dies — the connection is the lease, and there is no timeout to wait out.
@@ -159,9 +173,43 @@ A chain that fails partway stops there: the remaining steps were never queued, s
 nothing to cancel. A group is deliberately thin — the queue already runs what it can in
 parallel, and what `group` adds is handles that exist before the sending does.
 
-**No chord.** Fanning back in needs a counter in the broker and every member's result gathered
-before the callback can run, which is a different kind of machinery from either of these. Ask
-if you want it.
+## Chords
+
+```python
+from tarsk import chord, group
+
+work = chord(group(resize.si(f) for f in files), publish.s(album_id))
+answer = app.result(work.send()).get()
+```
+
+Members run side by side; the callback runs once, after all of them, and is handed a list of
+what they returned — in the order they were given, whichever order they finished in — ahead of
+its own arguments. `publish.si(...)` for a callback that does not want the list.
+
+Each member carries its place and the callback where a chain step would be, so this too is
+data on the job record. What it adds is a count: finished members are recorded in the broker,
+and the member whose arrival completes the set queues the callback. Exactly one member is told
+so, however they race, and the same one is told again if it is redelivered, so a callback that
+could not be queued the first time is queued the second.
+
+**If a member fails for good, the callback never runs** — there is no list to hand it. The
+failed member is in the dead letters like any other failure, and replaying it there completes
+the chord. What has been recorded is kept for a day.
+
+Not on RabbitMQ: counting needs a store every worker can write to, and `send()` says so before
+anything is queued rather than letting the members run and the callback go missing.
+
+## Sending many at once
+
+```python
+ids = app.send_many(resize.si(f) for f in files)
+```
+
+One round trip instead of one a job, and on Redis and Postgres one unit: they are all queued
+or none are, where a loop of `send()` leaves half a batch behind when the connection drops in
+the middle. A group and a chord are sent this way. Jobs that have to be decided one at a time
+still are — anything delayed, and anything with `unique=` or a dedup key — and RabbitMQ
+confirms each in turn, having no way to take a batch as a unit.
 
 ## Scheduling
 
@@ -175,6 +223,12 @@ schedule — five fields, evaluated in UTC.
 
 UTC is the whole timezone story, deliberately. A local schedule has to answer what "02:30
 daily" means on the night a clock jumps, and every answer is someone's outage.
+
+`AsyncResult.get()` does not poll. Redis publishes and Postgres notifies when a result is
+stored, so the answer arrives when it exists — about 2ms after the task finishes on a local
+Redis and 9ms on Postgres, where asking every 50ms made it 53 and 55 — and waiting on a slow
+task costs the broker nothing in the meantime. A Postgres worker is told about new work the
+same way, rather than asking forty times a second while there is none.
 
 The schedule lives with the supervisor, because that is the only process holding the registry
 and no user code. Each run is elected through the broker, so running ten workers still runs

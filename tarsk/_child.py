@@ -47,7 +47,8 @@ class Wire:
         asyncio.run_coroutine_threadsafe(self.send(tag, *args), loop).result()
 
 
-async def _call(app, task: Task, ctx: Context, args: list, kwargs: dict):
+async def _call(app, task: Task, ctx: Context, args: list, kwargs: dict,
+                control: "_Control | None" = None):
     """Run one task, through its middleware, under its timeout (spec §4.5).
 
     The timeout covers the middleware too. A tracing layer that hangs holds the
@@ -80,7 +81,25 @@ async def _call(app, task: Task, ctx: Context, args: list, kwargs: dict):
             chain = functools.partial(_layer, middleware, ctx, chain)
     hard = task.spec.timeout_ms / 1000
     soft = task.spec.soft_timeout_ms / 1000
-    return await _both_deadlines(chain, ctx, soft, hard)
+    return await _both_deadlines(chain, ctx, soft, hard, control if task.is_async else None)
+
+
+class _Control:
+    """How a job that is running can be reached from outside it.
+
+    `stop` is filled in once the work has started, and cancels it. Only async
+    handlers get one: a thread cannot be interrupted, so for a sync handler
+    there is nothing a `stop` could do.
+    """
+
+    __slots__ = ("stop",)
+
+    def __init__(self):
+        self.stop = None
+
+
+class _Cancelled(Exception):
+    """The job was cancelled while it ran, on the caller's say-so."""
 
 
 class _Deadline(Exception):
@@ -94,7 +113,8 @@ class _Deadline(Exception):
     """
 
 
-async def _both_deadlines(chain, ctx: Context, soft: float, hard: float):
+async def _both_deadlines(chain, ctx: Context, soft: float, hard: float,
+                          control: "_Control | None" = None):
     """Run the work under its deadlines, and report which one stopped it.
 
     `soft` is zero for a task that set none, and then only the hard one is
@@ -141,6 +161,19 @@ async def _both_deadlines(chain, ctx: Context, soft: float, hard: float):
         fired = "hard"
         running.cancel()
 
+    def stop() -> None:
+        # A third reason to cancel, and the same care as the soft deadline:
+        # the flag is set first, so the handler waking up in its `except` can
+        # already read why.
+        nonlocal fired
+        if not fired:
+            fired = "cancel"
+            object.__setattr__(ctx, "cancelled", True)
+            running.cancel()
+
+    if control is not None:
+        control.stop = stop
+
     loop = asyncio.get_running_loop()
     timers = [loop.call_later(hard, take)]
     if soft:
@@ -155,6 +188,8 @@ async def _both_deadlines(chain, ctx: Context, soft: float, hard: float):
             raise _Deadline(f"exceeded timeout of {hard}s") from None
         if fired == "soft":
             raise SoftTimeout(f"exceeded soft_timeout of {soft}s") from None
+        if fired == "cancel":
+            raise _Cancelled("cancelled while running") from None
         raise  # the worker is going down, not a deadline
     finally:
         for timer in timers:
@@ -234,7 +269,8 @@ _reports: set[asyncio.Task] = set()
 
 
 async def _one(app, wire: Wire, app_spec: str, task_id: int, name: str, payload,
-               meta: bytes = b"", attempt: int = 1, job_id: str = "") -> tuple[tuple, bool]:
+               meta: bytes = b"", attempt: int = 1, job_id: str = "",
+               control: "_Control | None" = None) -> tuple[tuple, bool]:
     """Run a single dispatched task. Never raises.
 
     Returns the frame that reports it, and whether this process can go on —
@@ -283,7 +319,11 @@ async def _one(app, wire: Wire, app_spec: str, task_id: int, name: str, payload,
             meta=_proto.unpack_result(meta) if meta else {},
             _emit=emit,
         )
-        result = await _call(app, task, ctx, call_args, call_kwargs)
+        result = await _call(app, task, ctx, call_args, call_kwargs, control)
+    except _Cancelled as exc:
+        # Settled and dropped: not retried, and not parked where a replay
+        # would bring back something its caller asked to be rid of.
+        return ("Nack", task_id, "Cancelled", str(exc), "drop", 0), True
     except SoftTimeout as exc:
         # Its own outcome rather than folded into TimeoutError: the two say
         # different things about the handler. This one was asked and stopped
@@ -359,6 +399,8 @@ async def main(socket_path: str, app_spec: str, child_id: int, slots: int = 1) -
         )
 
     running: set[asyncio.Task] = set()
+    # Dispatch id to the handle that can stop that job; see `_Control`.
+    controls: dict[int, _Control] = {}
     draining = False
     leaving = False
 
@@ -389,8 +431,12 @@ async def main(socket_path: str, app_spec: str, child_id: int, slots: int = 1) -
         # to the next: a block is counted where it is kept, not where the
         # process happened to grow. Two calls that read a counter.
         before = sys.getallocatedblocks()
-        frame, alive = await _one(app, wire, app_spec, task_id, name, payload, meta,
-                                  attempt, job_id)
+        control = controls[task_id] = _Control()
+        try:
+            frame, alive = await _one(app, wire, app_spec, task_id, name, payload, meta,
+                                      attempt, job_id, control)
+        finally:
+            controls.pop(task_id, None)
         await wire.send(*frame, sys.getallocatedblocks() - before)
         if not alive:
             # Nothing above is awaiting this task, so the exit has to happen
@@ -408,6 +454,14 @@ async def main(socket_path: str, app_spec: str, child_id: int, slots: int = 1) -
         if tag == "Drain":
             draining = True
             break
+        if tag == "Cancel":
+            # For a job that has already finished, or a sync handler, there is
+            # nothing to stop and nothing to say: the supervisor learns how it
+            # ended from the frame that reports it.
+            control = controls.get(args[0])
+            if control is not None and control.stop is not None:
+                control.stop()
+            continue
         if tag != "Dispatch":
             raise RuntimeError(f"unexpected frame from supervisor: {tag!r}")
         # Indexed rather than unpacked: the frame grew a field for the sender's

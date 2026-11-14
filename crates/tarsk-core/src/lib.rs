@@ -127,12 +127,16 @@ enum Directive {
     Reject,
     /// Hand it back after this many milliseconds, still charged an attempt.
     RetryAfter(u32),
+    /// Settle it and keep nothing: it was cancelled, which is neither a
+    /// failure to retry nor one to park where a replay would bring it back.
+    Drop,
 }
 
 impl Directive {
     fn read(items: &[Value]) -> Directive {
         match items.get(4).and_then(|v| v.as_str()) {
             Some("reject") => Directive::Reject,
+            Some("drop") => Directive::Drop,
             Some("retry") => {
                 Directive::RetryAfter(items.get(5).and_then(|v| v.as_u64()).unwrap_or(0) as u32)
             }
@@ -249,6 +253,7 @@ struct Counters {
     retried: AtomicU64,
     rate_limited: AtomicU64,
     expired: AtomicU64,
+    cancelled: AtomicU64,
     chained: AtomicU64,
     at_capacity: AtomicU64,
     /// Largest child RSS this supervisor ever read, in bytes.
@@ -297,6 +302,9 @@ pub struct Shared {
     /// Checked where the ceiling is checked — at the dispatch decision — so a
     /// cancellation costs nothing per task and takes effect within one refresh.
     revoked: Mutex<std::collections::HashSet<String>>,
+    /// The cancelled ids whose caller asked for a running job to be stopped
+    /// as well. A subset of `revoked`.
+    interrupts: Mutex<std::collections::HashSet<String>>,
     /// Observed cost of bringing a child up, in milliseconds. Pre-warming needs
     /// to know this: how early to start is a question about wall-clock, and a
     /// percentage of a limit answers a different question.
@@ -607,6 +615,19 @@ impl Shared {
         // the task until its lease expires, which reads as a task that
         // mysteriously stopped running.
         self.free_slot(&job).await;
+        if outcome.directive == Directive::Drop {
+            // Cancelled. The answer is kept for whoever is waiting on it, and
+            // the job is gone: it used to be retried, cancelled again each
+            // time, and finally left in the dead letters for a replay to
+            // resurrect.
+            self.counters.cancelled.fetch_add(1, Ordering::Relaxed);
+            self.keep_result(&job, &outcome).await;
+            if let Err(err) = self.broker.ack(&job.receipt).await {
+                self.broker_error("ack", err.as_ref());
+            }
+            self.record(job.task_id, outcome);
+            return;
+        }
         let spec = self.specs.lock().unwrap().get(&job.name).cloned();
         let retries = spec.as_ref().map(|s| s.retries).unwrap_or(0);
         // A rejection skips whatever attempts are left: the handler is saying
@@ -884,6 +905,7 @@ fn counter_list(shared: &Shared) -> Vec<(&'static str, u64)> {
         ("task_retries", load(&counters.retried)),
         ("tasks_rate_limited", load(&counters.rate_limited)),
         ("tasks_expired", load(&counters.expired)),
+        ("tasks_cancelled", load(&counters.cancelled)),
         ("chain_steps_queued", load(&counters.chained)),
         ("tasks_at_capacity", load(&counters.at_capacity)),
         ("child_rss_peak", load(&counters.child_rss_peak)),
@@ -1375,6 +1397,8 @@ async fn serve_inner(
     let mut retiring: Option<&'static str> = None;
     // For charging memory to tasks: the child's RSS when growth was last
     // charged, and what has finished since. See `Metrics::observe_growth`.
+    // Jobs in this child already told to stop, so each is told once.
+    let mut interrupted: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut charged_at: Option<u64> = None;
     let mut finished: Vec<String> = Vec::new();
 
@@ -1579,14 +1603,10 @@ async fn serve_inner(
                 if shared.revoked.lock().unwrap().contains(&job.id) {
                     // Settled, not run. The delivery still has to be acked or
                     // the lease would expire and hand it back for another go.
-                    if settle
-                        .send(Settle::Done(
-                            job,
-                            Outcome::nack("Cancelled", "cancelled before it started".into()),
-                        ))
-                        .await
-                        .is_err()
-                    {
+                    let mut cancelled =
+                        Outcome::nack("Cancelled", "cancelled before it started".into());
+                    cancelled.directive = Directive::Drop;
+                    if settle.send(Settle::Done(job, cancelled)).await.is_err() {
                         outcome = Fill::Dead;
                         break;
                     }
@@ -1748,6 +1768,29 @@ async fn serve_inner(
                         spare_at = None;
                         shared.counters.wasted_spares.fetch_add(1, Ordering::Relaxed);
                         tokio::spawn(drain_owned(shared.clone(), stale, cfg.clone()));
+                    }
+                }
+                // A cancellation that asked for it reaches a job that is already
+                // running. The child cancels an async handler and answers with
+                // a Nack; a sync one cannot be interrupted and runs on.
+                let wanted: Vec<u64> = {
+                    let interrupts = shared.interrupts.lock().unwrap();
+                    if interrupts.is_empty() {
+                        Vec::new()
+                    } else {
+                        inflight
+                            .values()
+                            .filter(|job| interrupts.contains(&job.id))
+                            .map(|job| job.task_id)
+                            .filter(|task_id| !interrupted.contains(task_id))
+                            .collect()
+                    }
+                };
+                for task_id in wanted {
+                    interrupted.insert(task_id);
+                    let cancel = Value::Array(vec![Value::from("Cancel"), Value::from(task_id)]);
+                    if write_frame(writer, &cancel).await.is_err() {
+                        return Served { exit: Exit::Died, spare };
                     }
                 }
                 let reading = check!();
@@ -2226,7 +2269,26 @@ pub async fn supervise_until(
                     }
                 }
                 match shared.broker.revoked_all().await {
-                    Ok(ids) => *shared.revoked.lock().unwrap() = ids.into_iter().collect(),
+                    Ok(ids) => {
+                        // A leading `!` marks a cancellation that also wants a
+                        // running job stopped. Both kinds stop one that has
+                        // not started.
+                        let mut interrupts = std::collections::HashSet::new();
+                        let mut revoked = std::collections::HashSet::new();
+                        for id in ids {
+                            match id.strip_prefix('!') {
+                                Some(bare) => {
+                                    interrupts.insert(bare.to_string());
+                                    revoked.insert(bare.to_string());
+                                }
+                                None => {
+                                    revoked.insert(id);
+                                }
+                            }
+                        }
+                        *shared.revoked.lock().unwrap() = revoked;
+                        *shared.interrupts.lock().unwrap() = interrupts;
+                    }
                     Err(err) => shared.broker_error("reading cancellations", err.as_ref()),
                 }
                 if let Err(err) = shared.broker.refresh_paused().await {
@@ -2393,6 +2455,7 @@ pub fn new_shared(broker: Broker, total: usize, batch: bool) -> Arc<Shared> {
         next_child_id: AtomicU64::new(0),
         max_dead: AtomicU64::new(0),
         revoked: Mutex::new(std::collections::HashSet::new()),
+        interrupts: Mutex::new(std::collections::HashSet::new()),
         spawn_ms: AtomicU64::new(250), // replaced by the first real measurement
         task_growth: AtomicU64::new(0),
         growth_samples: AtomicU64::new(0),

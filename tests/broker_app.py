@@ -282,3 +282,18 @@ def lingers(tag):
 @app.task(name="catches_up", cron=os.environ.get("TARSK_TEST_CRON", ""))
 def catches_up():
     _log("caught-up")
+
+
+@app.task(name="stoppable", result_ttl=60, retries=2)
+async def stoppable(tag, ctx=Depends(Context)):
+    """Waits a long time for nothing, and says how it was stopped."""
+    import asyncio
+
+    _log(f"{tag}-start")
+    try:
+        await asyncio.sleep(25)
+    except asyncio.CancelledError:
+        _log(f"{tag}-stopped-{ctx.cancelled}")
+        raise
+    _log(f"{tag}-end")
+    return tag

@@ -1699,6 +1699,45 @@ def _b44_a_paused_queue_waits(url, label, skip, app, env, log, producer):
     assert producer.paused() == [], producer.paused()
 
 
+def _b45_a_running_job_can_be_stopped(url, label, skip, app, env, log, producer):
+    if "cancel" in skip:
+        print(f"  {label}: skip interrupt — this broker refuses cancellation outright")
+        return
+    # --- cancel(interrupt=True) reaches a job that has already started ---
+    from tarsk import TaskFailed
+
+    log.write_text("")
+    before = count_dead(url)
+    waiting = app.registry["stoppable"].send("halfway")
+    blocking = app.registry["medium"].send("sync-runs-on")
+    worker = start_worker(env, TARSK_SLOTS=4, TARSK_LEASE_GRACE=1)
+    try:
+        wait_for(log, {"halfway-start"}, timeout=60)
+        app.cancel(waiting, interrupt=True)
+        app.cancel(blocking, interrupt=True)
+        seen = wait_for(log, {"halfway-stopped-True"}, timeout=15)
+        assert "halfway-stopped-True" in seen, \
+            f"{label}: the running job was not interrupted, or was not told why: {seen}"
+        try:
+            app.result(waiting).get(timeout=15)
+        except TaskFailed as why:
+            assert why.error_type == "Cancelled", why.error_type
+        else:
+            raise AssertionError(f"{label}: an interrupted job reported a result")
+        # A thread cannot be interrupted: the sync handler finishes its work.
+        seen = wait_for(log, {"sync-runs-on"}, timeout=30)
+        assert "sync-runs-on" in seen, f"{label}: a sync handler was cut off: {seen}"
+        time.sleep(1.5)
+    finally:
+        stop_worker(worker)
+    seen = tags_in(log)
+    # It had two retries to spend and spent none: cancelled is not failed.
+    assert seen.count("halfway-start") == 1, f"{label}: a cancelled job was retried: {seen}"
+    assert "halfway-end" not in seen, f"{label}: {seen}"
+    assert count_dead(url) == before, \
+        f"{label}: a cancelled job was left in the dead letters for a replay to revive"
+
+
 def _b38_redis_only(url, label, skip, app, env, log, producer):
     if not scheme_is(url, ("redis://", "rediss://")):
         return
@@ -1912,6 +1951,7 @@ def check_broker(url: str, label: str, skip: frozenset = frozenset()) -> None:
         _b42_connecting_beside_a_busy_worker(url, label, skip, app, env, log, producer)
         _b43_a_batch_arrives_whole(url, label, skip, app, env, log, producer)
         _b44_a_paused_queue_waits(url, label, skip, app, env, log, producer)
+        _b45_a_running_job_can_be_stopped(url, label, skip, app, env, log, producer)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 

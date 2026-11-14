@@ -153,6 +153,10 @@ class Context:
     #: difference between "my deadline passed" and "the worker is shutting
     #: down" — two cancellations that want different cleanup.
     soft_expired: bool = False
+    #: True once the job has been cancelled while running, with
+    #: `app.cancel(task_id, interrupt=True)`. Like `soft_expired`, it is what
+    #: tells this cancellation from a deadline or a worker shutting down.
+    cancelled: bool = False
     #: Set by the worker. Sends progress to the supervisor, which is the only
     #: process here holding a broker connection (spec §4.1).
     _emit: object = None
@@ -639,14 +643,23 @@ class App:
         ])
         return [record[0] for record in records]
 
-    def cancel(self, task_id: str, *, queue: str = "default", ttl: float = 86400.0) -> None:
+    def cancel(self, task_id: str, *, queue: str = "default", ttl: float = 86400.0,
+               interrupt: bool = False) -> None:
         """Stop a job from running. Takes effect within a second.
 
-        A job that has already started is *not* interrupted. The supervisor
-        could tell the child to drop it, but a handler that has begun has
-        usually begun doing the thing you wanted stopped — written the row,
-        called the API — and a queue that reports "cancelled" for work that
-        half-happened is worse than one that admits it finished.
+        A job that has already started is not interrupted unless you ask. A
+        handler that has begun has usually begun doing the thing you wanted
+        stopped — written the row, called the API — and a queue that reports
+        "cancelled" for work that half-happened is worse than one that admits
+        it finished.
+
+        `interrupt=True` asks anyway. An async handler is cancelled where it
+        is waiting: it sees `asyncio.CancelledError` with `ctx.cancelled` set,
+        and what it had already done stays done, so this is for work that can
+        be abandoned halfway. A sync handler runs in a thread that cannot be
+        interrupted and finishes regardless. Either way the job is not
+        retried and not dead-lettered; a result, if it keeps one, says
+        `Cancelled`.
 
         `ttl` is how long the cancellation is remembered, and it has to outlive
         the job: cancelling something scheduled for next week needs a week.
@@ -654,7 +667,9 @@ class App:
         `queue` no longer decides anything and is kept so existing calls still
         work: a job is found by its id, whichever queue it is on.
         """
-        self.producer().cancel(task_id, queue=queue, ttl=ttl)
+        # The `!` is how the workers tell the two kinds apart; see the
+        # supervisor's reading of the cancellation set.
+        self.producer().cancel(f"!{task_id}" if interrupt else task_id, queue=queue, ttl=ttl)
 
     def pause(self, queue: str = "default") -> None:
         """Stop every worker taking jobs from `queue`. Takes effect within a second.
@@ -956,9 +971,11 @@ class AsyncResult:
     def ready(self) -> bool:
         return self._fetch() is not None
 
-    def cancel(self, *, queue: str = "default", ttl: float = 86400.0) -> None:
-        """Stop this job from running, if it has not started. See `App.cancel`."""
-        self.app.cancel(self.task_id, queue=queue, ttl=ttl)
+    def cancel(self, *, queue: str = "default", ttl: float = 86400.0,
+               interrupt: bool = False) -> None:
+        """Stop this job from running; with `interrupt`, also if it has started.
+        See `App.cancel`."""
+        self.app.cancel(self.task_id, queue=queue, ttl=ttl, interrupt=interrupt)
 
     async def get_async(self, timeout: float = 30.0, poll: float = 0.05):
         """Wait for the answer without blocking the event loop.

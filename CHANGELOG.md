@@ -16,9 +16,6 @@ Nothing in your tasks has to change. Four things are worth knowing before you ro
 - **Postgres changes its schema on the first 0.3 connection:** tables `tarsk_schema` and
   `tarsk_cron_runs`, three columns on `tarsk_dead`, one on `tarsk_buckets`, and the function
   `tarsk_acquire_slot`. It needs no downtime, and a 0.2 worker keeps running against it.
-- **Redis is spoken to in RESP3**, which needs Redis 6 or newer. Add `?protocol=2` to the
-  URL for an older server; the only thing it costs is that a producer then loses the one
-  call that discovers a dropped connection.
 - **On RabbitMQ, a message too large for 0.2 to have sent at all** — a chain, meta or
   traceback past about 64KB — is written in a form a 0.2 worker cannot read. Everything
   smaller is written as before.
@@ -89,8 +86,8 @@ Nothing in your tasks has to change. Four things are worth knowing before you ro
   measured — so one that kept growing went straight through the hard ceiling: 400 MB
   under a 220 MB limit, measured. The supervisor also stopped watching for as long as a
   replacement child took to start.
-- **Redis: a producer loses no call to a dropped connection** either, now that the
-  connection hears the server hang up.
+- **Redis: a producer loses no call to a dropped connection** either. A connection that
+  has been idle for a second is sent a PING first, so it is the PING that finds out.
 - A worker reads its schedules as soon as its first child has registered, rather than at
   the next minute boundary.
 - **Postgres: a claim no longer reads the whole backlog.** It filtered on an `OR` and

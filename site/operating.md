@@ -79,10 +79,10 @@ except BrokerError:
 ```
 
 On Redis and Postgres a producer notices a dropped connection before it sends on it, so the
-drop costs no call. On Redis that relies on RESP3, which is the default; with `?protocol=2` in
-the URL — for a server older than 6 — the call that discovers the drop fails and the next one
-succeeds. A command that was already in flight when the connection died fails either way, and
-is not retried for you: whether the server acted on it is not something a client can know.
+drop costs no call. On Redis that is a PING, sent first on any connection that has been quiet
+for a second — one extra round trip for a producer that sends rarely, none for one that is
+busy. A command that was already in flight when the connection died fails either way, and is
+not retried for you: whether the server acted on it is not something a client can know.
 
 ## Seeing the backlog
 

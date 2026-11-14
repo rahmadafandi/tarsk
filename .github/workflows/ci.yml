@@ -25,12 +25,10 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
 
-      # The broker tests start their own servers on free ports; these are just
-      # the binaries. Postgres ships with the runner image.
-      # rabbitmq-server starts on install, guest/guest on localhost — exactly
-      # what test_amqp probes for. Without it that test skips, and a skipped
-      # backend is not a tested one however honestly the summary says so.
-      - run: sudo apt-get update && sudo apt-get install -y redis-server rabbitmq-server
+      # Redis for the demo below, which is the definition of done and wants a
+      # real broker. The broker suites themselves run in `brokers`, one job a
+      # backend, so this job no longer waits on all three in turn.
+      - run: sudo apt-get update && sudo apt-get install -y redis-server
 
       # A venv so `maturin develop` puts the extension in the source tree,
       # which is where the tests add ROOT to sys.path expects to find it.
@@ -43,11 +41,48 @@ jobs:
 
       - run: .venv/bin/python tests/test_ipc.py
       - run: .venv/bin/python tests/test_recycle.py
-      - run: .venv/bin/python tests/test_brokers.py
+      # The parts of the broker suite that need no server: batch mode, the
+      # CLI's broker resolution, and that TLS is compiled in.
+      - run: .venv/bin/python tests/test_brokers.py memory cli tls
 
       # The definition of done, at a length CI can afford. Exits non-zero if a
       # single task went missing.
       - run: .venv/bin/python demo/run.py --minutes 1 --ceiling 150MB --rate 30
+
+  brokers:
+    # Each backend's suite in a job of its own. They are independent, they are
+    # the slow part, and in one job a backend waited for the others to finish
+    # before anyone learned whether it worked. Two Pythons rather than four:
+    # what differs between them is in the child, which test_ipc and
+    # test_recycle already run on every version.
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [redis, postgres, amqp]
+        python: ["3.11", "3.14"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      # The suite starts its own Redis and Postgres on free ports; these are
+      # just the binaries, and Postgres ships with the runner image.
+      # rabbitmq-server starts on install, guest/guest on localhost — exactly
+      # what test_amqp probes for. Without it that suite skips, and a skipped
+      # backend is not a tested one however honestly the summary says so.
+      - if: matrix.backend == 'redis'
+        run: sudo apt-get update && sudo apt-get install -y redis-server
+      - if: matrix.backend == 'amqp'
+        run: sudo apt-get update && sudo apt-get install -y rabbitmq-server
+      - run: python -m venv .venv
+      - run: .venv/bin/pip install --upgrade pip maturin msgpack
+      - run: .venv/bin/maturin develop --release -F redis,postgres,amqp,test-hooks
+      - run: .venv/bin/python tests/test_brokers.py ${{ matrix.backend }}
+        env:
+          TARSK_VERBOSE: "1"
 
   lint:
     runs-on: ubuntu-24.04

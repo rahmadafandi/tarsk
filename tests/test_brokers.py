@@ -14,6 +14,7 @@ Run: python tests/test_brokers.py
 """
 
 import os
+import re
 import shutil
 import signal
 import socket
@@ -145,13 +146,31 @@ class Postgres:
 def start_worker(env, stderr=None, **overrides):
     """`stderr` is a path to keep what the worker prints, for a test that reads it."""
     sink = stderr or os.environ.get("TARSK_WORKER_ERR")
-    return subprocess.Popen(
+    worker = subprocess.Popen(
         [sys.executable, "tests/broker_worker.py"],
         env={**env, **{k: str(v) for k, v in overrides.items()}},
         stdout=subprocess.DEVNULL,
         stderr=open(sink, "a") if sink else subprocess.DEVNULL,
         start_new_session=True,
     )
+    _started.append(worker)
+    return worker
+
+
+# Every worker this run has started, so one a failed block left behind can be
+# found and stopped before it eats the next block's jobs.
+_started: list = []
+
+
+def _stop_stray_workers() -> None:
+    for worker in _started:
+        if worker.poll() is None:
+            try:
+                os.killpg(os.getpgid(worker.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            worker.wait(timeout=30)
+    _started.clear()
 
 
 def stop_worker(proc, hard=False):
@@ -1929,53 +1948,40 @@ def check_broker(url: str, label: str, skip: frozenset = frozenset()) -> None:
     from tarsk._core import Producer
 
     producer = Producer(broker_url=url)
+    # Every block, in the order its number gives it. A block that fails is
+    # reported and the rest still run: one assertion used to end the whole
+    # suite, so a run told you about the first thing broken and nothing about
+    # the others. `TARSK_BLOCKS=27,35` runs only those.
+    blocks = sorted(
+        (name, fn) for name, fn in globals().items()
+        if re.fullmatch(r"_b\d\d_\w+", name) and callable(fn)
+    )
+    only = {int(n) for n in os.environ.get("TARSK_BLOCKS", "").replace(",", " ").split()}
+    failed = []
     try:
-        _b01_delivery(url, label, skip, app, env, log, producer)
-        _b02_lease_expiry_the_whole(url, label, skip, app, env, log, producer)
-        _b03_a_delayed_job_waits(url, label, skip, app, env, log, producer)
-        _b04_results_for_the_tasks(url, label, skip, app, env, log, producer)
-        _b05_per_call_overrides_a(url, label, skip, app, env, log, producer)
-        _b06_progress_published_from_inside(url, label, skip, app, env, log, producer)
-        _b07_cron_election(url, label, skip, app, env, log, producer)
-        _b08_dedup(url, label, skip, app, env, log, producer)
-        _b09_shared_concurrency(url, label, skip, app, env, log, producer)
-        _b10_the_types_people_actually(url, label, skip, app, env, log, producer)
-        _b11_the_dead_letters_stop(url, label, skip, app, env, log, producer)
-        _b12_what_the_sender_attached(url, label, skip, app, env, log, producer)
-        _b13_listing_and_cancel(url, label, skip, app, env, log, producer)
-        _b14_the_backlog_is_visible(url, label, skip, app, env, log, producer)
-        _b15_a_chain_runs_in(url, label, skip, app, env, log, producer)
-        _b16_a_group_hands_back(url, label, skip, app, env, log, producer)
-        _b17_a_job_that_waited(url, label, skip, app, env, log, producer)
-        _b18_expires_per_send_not(url, label, skip, app, env, log, producer)
-        _b19_queues_high_low_is(url, label, skip, app, env, log, producer)
-        _b20_a_chain_against_an(url, label, skip, app, env, log, producer)
-        _b21_set_progress_works_from(url, label, skip, app, env, log, producer)
-        _b22_a_delayed_send_keeps(url, label, skip, app, env, log, producer)
-        _b23_a_rate_limit_holds(url, label, skip, app, env, log, producer)
-        _b24_cancel(url, label, skip, app, env, log, producer)
-        _b25_retries_run_out_job(url, label, skip, app, env, log, producer)
-        _b26_the_dead_letters_can(url, label, skip, app, env, log, producer)
-        _b27_the_handler_knows_its_id(url, label, skip, app, env, log, producer)
-        _b28_stop_means_stop(url, label, skip, app, env, log, producer)
-        _b29_a_replay_is_the_same_job(url, label, skip, app, env, log, producer)
-        _b30_a_signal_to_the_group_drains(url, label, skip, app, env, log, producer)
-        _b31_a_wait_is_not_an_attempt(url, label, skip, app, env, log, producer)
-        _b32_a_cancel_needs_no_queue(url, label, skip, app, env, log, producer)
-        _b33_jobs_filters_before_it_limits(url, label, skip, app, env, log, producer)
-        _b34_the_console_acts_on_what_it_was_sent(url, label, skip, app, env, log, producer)
-        _b35_a_dropped_connection_comes_back(url, label, skip, app, env, log, producer)
-        _b36_a_failed_send_frees_its_reservation(url, label, skip, app, env, log, producer)
-        _b37_many_workers_share_one_cap(url, label, skip, app, env, log, producer)
-        _b38_redis_only(url, label, skip, app, env, log, producer)
-        _b39_large_things_travel(url, label, skip, app, env, log, producer)
-        _b40_limits_hold_across_connections(url, label, skip, app, env, log, producer)
-        _b41_a_missed_cron_run_is_caught_up(url, label, skip, app, env, log, producer)
-        _b42_connecting_beside_a_busy_worker(url, label, skip, app, env, log, producer)
-        _b43_a_batch_arrives_whole(url, label, skip, app, env, log, producer)
-        _b44_a_paused_queue_waits(url, label, skip, app, env, log, producer)
-        _b45_a_running_job_can_be_stopped(url, label, skip, app, env, log, producer)
-        _b46_a_chord_joins(url, label, skip, app, env, log, producer)
+        for name, block in blocks:
+            if only and int(name[2:4]) not in only:
+                continue
+            began = time.time()
+            try:
+                block(url, label, skip, app, env, log, producer)
+            except Exception as why:  # noqa: BLE001 — reported below, by name
+                failed.append(name)
+                first = str(why).strip().splitlines()[0] if str(why).strip() else ""
+                print(f"  FAIL {label} {name[1:]} ({time.time() - began:.0f}s): "
+                      f"{type(why).__name__}: {first}")
+                if os.environ.get("TARSK_TRACEBACKS"):
+                    import traceback
+
+                    traceback.print_exc()
+                _stop_stray_workers()
+            else:
+                if os.environ.get("TARSK_VERBOSE"):
+                    print(f"  ok   {label} {name[1:]} ({time.time() - began:.0f}s)")
+        if failed:
+            raise AssertionError(
+                f"{label}: {len(failed)} of {len(blocks)} blocks failed: "
+                + ", ".join(name[1:] for name in failed))
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
@@ -2282,12 +2288,23 @@ def test_tls_is_compiled_in():
 
 
 if __name__ == "__main__":
+    # `python tests/test_brokers.py` runs everything; naming backends runs
+    # those — `… redis postgres` — which is how CI gives each its own job.
     # memory first: it needs no server, so a broken build says so in seconds
     # rather than after Postgres has finished initdb.
-    ran, skipped = [], []
-    for check in (test_memory, test_redis, test_cli_broker_from_env_and_dotenv,
-                  test_amqp, test_postgres, test_tls_is_compiled_in,
-                  test_postgres_tls_is_compiled_in):
+    suites = {
+        "memory": [test_memory],
+        "redis": [test_redis],
+        "cli": [test_cli_broker_from_env_and_dotenv],
+        "amqp": [test_amqp],
+        "postgres": [test_postgres],
+        "tls": [test_tls_is_compiled_in, test_postgres_tls_is_compiled_in],
+    }
+    unknown = [name for name in sys.argv[1:] if name not in suites]
+    if unknown:
+        sys.exit(f"no such suite: {', '.join(unknown)} (there is {', '.join(suites)})")
+    ran, skipped, broken = [], [], []
+    for check in [c for name in (sys.argv[1:] or suites) for c in suites[name]]:
         try:
             check()
         except SkipTest as why:
@@ -2295,8 +2312,16 @@ if __name__ == "__main__":
             # printing a pass for it is how a broken backend hides in CI.
             skipped.append(check.__name__)
             print(f"skip {check.__name__} ({why})")
+        except AssertionError as why:
+            # Reported and carried on from, so one backend's failure does not
+            # hide whether the next one works.
+            broken.append(check.__name__)
+            print(f"FAIL {check.__name__}: {why}")
         else:
             ran.append(check.__name__)
             print("ok", check.__name__)
     print(f"\n{len(ran)} ran, {len(skipped)} skipped"
-          + (f": {', '.join(skipped)}" if skipped else ""))
+          + (f": {', '.join(skipped)}" if skipped else "")
+          + (f", {len(broken)} FAILED: {', '.join(broken)}" if broken else ""))
+    if broken:
+        sys.exit(1)

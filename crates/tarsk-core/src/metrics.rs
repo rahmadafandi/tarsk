@@ -80,8 +80,14 @@ impl Metrics {
     }
 }
 
+/// A label value, as the exposition format wants it: backslash, quote and
+/// newline are the three characters it gives a meaning to. A queue or task
+/// name carrying one would otherwise end its own label and corrupt the scrape.
 fn escape(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 /// Render the exposition text. `counters` and `reasons` are passed in rather
@@ -112,7 +118,8 @@ pub fn render(
                 ("dead", dead),
             ] {
                 out.push_str(&format!(
-                    "tarsk_queue_jobs{{queue=\"{queue}\",state=\"{state}\"}} {value}\n"
+                    "tarsk_queue_jobs{{queue=\"{}\",state=\"{state}\"}} {value}\n",
+                    escape(queue)
                 ));
             }
         }
@@ -189,3 +196,23 @@ pub fn render(
 // The HTTP server that used to live here now serves the console as well, and
 // moved to `console.rs` with it. This module went back to being what its name
 // says: turning counters into text.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_label_cannot_break_out_of_its_quotes() {
+        assert_eq!(escape("plain"), "plain");
+        assert_eq!(escape(r#"a"b\c"#), r#"a\"b\\c"#);
+        assert_eq!(escape("two\nlines"), "two\\nlines");
+
+        let metrics = Metrics::default();
+        metrics.set_depth(vec![("odd\"queue\n".to_string(), [1, 0, 0, 0])]);
+        let text = render(&metrics, &[], &std::collections::HashMap::new(), 0);
+        assert!(
+            text.contains(r#"tarsk_queue_jobs{queue="odd\"queue\n",state="ready"} 1"#),
+            "{text}"
+        );
+    }
+}

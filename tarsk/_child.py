@@ -93,10 +93,20 @@ class _Control:
     there is nothing a `stop` could do.
     """
 
-    __slots__ = ("stop",)
+    __slots__ = ("stop", "asked")
 
     def __init__(self) -> None:
         self.stop: Callable[[], None] | None = None
+        # A cancellation that arrived before there was anything to cancel:
+        # the job was dispatched and has not reached its handler yet. Acted
+        # on the moment it does, rather than lost.
+        self.asked = False
+
+    def cancel(self) -> None:
+        if self.stop is not None:
+            self.stop()
+        else:
+            self.asked = True
 
 
 class _Cancelled(Exception):
@@ -174,6 +184,8 @@ async def _both_deadlines(chain, ctx: Context, soft: float, hard: float,
 
     if control is not None:
         control.stop = stop
+        if control.asked:
+            stop()
 
     loop = asyncio.get_running_loop()
     timers = [loop.call_later(hard, take)]
@@ -434,7 +446,7 @@ async def main(socket_path: str, app_spec: str, child_id: int, slots: int = 1) -
         # to the next: a block is counted where it is kept, not where the
         # process happened to grow. Two calls that read a counter.
         before = sys.getallocatedblocks()
-        control = controls[task_id] = _Control()
+        control = controls[task_id]
         try:
             frame, alive = await _one(app, wire, app_spec, task_id, name, payload, meta,
                                       attempt, job_id, control)
@@ -462,8 +474,8 @@ async def main(socket_path: str, app_spec: str, child_id: int, slots: int = 1) -
             # nothing to stop and nothing to say: the supervisor learns how it
             # ended from the frame that reports it.
             control = controls.get(args[0])
-            if control is not None and control.stop is not None:
-                control.stop()
+            if control is not None:
+                control.cancel()
             continue
         if tag != "Dispatch":
             raise RuntimeError(f"unexpected frame from supervisor: {tag!r}")
@@ -474,6 +486,9 @@ async def main(socket_path: str, app_spec: str, child_id: int, slots: int = 1) -
         meta = args[3] if len(args) > 3 else b""
         attempt = args[4] if len(args) > 4 else 1
         job_id = args[5] if len(args) > 5 else ""
+        # Registered here, not when the job starts running: a Cancel can be
+        # the very next frame, before the loop has given the job a turn.
+        controls[task_id] = _Control()
         job = asyncio.create_task(
             run_and_report(task_id, name, payload, meta, attempt, job_id)
         )

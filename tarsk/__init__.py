@@ -412,6 +412,7 @@ class App:
         self._finishers: list = []
         self._resolving = asyncio.Lock()
         self._overrides: dict = {}
+        self._waiters: Any = None  # the executor result waits run in, made on first use
         self._producer = None
         self._producer_pid = 0
         self._inherited: list = []
@@ -623,7 +624,8 @@ class App:
         `app.send_many(resize.si(f) for f in files)`. On Redis and Postgres
         they go in together or not at all: a group that is half queued when
         the connection drops is a harder thing to recover from than one that
-        was never queued. A thousand sends are also a thousand round trips,
+        was never queued. (Postgres refuses the whole batch for one bad row
+        as well; Redis runs the rest.) A thousand sends are also a thousand round trips,
         and this is one.
 
         Jobs that cannot travel in a batch are sent one at a time, as
@@ -1046,8 +1048,25 @@ class AsyncResult:
         self.app.cancel(self.task_id, queue=queue, ttl=ttl, interrupt=interrupt)
 
     async def get_async(self, timeout: float = 30.0, poll: float = 0.05):
-        """Wait for the answer without blocking the event loop."""
-        return await asyncio.to_thread(self.get, timeout, poll)
+        """Wait for the answer without blocking the event loop.
+
+        The wait is one blocking call, held in a thread for as long as it
+        takes. Those threads are this app's own and not asyncio's default
+        pool: forty handlers each awaiting a slow result would otherwise hold
+        every thread `send_async` needs, for up to `timeout`.
+        """
+        # ponytail: at most 64 waits at once per app; the 65th queues behind
+        # them, and its timeout starts when it gets a thread. A waiter that is
+        # a coroutine rather than a thread needs the Rust runtime bridged into
+        # the event loop, which is the same upgrade `send_async` is waiting on.
+        app = self.app
+        if app._waiters is None:
+            import concurrent.futures
+
+            app._waiters = concurrent.futures.ThreadPoolExecutor(
+                max_workers=64, thread_name_prefix="tarsk-wait")
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(app._waiters, self.get, timeout, poll)
 
     def progress(self):
         """The last value the task published, or None."""

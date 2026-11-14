@@ -28,7 +28,8 @@
   is stored. Send-to-result fell from 53ms to 2ms on Redis and from 55ms to 9ms on
   Postgres. `poll=` is accepted and unused.
 - **A Postgres worker is told about new work** instead of asking for it forty times a
-  second: an idle worker went from 82 transactions a second to 19.
+  second: an idle worker went from 82 transactions a second to 19. Listening takes one
+  more connection per worker, and per producer that waits on results.
 - **A cancelled job is settled and dropped.** It used to be retried, cancelled again each
   time, and left in the dead letters where a replay would run it.
 - RabbitMQ is documented as the basic backend, with a table of what it does not do.

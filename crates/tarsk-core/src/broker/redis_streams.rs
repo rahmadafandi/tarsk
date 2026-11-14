@@ -608,13 +608,9 @@ impl RedisBroker {
             match head {
                 Some((delivery, claimed_at, deadline_ms)) => {
                     if claimed_at.elapsed().as_millis() as u64 >= deadline_ms {
-                        // ponytail: `fetch_update` was renamed `try_update` in a Rust newer than
-                        // the one mise.toml pins. Allowed rather than renamed so both the pinned
-                        // toolchain and CI's stable build; switch when the pin moves past the rename.
-                        #[allow(deprecated)]
                         let _ =
                             self.prefetch
-                                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                                .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                                     Some((n / 2).max(1))
                                 });
                         continue; // let it expire and return to whoever is free
@@ -672,11 +668,9 @@ impl RedisBroker {
         if first.is_some() {
             // A read that returned work earns a larger one next time; the
             // discard path above walks it back down when batches go stale.
-            // See the note on the other `fetch_update` above.
-            #[allow(deprecated)]
             let _ = self
                 .prefetch
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                     Some((n * 2).min(self.prefetch_cap.load(Ordering::Relaxed).max(1)))
                 });
         }

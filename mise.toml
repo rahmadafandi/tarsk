@@ -21,7 +21,7 @@ python = "3.14.3"
 # the other half of that trade: locally you get the version the numbers on the
 # documentation site were produced with, and CI tells you when stable moves
 # past it.
-rust = "1.94.0"
+rust = "1.100.0"
 
 [env]
 # Created and activated when the directory is entered — on the shell hook, or

@@ -257,12 +257,12 @@ impl Producer {
     /// reconnects before anything is sent rather than after something is lost.
     fn wake_then<F: std::future::Future>(&self, call: F) -> F::Output {
         self.runtime.block_on(async {
-            // More than one turn: the driver has to see the socket, tell
-            // whoever reconnects, and that has to swap the connection, each
-            // on a turn of its own.
             for _ in 0..4 {
                 tokio::task::yield_now().await;
             }
+            // That is enough for Postgres, whose client can be asked whether
+            // it is closed. Redis cannot be, and is probed instead.
+            self.broker.refresh().await;
             call.await
         })
     }

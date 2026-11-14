@@ -789,6 +789,16 @@ impl Broker {
         }
     }
 
+    /// Give an idle connection the chance to find out it has been closed,
+    /// before the caller sends anything it would mind losing. Only Redis needs
+    /// asking; see `RedisBroker::refresh`.
+    pub async fn refresh(&self) {
+        #[cfg(feature = "redis")]
+        if let Broker::Redis(b) = self {
+            b.refresh().await;
+        }
+    }
+
     /// Hand back what this worker fetched ahead and will now never start.
     ///
     /// Only Redis reads ahead. A worker that stops claiming still owns the

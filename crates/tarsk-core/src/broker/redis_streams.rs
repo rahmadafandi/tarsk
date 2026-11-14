@@ -21,6 +21,9 @@ pub struct RedisBroker {
     /// from every child queue behind one lock on a single-threaded runtime,
     /// which is a bottleneck this driver invented for itself.
     conn: redis::aio::ConnectionManager,
+    /// When a caller last asked `refresh` whether the connection was alive, in
+    /// milliseconds. See there.
+    last_used_ms: AtomicU64,
     /// Only for `XREADGROUP … BLOCK`, and never shared with anything else.
     ///
     /// A blocking command on a multiplexed connection holds up every command
@@ -151,21 +154,7 @@ const REVOKED: &str = "tarsk:revoked";
 
 impl RedisBroker {
     pub(super) async fn connect(url: &str, queues: Vec<String>) -> Res<RedisBroker> {
-        use redis::IntoConnectionInfo;
-        let mut info = url.into_connection_info()?;
-        // RESP3 unless the URL says otherwise. It is what lets the connection
-        // manager hear a disconnect when it happens: on RESP2 it finds out
-        // only when a command fails, so a producer that had been idle lost
-        // the first call it made after every failover. `?protocol=2` is still
-        // honoured, and is what a Redis older than 6 needs.
-        if !url.contains("protocol=") {
-            let settings = info
-                .redis_settings()
-                .clone()
-                .set_protocol(redis::ProtocolVersion::RESP3);
-            info = info.set_redis_settings(settings);
-        }
-        let client = redis::Client::open(info)?;
+        let client = redis::Client::open(url)?;
         // Managers rather than bare connections: they reconnect after a
         // failover or a restart, where a multiplexed connection stays closed
         // and leaves a worker that is up, healthy to its orchestrator, and
@@ -207,6 +196,7 @@ impl RedisBroker {
             blocking,
             consumer: format!("tarsk-{}", std::process::id()),
             queues,
+            last_used_ms: AtomicU64::new(now_ms()),
             min_timeout_ms: AtomicU64::new(u64::MAX),
             grace_ms: AtomicU64::new(0),
             // Seeded from the clock, not zero: the member is `<pid>-<n>`, and
@@ -222,6 +212,27 @@ impl RedisBroker {
             prefetch: AtomicU64::new(1),
             prefetch_cap: AtomicU64::new(DEFAULT_PREFETCH_CAP),
         })
+    }
+
+    /// Find out that the connection has gone before something that matters is
+    /// sent on it.
+    ///
+    /// The manager reconnects when a command fails, which makes the command
+    /// that fails the price of finding out — and for a producer that had been
+    /// idle, that command was a job being sent. So after a second of quiet the
+    /// first thing sent is a PING instead: if the server hung up meanwhile it
+    /// is the PING that fails, the manager starts over, and the real command
+    /// waits for the new connection. Nothing is lost that was worth keeping.
+    ///
+    /// Only an idle connection is probed. A busy one learns the same thing
+    /// from its own traffic, and should not pay a round trip per call for it.
+    pub(super) async fn refresh(&self) {
+        let now = now_ms();
+        let idle = now.saturating_sub(self.last_used_ms.swap(now, Ordering::Relaxed));
+        if idle >= 1_000 {
+            let mut conn = self.conn.clone();
+            let _: Result<String, _> = redis::cmd("PING").query_async(&mut conn).await;
+        }
     }
 
     pub(super) async fn push(&self, job: NewJob, delay: Duration) -> Res<()> {

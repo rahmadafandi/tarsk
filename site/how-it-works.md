@@ -26,6 +26,12 @@ something read off your `App`.
 Recycle triggers: `--max-rss`, `--max-tasks`, `--max-lifetime`, whichever comes first. A child
 is drained, never killed outright: it finishes what it is holding.
 
+`--hard-max-rss` is the exception, and it is opt-in for that reason: a child that reaches it
+with work in flight is killed, and the work goes to the dead letters as `HardMemoryLimit` once
+its retries are spent. It is watched for as long as the child is alive — including while it is
+being drained after crossing `--max-rss`, which is exactly when a task that is still
+allocating is most likely to reach it.
+
 `--slots N` lets one child hold N tasks at once, and it costs precision in exactly the place
 this project claims it. At one slot the ceiling is read while the child has nothing running, so
 overshoot is bounded by a single task's peak. At 64 it is bounded by whatever 64 tasks are

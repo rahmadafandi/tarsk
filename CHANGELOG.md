@@ -16,6 +16,9 @@ Nothing in your tasks has to change. Four things are worth knowing before you ro
 - **Postgres changes its schema on the first 0.3 connection:** tables `tarsk_schema` and
   `tarsk_cron_runs`, three columns on `tarsk_dead`, one on `tarsk_buckets`, and the function
   `tarsk_acquire_slot`. It needs no downtime, and a 0.2 worker keeps running against it.
+- **Redis is spoken to in RESP3**, which needs Redis 6 or newer. Add `?protocol=2` to the
+  URL for an older server; the only thing it costs is that a producer then loses the one
+  call that discovers a dropped connection.
 - **On RabbitMQ, a message too large for 0.2 to have sent at all** — a chain, meta or
   traceback past about 64KB — is written in a form a 0.2 worker cannot read. Everything
   smaller is written as before.
@@ -81,6 +84,15 @@ Nothing in your tasks has to change. Four things are worth knowing before you ro
 - `tarsk jobs --state …` filtered after `--limit`, so it could print nothing while
   matching jobs existed.
 - ctrl-C on `tarsk worker` ended a clean drain with a `KeyboardInterrupt` traceback.
+- **`--hard-max-rss` is enforced on a child that `--max-rss` has already retired.** A task
+  that crossed the soft ceiling was left to finish, and a retiring child was no longer
+  measured — so one that kept growing went straight through the hard ceiling: 400 MB
+  under a 220 MB limit, measured. The supervisor also stopped watching for as long as a
+  replacement child took to start.
+- **Redis: a producer loses no call to a dropped connection** either, now that the
+  connection hears the server hang up.
+- A worker reads its schedules as soon as its first child has registered, rather than at
+  the next minute boundary.
 - **Postgres: a claim no longer reads the whole backlog.** It filtered on an `OR` and
   sorted the result, so each claim scanned every waiting job — 126ms a claim with 200,000
   queued, against 0.3ms now.
@@ -91,7 +103,7 @@ Nothing in your tasks has to change. Four things are worth knowing before you ro
   limits and cancellations were stamped by each client and compared by all of them, so
   hosts a few seconds apart disagreed about when anything was due.
 - **Postgres: a producer loses no call to a dropped connection.** It notices before it
-  sends. On Redis the call that finds the connection gone still fails once.
+  sends.
 - `cancel(ttl=float("inf"))` wrapped into the past on Redis and was forgotten at once. A
   cancellation now lasts at most ten years.
 - A queue name containing a quote or a newline corrupted the `/metrics` output.

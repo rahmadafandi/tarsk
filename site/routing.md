@@ -187,6 +187,10 @@ a month does not start by running last month's reports. A schedule seen for the 
 not owed anything: deploying a nightly job at noon does not run it at noon. If a late run is
 worse than none, give the task an `expires`.
 
+Catching up needs a record of the last run that outlives the worker, which Redis and Postgres
+keep and RabbitMQ has nowhere to put: on `amqp://` a schedule fires when a worker is up for it
+and is not caught up after a restart.
+
 `7` is Sunday as well as `0`. An expression that cannot be read is reported once on the
 worker's stderr, and that task then never fires — it is worth looking for the line after
 adding a schedule.

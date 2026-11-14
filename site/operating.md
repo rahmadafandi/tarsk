@@ -78,9 +78,11 @@ except BrokerError:
     outbox.keep(order.id)       # the broker is away; this is not a bug in the call
 ```
 
-On Postgres a producer notices a dropped connection before it sends and loses no call. On
-Redis the call that discovers the drop fails and the next one succeeds, because that driver
-reconnects on the error rather than ahead of it.
+On Redis and Postgres a producer notices a dropped connection before it sends on it, so the
+drop costs no call. On Redis that relies on RESP3, which is the default; with `?protocol=2` in
+the URL — for a server older than 6 — the call that discovers the drop fails and the next one
+succeeds. A command that was already in flight when the connection died fails either way, and
+is not retried for you: whether the server acted on it is not something a client can know.
 
 ## Seeing the backlog
 

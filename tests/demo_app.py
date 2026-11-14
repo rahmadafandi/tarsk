@@ -244,3 +244,38 @@ def balloons(megabytes, marker=""):
         time.sleep(0.1)
     time.sleep(1.5)
     return len(hoard)
+
+
+def _provided(line):
+    path = os.environ.get("TARSK_PROVIDER_LOG")
+    if path:
+        with open(path, "a", buffering=1) as fh:
+            fh.write(line + "\n")
+
+
+def a_session():
+    """Opens something per call and closes it after: everything past the
+    `yield` is what the handler would otherwise have had to remember."""
+    _provided("session-open")
+    yield "session"
+    _provided("session-closed")
+
+
+async def a_client():
+    _provided("client-open")
+    yield "client"
+    _provided("client-closed")
+
+
+@app.task(name="uses_a_session")
+def uses_a_session(fail, s=Depends(a_session, scope="task")):
+    _provided(f"handler-{s}")
+    if fail:
+        raise RuntimeError("after opening it")
+    return s
+
+
+@app.task(name="uses_a_client")
+async def uses_a_client(c=Depends(a_client)):
+    _provided(f"handler-{c}")
+    return c

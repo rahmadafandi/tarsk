@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 os.chdir(ROOT)
 
+from tarsk import App  # noqa: E402
 from tarsk._supervisor import Supervisor  # noqa: E402
 
 CEILING = 120 * 1024 * 1024  # 120MB
@@ -245,6 +246,47 @@ def test_hooks_bracket_every_worker():
         os.environ.pop("TARSK_HOOK_LOG", None)
 
 
+def test_a_provider_cleans_up_after_its_yield():
+    """A provider that yields is resumed when its value is done with.
+
+    Per call for `scope="task"` — including a call that raised — and once, as
+    the worker drains, for the default `scope="worker"`.
+    """
+    import tempfile
+
+    log = Path(tempfile.mktemp(suffix=".providers"))
+    os.environ["TARSK_PROVIDER_LOG"] = str(log)
+    try:
+        sup = Supervisor("tests.demo_app:app", children=1)
+        out = sup.run([("uses_a_session", (False,), {}), ("uses_a_session", (True,), {}),
+                       ("uses_a_client", (), {}), ("uses_a_client", (), {})])
+        assert out[0] == ("ack", "session") and out[2] == ("ack", "client"), out
+        assert out[1][0] == "nack", out[1]
+        lines = log.read_text().split()
+        # Opened and closed around each call, the failed one included.
+        assert lines[:6] == ["session-open", "handler-session", "session-closed"] * 2, lines
+        # Opened once for the process, used twice, and closed at the end.
+        assert lines[6:] == ["client-open", "handler-client", "handler-client",
+                             "client-closed"], lines
+    finally:
+        log.unlink(missing_ok=True)
+        os.environ.pop("TARSK_PROVIDER_LOG", None)
+
+
+def test_backoff_is_checked_where_it_is_written():
+    app = App()
+    for bad in ({"backoff": "linear"}, {"backoff_base": 0}, {"backoff_base": 5, "backoff_max": 1}):
+        try:
+            app.task(name=f"bad-{len(app.registry)}", **bad)(lambda: None)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"{bad} was accepted")
+    spec = app.task(name="ok", backoff_base=0.05, backoff_max=2)(lambda: None).spec
+    assert (spec.backoff_base_ms, spec.backoff_max_ms) == (50, 2000), spec
+    assert spec.as_row()[12:14] == [50, 2000], spec.as_row()
+
+
 def test_before_send_can_attach_to_the_payload():
     """The producer-side hook, which the README claimed before it existed."""
     from unittest.mock import Mock
@@ -416,6 +458,8 @@ if __name__ == "__main__":
                   test_baseline_above_ceiling_is_refused,
                   test_hard_ceiling_kills_and_dead_letters,
                   test_hard_ceiling_holds_past_the_soft_one,
+                  test_a_provider_cleans_up_after_its_yield,
+                  test_backoff_is_checked_where_it_is_written,
                   test_hard_ceiling_must_exceed_the_soft_one,
                   test_hooks_bracket_every_worker,
                   test_middleware_wraps_and_dependencies_inject,

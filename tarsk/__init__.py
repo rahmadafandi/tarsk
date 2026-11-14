@@ -105,6 +105,12 @@ class TaskSpec:
     # registry's identity and a child running a different soft timeout is a
     # child running different code.
     soft_timeout_ms: int = 0
+    # The first wait between attempts and the longest, in milliseconds. One
+    # second doubling to sixty-four is what `backoff="exp"` always meant; a
+    # task calling something that takes minutes to recover wants more, and one
+    # retrying a lock wants much less.
+    backoff_base_ms: int = 1_000
+    backoff_max_ms: int = 64_000
 
     def as_row(self) -> list:
         """Positional form that crosses the wire (spec §4.2)."""
@@ -121,6 +127,8 @@ class TaskSpec:
             self.expires_ms,
             self.max_concurrency,
             self.soft_timeout_ms,
+            self.backoff_base_ms,
+            self.backoff_max_ms,
         ]
 
 
@@ -389,6 +397,7 @@ class App:
         self.stop_hooks: list = []
         self.middlewares: list = []
         self._provided: dict = {}
+        self._finishers: list = []
         self._resolving = asyncio.Lock()
         self._overrides: dict = {}
         self._producer = None
@@ -410,6 +419,8 @@ class App:
         max_concurrency: int = 0,
         unique: float = 0.0,
         soft_timeout: float = 0.0,
+        backoff_base: float = 1.0,
+        backoff_max: float = 64.0,
     ) -> Callable[[Callable[P, R]], Task[P, R]]:
         def decorate(fn: Callable[P, R]) -> Task[P, R]:
             t = self.default_timeout if timeout is None else timeout
@@ -462,11 +473,20 @@ class App:
                     f"handler runs in a thread that cannot be interrupted, so nothing "
                     f"can ask it to stop early."
                 )
+            if backoff not in ("exp", "fixed", "none"):
+                raise ValueError(
+                    f"{fn.__qualname__}: backoff must be 'exp', 'fixed' or 'none', "
+                    f"got {backoff!r}")
+            if backoff_base <= 0 or backoff_max < backoff_base:
+                raise ValueError(
+                    f"{fn.__qualname__}: backoff_base must be positive and no larger "
+                    f"than backoff_max, got {backoff_base}s and {backoff_max}s")
             spec = TaskSpec(
                 task_name, int(t * 1000), retries, backoff, queue,
                 int(result_ttl * 1000), cron, per_sec, burst, int(expires * 1000),
                 max(0, max_concurrency), int(max(0.0, unique) * 1000),
                 int(soft_timeout * 1000),
+                int(backoff_base * 1000), int(backoff_max * 1000),
             )
             task = Task(fn, spec, self)
             self.registry[task_name] = task
@@ -528,11 +548,19 @@ class App:
         """Swap what a `Depends` provider returns. For tests."""
         self._overrides[provider] = replacement
 
-    async def resolve(self, dep: Depends):
+    async def resolve(self, dep: Depends, finishers: list | None = None):
+        """What `dep` stands for.
+
+        A provider may `yield` its value instead of returning it. What follows
+        the `yield` then runs when the value is done with: after the call, for
+        `scope="task"`, and as the worker drains, for `scope="worker"` — a
+        connection is closed by the function that opened it, without the
+        handler having to remember. `finishers` is where a task-scoped one is
+        left for the caller to run.
+        """
         provider = self._overrides.get(dep.provider, dep.provider)
         if dep.scope != "worker":
-            value = provider()
-            return await value if inspect.isawaitable(value) else value
+            return await _provide(provider, finishers)
         if provider in self._provided:
             return self._provided[provider]
         # Once per process means once, and with more than one slot the first
@@ -540,11 +568,13 @@ class App:
         # provider: unlocked, a hundred slots opened a hundred pools.
         async with self._resolving:
             if provider not in self._provided:
-                value = provider()
-                if inspect.isawaitable(value):
-                    value = await value
-                self._provided[provider] = value
+                self._provided[provider] = await _provide(provider, self._finishers)
             return self._provided[provider]
+
+    async def finish(self) -> None:
+        """Run what follows the `yield` in every worker-scoped provider, last
+        opened first. Called once, as the worker drains."""
+        await _finish(self._finishers)
 
     def producer(self):
         """Connection to the broker for enqueueing.
@@ -604,6 +634,36 @@ class App:
         """
         digest = hashlib.blake2b(repr(self.registry_rows()).encode(), digest_size=8)
         return int.from_bytes(digest.digest(), "big")
+
+
+async def _provide(provider, finishers: list | None):
+    """Call a provider, and if it yields rather than returns, keep the rest."""
+    value = provider()
+    if inspect.isgenerator(value):
+        held, value = value, next(value)
+    elif inspect.isasyncgen(value):
+        held, value = value, await anext(value)
+    else:
+        return await value if inspect.isawaitable(value) else value
+    if finishers is not None:
+        finishers.append(held)
+    return value
+
+
+async def _finish(finishers: list) -> None:
+    """Resume each provider past its `yield`. One that fails does not stop the
+    others from closing what they opened."""
+    while finishers:
+        held = finishers.pop()
+        try:
+            if inspect.isasyncgen(held):
+                await anext(held, None)
+            else:
+                next(held, None)
+        except Exception:  # noqa: BLE001 — cleanup must not mask the task's own result
+            import traceback
+
+            traceback.print_exc()
 
 
 _RATE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*/\s*(\d*)\s*([smh])\s*$")

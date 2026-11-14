@@ -15,7 +15,7 @@ import signal
 import sys
 import traceback
 
-from . import Context, Reject, Retry, SoftTimeout, Task, load_app
+from . import Context, Reject, Retry, SoftTimeout, Task, _finish, load_app
 from . import _proto
 
 # Distinct exit code so the supervisor can tell "recycled after a sync timeout"
@@ -57,15 +57,22 @@ async def _call(app, task: Task, ctx: Context, args: list, kwargs: dict):
 
     async def invoke():
         filled = dict(kwargs)
-        for name, dep in task.depends.items():
-            if name in filled:
-                continue
-            # Depends(Context) hands the handler its own call, rather than
-            # making it reach for a global to find out what it is running.
-            filled[name] = ctx if dep.provider is Context else await app.resolve(dep)
-        if task.is_async:
-            return await task.fn(*args, **filled)
-        return await asyncio.to_thread(task.fn, *args, **filled)
+        finishers: list = []
+        try:
+            for name, dep in task.depends.items():
+                if name in filled:
+                    continue
+                # Depends(Context) hands the handler its own call, rather than
+                # making it reach for a global to find out what it is running.
+                filled[name] = (ctx if dep.provider is Context
+                                else await app.resolve(dep, finishers))
+            if task.is_async:
+                return await task.fn(*args, **filled)
+            return await asyncio.to_thread(task.fn, *args, **filled)
+        finally:
+            # Whatever a task-scoped provider left after its `yield`, whether
+            # the handler returned, raised or was cancelled.
+            await _finish(finishers)
 
     chain = invoke
     for middleware in reversed(app.middlewares):
@@ -217,6 +224,8 @@ async def _shutdown(app) -> None:
         await _run_hooks(app.stop_hooks)
     except Exception:
         traceback.print_exc()
+    # After the stop hooks: a hook may still want the pool a provider opened.
+    await app.finish()
 
 
 # Progress frames in flight from async handlers. The loop keeps only a weak

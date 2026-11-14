@@ -763,6 +763,9 @@ struct Spec {
     expires_ms: u64,
     /// How many of this task may be in progress at once. Zero is unlimited.
     max_concurrency: u32,
+    /// The first wait between attempts and the longest, in milliseconds.
+    backoff_base_ms: u64,
+    backoff_max_ms: u64,
 }
 
 /// Wait before the next attempt. Exponential from one second, capped so a
@@ -772,11 +775,18 @@ struct Spec {
 /// dependency that came back after a blip would otherwise be hit by every
 /// retry it caused, at the same instant, in step — the outage's own echo.
 fn backoff_for(spec: Option<&Spec>, attempt: u32, seed: &str) -> Duration {
-    let base = Duration::from_secs(1);
+    // A registry from before these were configurable sends neither, and gets
+    // what it always had: one second, doubling to sixty-four.
+    let base = Duration::from_millis(spec.map(|s| s.backoff_base_ms).unwrap_or(1_000));
+    let longest = Duration::from_millis(spec.map(|s| s.backoff_max_ms).unwrap_or(64_000));
     let full = match spec.map(|s| s.backoff.as_str()) {
         Some("none") => return Duration::ZERO,
         Some("fixed") => base,
-        _ => base * 2u32.pow(attempt.saturating_sub(1).min(6)),
+        // Saturating: a base of minutes and twenty attempts must stop at
+        // `longest`, not wrap round to nothing.
+        _ => base
+            .saturating_mul(2u32.saturating_pow(attempt.saturating_sub(1).min(31)))
+            .min(longest.max(base)),
     };
     // FNV-1a over the id: no rand crate, and deterministic per job, which is
     // all that spreading requires.
@@ -935,6 +945,15 @@ async fn accept_loop(listener: transport::Listener, shared: Arc<Shared>) {
                             expires_ms: fields.get(9).and_then(|v| v.as_u64()).unwrap_or(0),
                             max_concurrency: fields.get(10).and_then(|v| v.as_u64()).unwrap_or(0)
                                 as u32,
+                            // Index 11 is the soft timeout, which only the child reads.
+                            backoff_base_ms: fields
+                                .get(12)
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(1_000),
+                            backoff_max_ms: fields
+                                .get(13)
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(64_000),
                         },
                     )),
                     _ => None,
@@ -2580,7 +2599,38 @@ mod settle_tests {
             rate_burst: 0,
             expires_ms: 0,
             max_concurrency: 0,
+            backoff_base_ms: 1_000,
+            backoff_max_ms: 64_000,
         }
+    }
+
+    #[test]
+    fn backoff_starts_at_its_base_and_stops_at_its_ceiling() {
+        // Jittered into the top half of the window, so each is a range.
+        let within = |spec: &Spec, attempt: u32, full_ms: u64| {
+            let wait = backoff_for(Some(spec), attempt, "job").as_millis() as u64;
+            assert!(
+                (full_ms / 2..=full_ms).contains(&wait),
+                "attempt {attempt}: {wait}ms, wanted {}..={full_ms}",
+                full_ms / 2
+            );
+        };
+        let mut spec = retried_once("default");
+        spec.backoff = "exp".into();
+        // What it always was.
+        within(&spec, 1, 1_000);
+        within(&spec, 4, 8_000);
+        within(&spec, 30, 64_000);
+        // A lock worth retrying in milliseconds, capped at a second.
+        spec.backoff_base_ms = 50;
+        spec.backoff_max_ms = 1_000;
+        within(&spec, 1, 50);
+        within(&spec, 3, 200);
+        within(&spec, 12, 1_000);
+        within(&spec, 4_000_000_000, 1_000);
+        // Fixed waits the base every time.
+        spec.backoff = "fixed".into();
+        within(&spec, 9, 50);
     }
 
     /// `n` jobs pushed, claimed and named for the order they were pushed in.

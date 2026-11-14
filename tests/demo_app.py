@@ -226,3 +226,18 @@ async def a_slow_pool():
 async def shares_pool(pool=Depends(a_slow_pool)):
     await asyncio.sleep(0.1)
     return pool
+
+
+@app.task(name="balloons", timeout=5)
+def balloons(megabytes, marker=""):
+    """Grows a step at a time rather than all at once, so it is over the soft
+    ceiling for a while before it reaches the hard one — which is how memory
+    actually runs away, and the case a single allocation never exercises."""
+    hoard = []
+    for held in range(10, megabytes + 1, 10):
+        hoard.append(bytearray(10 * 1024 * 1024))
+        if marker:
+            Path(marker).write_text(str(held))
+        time.sleep(0.1)
+    time.sleep(1.5)
+    return len(hoard)

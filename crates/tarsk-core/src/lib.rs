@@ -1343,6 +1343,11 @@ async fn serve_inner(
     // How many tasks this child may hold at once, as of the last RSS reading.
     // Unbounded without a ceiling, which is every run that never asked for one.
     let mut allowed: usize = usize::MAX;
+    // A limit has fired and this child is on its way out, but its replacement
+    // is still starting. It is handed nothing more, and the loop keeps turning
+    // rather than waiting on the spawn: a child that is not being watched can
+    // run straight through the hard ceiling, and the wait was seconds long.
+    let mut retiring: Option<&'static str> = None;
 
     // Read the pressure, start the replacement if the trigger is close, and
     // report the trigger if it has already fired.
@@ -1597,13 +1602,16 @@ async fn serve_inner(
                         // slots it is capped at the peak of whatever is still in
                         // flight, which is the price of the concurrency and the
                         // reason slots defaults to one.
-                        if let Some(reason) = check!().trigger {
+                        if let Some(reason) = check!().trigger.or(retiring) {
                             if spare.is_none() && arming {
                                 // A replacement is already starting. Waiting out
                                 // the rest of its startup beats launching a second
                                 // one from scratch — which costs a full spawn *and*
                                 // makes both slower by competing for the machine.
-                                spare = spare_rx.recv().await.flatten();
+                                // The timer below does the waiting; see `retiring`.
+                                retiring = Some(reason);
+                                free += 1;
+                                continue;
                             }
                             return Served { exit: Exit::Recycle(reason), spare };
                         }
@@ -1691,7 +1699,7 @@ async fn serve_inner(
                     }
                 }
                 let reading = check!();
-                if free > 0 && !inflight.is_empty() {
+                if free > 0 && !inflight.is_empty() && retiring.is_none() {
                     if let Fill::Dead = fill!() {
                         return Served { exit: Exit::Died, spare };
                     }
@@ -1699,39 +1707,85 @@ async fn serve_inner(
                 // The hard ceiling is the one that does not wait for a good
                 // moment. Draining an idle child gets there just as well and
                 // costs nothing, so only work in flight is worth killing over.
-                if cfg.hard_max_rss > 0 && reading.rss.is_some_and(|b| b >= cfg.hard_max_rss) {
-                    if !inflight.is_empty() {
-                        // No waiting for a replacement that is still starting:
-                        // the child being killed is growing while it does, and
-                        // this is the limit that exists to protect the box. A
-                        // spare that arrives later finds nobody listening and
-                        // is dropped, which kills it.
-                        return Served { exit: Exit::OverHardLimit, spare };
-                    }
-                    if spare.is_none() && arming {
-                        spare = spare_rx.recv().await.flatten();
-                    }
-                    return Served { exit: Exit::Recycle("hard_max_rss"), spare };
+                let over_hard = cfg.hard_max_rss > 0
+                    && reading.rss.is_some_and(|b| b >= cfg.hard_max_rss);
+                if over_hard && !inflight.is_empty() {
+                    // No waiting for a replacement that is still starting: the
+                    // child being killed is growing while it does, and this is
+                    // the limit that exists to protect the box. A spare that
+                    // arrives later finds nobody listening and is dropped,
+                    // which kills it.
+                    return Served { exit: Exit::OverHardLimit, spare };
                 }
-                if let Some(reason) = reading.trigger {
+                // Idle and over the hard limit needs no killing, only retiring.
+                let due = if over_hard { Some("hard_max_rss") } else { reading.trigger };
+                if let Some(reason) = due.or(retiring) {
                     if spare.is_none() && arming {
-                        spare = spare_rx.recv().await.flatten();
+                        retiring = Some(reason); // looked at again next tick
+                    } else {
+                        return Served { exit: Exit::Recycle(reason), spare };
                     }
-                    return Served { exit: Exit::Recycle(reason), spare };
                 }
             }
         }
     }
 }
 
+/// End a child that has reached the hard ceiling with work in flight, and
+/// send that work down the failure path under its own name.
+///
+/// With more than one slot the kill takes every task the child held, not only
+/// the one that grew — they were sharing a process, which is what a slot count
+/// buys and costs.
+async fn kill_at_hard_limit(shared: &Arc<Shared>, mut child: ChildHandle, cfg: &Cfg) {
+    // Taken before reaping, so the crash path does not also claim them: this
+    // failure has a name worth putting in the dead letters.
+    let killed = std::mem::take(&mut child.inflight);
+    shared.counters.hard_killed.fetch_add(1, Ordering::Relaxed);
+    *shared
+        .reasons
+        .lock()
+        .unwrap()
+        .entry("hard_max_rss")
+        .or_insert(0) += 1;
+    stop_now(&mut child);
+    reap(shared, child, cfg).await;
+    for (_, job) in killed {
+        let message = format!(
+            "{} was killed at the hard memory ceiling of {} MB",
+            job.name,
+            cfg.hard_max_rss / (1024 * 1024)
+        );
+        shared
+            .fail_job(job, Outcome::nack("HardMemoryLimit", message))
+            .await;
+    }
+}
+
 /// Drain, never kill outright (spec §4.4): stop dispatching, let in-flight
 /// work finish under a deadline, then escalate.
+///
+/// The one exception is the hard ceiling, which is still watched here. A child
+/// is drained because it crossed the *soft* ceiling with a task running, and
+/// that task goes on allocating: this is exactly the child most likely to
+/// reach the hard one. It used to be the child nobody was measuring any more.
 async fn drain(shared: &Arc<Shared>, mut child: ChildHandle, cfg: &Cfg) {
     let _ = write_frame(&mut child.writer, &Value::Array(vec![Value::from("Drain")])).await;
 
     let deadline = tokio::time::Instant::now() + cfg.drain_timeout;
+    let mut sys = System::new();
+    let mut ticker = tokio::time::interval(cfg.poll);
     loop {
         tokio::select! {
+            _ = ticker.tick(), if cfg.hard_max_rss > 0 && !child.inflight.is_empty() => {
+                if let Some(bytes) = transport::child_rss_with(&mut sys, child.pid) {
+                    shared.metrics.set_child_rss(child.pid, bytes);
+                    shared.counters.child_rss_peak.fetch_max(bytes, Ordering::Relaxed);
+                    if bytes >= cfg.hard_max_rss {
+                        return kill_at_hard_limit(shared, child, cfg).await;
+                    }
+                }
+            }
             frame = child.frames.recv() => {
                 let Some(body) = frame else { break };
                 let Some(items) = decode(&body) else { break };
@@ -1815,31 +1869,7 @@ async fn slot(shared: Arc<Shared>, cfg: Arc<Cfg>) {
                 return;
             }
             Exit::OverHardLimit => {
-                // Take the jobs before reaping, so the crash path does not also
-                // claim them: this failure has a name worth putting in the DLQ.
-                // With more than one slot the kill takes every task the child
-                // held, not only the one that grew — they were sharing a
-                // process, which is what a slot count buys and costs.
-                let killed = std::mem::take(&mut current.inflight);
-                shared.counters.hard_killed.fetch_add(1, Ordering::Relaxed);
-                *shared
-                    .reasons
-                    .lock()
-                    .unwrap()
-                    .entry("hard_max_rss")
-                    .or_insert(0) += 1;
-                stop_now(&mut current);
-                reap(&shared, current, &cfg).await;
-                for (_, job) in killed {
-                    let message = format!(
-                        "{} was killed at the hard memory ceiling of {} MB",
-                        job.name,
-                        cfg.hard_max_rss / (1024 * 1024)
-                    );
-                    shared
-                        .fail_job(job, Outcome::nack("HardMemoryLimit", message))
-                        .await;
-                }
+                kill_at_hard_limit(&shared, current, &cfg).await;
                 if shared.done.load(Ordering::SeqCst) {
                     if let Some(unused) = spare {
                         drain(&shared, unused, &cfg).await;

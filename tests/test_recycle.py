@@ -150,6 +150,36 @@ def test_hard_ceiling_kills_and_dead_letters():
     assert sup.stats["tasks_dead_lettered"] == 1, sup.stats
 
 
+def test_hard_ceiling_holds_past_the_soft_one():
+    """Both ceilings set, and a task that grows through one on its way to the other.
+
+    This is how memory actually runs away, and the hard ceiling did nothing
+    about it: crossing the soft one retired the child, a retiring child was no
+    longer measured, and the task went on to 400 MB under a 220 MB limit. The
+    test above never saw it — one allocation jumps both ceilings between two
+    readings.
+    """
+    import tempfile
+
+    marker = Path(tempfile.gettempdir()) / "tarsk-balloon-marker"
+    marker.unlink(missing_ok=True)
+    MB = 1024 * 1024
+    sup = Supervisor("tests.demo_app:app", children=1,
+                     max_rss=120 * MB, hard_max_rss=220 * MB)
+    try:
+        results = sup.run([("balloons", (400, str(marker)), {})])
+        kind, (error_type, message) = results[0]
+        assert (kind, error_type) == ("nack", "HardMemoryLimit"), results[0]
+        assert sup.stats["children_hard_killed"] == 1, sup.stats
+        # Ten megabytes every tenth of a second: stopped near the limit, not
+        # at the end of the run.
+        held = int(marker.read_text())
+        assert held <= 260, f"it was holding {held} MB when it was stopped"
+        assert sup.stats["child_rss_peak"] < 320 * MB, sup.stats["child_rss_peak"] // MB
+    finally:
+        marker.unlink(missing_ok=True)
+
+
 def test_hard_ceiling_must_exceed_the_soft_one():
     try:
         Supervisor("tests.demo_app:app", max_rss=200, hard_max_rss=100)
@@ -357,6 +387,7 @@ if __name__ == "__main__":
                   test_a_recycled_child_loses_no_acks,
                   test_baseline_above_ceiling_is_refused,
                   test_hard_ceiling_kills_and_dead_letters,
+                  test_hard_ceiling_holds_past_the_soft_one,
                   test_hard_ceiling_must_exceed_the_soft_one,
                   test_hooks_bracket_every_worker,
                   test_middleware_wraps_and_dependencies_inject,

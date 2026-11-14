@@ -24,9 +24,9 @@ P = ParamSpec("P")
 R = TypeVar("R")
 
 __all__ = [
-    "App", "AsyncResult", "BrokerError", "Chain", "Context", "Depends", "Group", "Signature",
-    "Task", "TaskFailed", "TaskSpec", "Reject", "Retry", "SoftTimeout",
-    "chain", "group", "load_app",
+    "App", "AsyncResult", "BrokerError", "Chain", "Chord", "Context", "Depends", "Group",
+    "Signature", "Task", "TaskFailed", "TaskSpec", "Reject", "Retry", "SoftTimeout",
+    "chain", "chord", "group", "load_app",
 ]
 
 # The four PyPI distributions — tarsk, tarsk-redis, tarsk-postgres, tarsk-amqp
@@ -628,10 +628,12 @@ class App:
         dedup key, whose whole point is to be decided one by one. RabbitMQ has
         no way to take a batch as a unit, so there each is confirmed in turn.
         """
-        records = [
+        return self._send_records([
             Enqueue(step.task, task_id=step.task_id)._record(step.args, step.kwargs)
             for step in signatures
-        ]
+        ])
+
+    def _send_records(self, records: list[tuple]) -> list[str]:
         if not records:
             return []
         producer = self.producer()
@@ -858,6 +860,69 @@ class Group:
 
     def results(self, app: "App") -> list["AsyncResult"]:
         return [app.result(i) for i in self.result_ids]
+
+
+class Chord:
+    """Steps that run side by side, and one that runs when they have all finished.
+
+    The callback is handed a list of what the members returned, in the order
+    they were given — whichever order they finished in — ahead of its own
+    arguments. Use `callback.si(...)` for one that does not want it.
+
+    If a member fails for good, the callback never runs: there is no list to
+    hand it. The failed member is in the dead letters like any other, and
+    replaying it there completes the chord.
+    """
+
+    __slots__ = ("steps", "callback")
+
+    def __init__(self, steps: list[Signature], callback: Signature):
+        if not steps:
+            raise ValueError("a chord needs at least one step before its callback")
+        self.steps = steps
+        self.callback = callback
+
+    @property
+    def result_id(self) -> str:
+        """The id the callback's result will be filed under."""
+        return self.callback.task_id
+
+    def _records(self) -> list[tuple]:
+        """One record a member, each carrying where it sits and what follows."""
+        from . import _proto
+
+        marker = secrets.token_hex(8)
+        row = self.callback._row()
+        return [
+            Enqueue(
+                step.task, task_id=step.task_id,
+                chain=_proto.pack_chain([["__chord__", marker, at, len(self.steps), row]]),
+            )._record(step.args, step.kwargs)
+            for at, step in enumerate(self.steps)
+        ]
+
+    def send(self) -> str:
+        app = self.callback.task.app
+        if (app.broker or "").startswith(("amqp://", "amqps://")):
+            # Refused here rather than discovered by a worker, after the
+            # members have run and there is nobody to tell.
+            raise ValueError(
+                "a chord needs a store every worker can count finished members in, "
+                "which RabbitMQ does not have — use the Redis or Postgres broker")
+        app._send_records(self._records())
+        return self.result_id
+
+    async def send_async(self) -> str:
+        return await asyncio.to_thread(self.send)
+
+
+def chord(header, callback: Signature) -> Chord:
+    """`chord(group(resize.si(f) for f in files), notify.s("done")).send()`
+
+    `header` is a group, or any iterable of signatures.
+    """
+    steps = header.steps if isinstance(header, Group) else list(header)
+    return Chord(steps, callback)
 
 
 def group(*steps: Signature) -> Group:

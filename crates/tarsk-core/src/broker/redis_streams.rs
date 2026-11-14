@@ -336,6 +336,44 @@ impl RedisBroker {
         Ok(())
     }
 
+    pub(super) async fn chord_done(
+        &self,
+        chord: &str,
+        index: u64,
+        total: u64,
+        result: &[u8],
+    ) -> Res<Option<Vec<Vec<u8>>>> {
+        // One hash a chord: a field per member, named by its position, and
+        // `fired` for the member that completed it. One script, because
+        // "record, count, decide" as three commands lets two members both
+        // decide they were the last.
+        let script = redis::Script::new(
+            r"local index, total = ARGV[1], tonumber(ARGV[2])
+              redis.call('HSETNX', KEYS[1], index, ARGV[3])
+              redis.call('PEXPIRE', KEYS[1], 86400000)
+              local fired = redis.call('HGET', KEYS[1], 'fired')
+              local members = redis.call('HLEN', KEYS[1])
+              if fired then members = members - 1 end
+              if members < total then return false end
+              if fired and fired ~= index then return false end
+              redis.call('HSET', KEYS[1], 'fired', index)
+              local out = {}
+              for at = 0, total - 1 do
+                out[#out + 1] = redis.call('HGET', KEYS[1], tostring(at)) or ''
+              end
+              return out",
+        );
+        let mut conn = self.conn.clone();
+        let whole: Option<Vec<Vec<u8>>> = script
+            .key(format!("tarsk:chord:{chord}"))
+            .arg(index)
+            .arg(total)
+            .arg(result)
+            .invoke_async(&mut conn)
+            .await?;
+        Ok(whole)
+    }
+
     pub(super) async fn claim_run(&self, name: &str, due: i64, now: i64) -> Res<bool> {
         // Read, compare and write in one step, or two workers both see the
         // old value and both fire. One key a schedule, holding the last minute

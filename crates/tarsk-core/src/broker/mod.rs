@@ -860,6 +860,39 @@ impl Broker {
         }
     }
 
+    /// Record that member `index` of a chord has finished with `result`, and
+    /// if that completes it, hand back every member's result in order.
+    ///
+    /// `Some` is returned to exactly one member: the one whose arrival made
+    /// the set whole. It is returned to that member again if it is delivered
+    /// again, because a callback that could not be queued the first time has
+    /// to be queued the second — and to no other, so the callback is queued
+    /// once however the members race.
+    ///
+    /// What is recorded expires after a day. Refused on AMQP: counting
+    /// members needs somewhere every worker can write.
+    pub async fn chord_done(
+        &self,
+        chord: &str,
+        index: u64,
+        total: u64,
+        result: &[u8],
+    ) -> Res<Option<Vec<Vec<u8>>>> {
+        match self {
+            Broker::Memory(b) => Ok(b.local.chord_done(chord, index, total, result)),
+            #[cfg(feature = "redis")]
+            Broker::Redis(b) => b.chord_done(chord, index, total, result).await,
+            #[cfg(feature = "postgres")]
+            Broker::Postgres(b) => b.chord_done(chord, index, total, result).await,
+            #[cfg(feature = "amqp")]
+            Broker::Amqp(_) => Err(
+                "a chord needs somewhere every worker can record a finished member, \
+                 and AMQP has no shared store — use the Redis or Postgres broker"
+                    .into(),
+            ),
+        }
+    }
+
     /// Reserve `key` for `job_id` for `ttl_ms`, or report who holds it.
     ///
     /// `None` means this caller won and should send. `Some(id)` means an
@@ -1029,6 +1062,27 @@ mod tests {
         broker.retry(&seen.receipt, wait).await.unwrap();
         let after = broker.claim(wait, wait).await.unwrap().unwrap();
         assert_eq!(after.attempt, 2);
+    }
+
+    #[tokio::test]
+    async fn a_chord_completes_once_in_member_order() {
+        let broker = Broker::connect("memory://", Vec::new()).await.unwrap();
+        // Members finish out of order; nothing is handed back until all have.
+        assert_eq!(broker.chord_done("c", 2, 3, b"two").await.unwrap(), None);
+        assert_eq!(broker.chord_done("c", 0, 3, b"zero").await.unwrap(), None);
+        // A member delivered twice is one member.
+        assert_eq!(broker.chord_done("c", 0, 3, b"again").await.unwrap(), None);
+        let whole = broker.chord_done("c", 1, 3, b"one").await.unwrap();
+        let expected: Vec<Vec<u8>> = vec![b"zero".to_vec(), b"one".to_vec(), b"two".to_vec()];
+        assert_eq!(whole.as_ref(), Some(&expected));
+        // The one that completed it hears so again if it is redelivered —
+        // its callback may not have been queued the first time — and the
+        // others never do.
+        assert_eq!(
+            broker.chord_done("c", 1, 3, b"one").await.unwrap(),
+            Some(expected)
+        );
+        assert_eq!(broker.chord_done("c", 2, 3, b"two").await.unwrap(), None);
     }
 
     #[tokio::test]

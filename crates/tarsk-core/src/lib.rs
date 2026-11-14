@@ -523,6 +523,9 @@ impl Shared {
             return true;
         };
         let Value::Array(f) = next else { return true };
+        if f.first().and_then(|v| v.as_str()) == Some("__chord__") {
+            return self.join_chord(outcome, f).await;
+        }
         if f.len() < 6 {
             return true;
         }
@@ -563,6 +566,72 @@ impl Shared {
         }
         if let Err(err) = self.broker.push(next_job, Duration::ZERO).await {
             self.broker_error("queueing the next chain step", err.as_ref());
+            return false;
+        }
+        self.counters.chained.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    /// This job was one member of a chord: record that it finished, and if it
+    /// was the last, queue the callback with every member's result.
+    ///
+    /// The member carries `["__chord__", id, position, how many, callback]`
+    /// where a chain step would be, so a chord needs no field of its own on
+    /// any broker. As with a chain, false means "do not ack": the callback
+    /// could not be queued, or the broker could not be asked, and the member
+    /// has to come back and try again.
+    async fn join_chord(&self, outcome: &Outcome, f: &[Value]) -> bool {
+        let (Some(chord), Some(index), Some(total), Some(Value::Array(row))) = (
+            f.get(1).and_then(|v| v.as_str()),
+            f.get(2).and_then(|v| v.as_u64()),
+            f.get(3).and_then(|v| v.as_u64()),
+            f.get(4),
+        ) else {
+            return true; // not something redelivery would make readable
+        };
+        if row.len() < 6 {
+            return true;
+        }
+        let whole = match self
+            .broker
+            .chord_done(chord, index, total, &outcome.result)
+            .await
+        {
+            Ok(Some(whole)) => whole,
+            Ok(None) => return true,
+            Err(err) => {
+                self.broker_error("recording a chord member", err.as_ref());
+                return false;
+            }
+        };
+        // The callback is handed a list: what each member returned, in the
+        // order the members were given, whatever order they finished in.
+        let results: Vec<Value> = whole
+            .iter()
+            .map(|blob| rmpv::decode::read_value(&mut blob.as_slice()).unwrap_or(Value::Nil))
+            .collect();
+        let mut fed = Vec::new();
+        let _ = rmpv::encode::write_value(&mut fed, &Value::Array(results));
+        let payload = row[2].as_slice().unwrap_or_default().to_vec();
+        let callback = NewJob {
+            id: row[0].as_str().unwrap_or_default().to_string(),
+            queue: row[4].as_str().unwrap_or("default").to_string(),
+            name: row[1].as_str().unwrap_or_default().to_string(),
+            payload: if row[5].as_bool().unwrap_or(true) {
+                prepend_result(&payload, &fed)
+            } else {
+                payload
+            },
+            timeout_ms: row[3].as_u64().unwrap_or(0) as u32,
+            chain: Vec::new(),
+            meta: Vec::new(),
+            expires_ms: 0,
+        };
+        if self.batch() {
+            self.total.fetch_add(1, Ordering::SeqCst);
+        }
+        if let Err(err) = self.broker.push(callback, Duration::ZERO).await {
+            self.broker_error("queueing a chord's callback", err.as_ref());
             return false;
         }
         self.counters.chained.fetch_add(1, Ordering::Relaxed);

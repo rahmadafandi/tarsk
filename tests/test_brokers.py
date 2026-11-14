@@ -1738,6 +1738,29 @@ def _b45_a_running_job_can_be_stopped(url, label, skip, app, env, log, producer)
         f"{label}: a cancelled job was left in the dead letters for a replay to revive"
 
 
+def _b46_a_chord_joins(url, label, skip, app, env, log, producer):
+    if "cancel" in skip:
+        print(f"  {label}: skip chord — this broker has no store to count finished members in")
+        return
+    # --- twelve members across two workers, and one callback after them ---
+    from tarsk import chord, group
+
+    log.write_text("")
+    double, adds_up = app.registry["double"], app.registry["adds_up"]
+    work = chord(group(double.si(n) for n in range(12)), adds_up.s(extra=1))
+    answer = work.send()
+    pair = [start_worker(env, TARSK_SLOTS=4, TARSK_LEASE_GRACE=1) for _ in range(2)]
+    try:
+        # 2 * (0 + 1 + … + 11) + 1, which also says the list arrived whole.
+        assert app.result(answer).get(timeout=60) == 133, f"{label}: the callback's answer"
+        time.sleep(1.5)  # room for a second callback, if two members both fired it
+    finally:
+        for worker in pair:
+            stop_worker(worker)
+    fired = [t for t in tags_in(log) if t.startswith("adds_up-")]
+    assert fired == ["adds_up-12"], f"{label}: the callback ran {len(fired)} times: {fired}"
+
+
 def _b38_redis_only(url, label, skip, app, env, log, producer):
     if not scheme_is(url, ("redis://", "rediss://")):
         return
@@ -1952,6 +1975,7 @@ def check_broker(url: str, label: str, skip: frozenset = frozenset()) -> None:
         _b43_a_batch_arrives_whole(url, label, skip, app, env, log, producer)
         _b44_a_paused_queue_waits(url, label, skip, app, env, log, producer)
         _b45_a_running_job_can_be_stopped(url, label, skip, app, env, log, producer)
+        _b46_a_chord_joins(url, label, skip, app, env, log, producer)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 

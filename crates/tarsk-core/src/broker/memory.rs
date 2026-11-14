@@ -3,6 +3,10 @@
 
 use super::*;
 
+/// What each member of a chord returned, by its position, and which member
+/// completed it.
+type ChordState = (HashMap<u64, Vec<u8>>, Option<u64>);
+
 /// The coordination state a broker without a shared store keeps in-process:
 /// rate-limit buckets, concurrency slots, and the once-per-minute cron tick.
 ///
@@ -15,6 +19,9 @@ use super::*;
 pub(super) struct LocalCoordination {
     /// The last minute each schedule was fired for.
     pub(super) runs: Mutex<HashMap<String, i64>>,
+    /// chord id → (what each member returned, by its position; which member
+    /// completed it). See `Broker::chord_done`.
+    chords: Mutex<HashMap<String, ChordState>>,
     buckets: Mutex<HashMap<String, (f64, std::time::Instant)>>,
     slots: Mutex<HashMap<String, HashMap<String, std::time::Instant>>>,
 }
@@ -55,6 +62,32 @@ impl LocalCoordination {
         if let Some(held) = self.slots.lock().unwrap().get_mut(task) {
             held.remove(job_id);
         }
+    }
+
+    pub(super) fn chord_done(
+        &self,
+        chord: &str,
+        index: u64,
+        total: u64,
+        result: &[u8],
+    ) -> Option<Vec<Vec<u8>>> {
+        let mut chords = self.chords.lock().unwrap();
+        let (results, fired) = chords.entry(chord.to_string()).or_default();
+        results.entry(index).or_insert_with(|| result.to_vec());
+        if (results.len() as u64) < total {
+            return None;
+        }
+        // Complete. The member that completed it is remembered, so that if it
+        // is delivered again it is told the same thing — and nobody else is.
+        if fired.is_some_and(|by| by != index) {
+            return None;
+        }
+        *fired = Some(index);
+        Some(
+            (0..total)
+                .map(|at| results.get(&at).cloned().unwrap_or_default())
+                .collect(),
+        )
     }
 
     pub(super) fn claim_run(&self, name: &str, due: i64, now: i64) -> bool {

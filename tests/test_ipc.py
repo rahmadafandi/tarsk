@@ -338,6 +338,40 @@ def test_send_many_is_one_call_unless_a_job_has_to_be_decided_alone():
     assert held.send() == held.result_ids and calls == [("many", held.result_ids)], calls
 
 
+def test_a_chord_calls_back_with_every_result_in_order():
+    """The callback runs once, after all the members, with what they returned.
+
+    In the order they were given, which here is the reverse of the order they
+    finish in.
+    """
+    from tarsk import chord, group
+
+    from tests.demo_app import app as demo
+
+    square, total = demo.registry["square"], demo.registry["total"]
+    work = chord(group(square.si(n) for n in range(1, 5)), total.s(label="squares"))
+    out = Supervisor("tests.demo_app:app", children=2, slots=2).run([work])
+    answers = [value for kind, value in out.values() if kind == "ack"]
+    assert len(out) == 5, f"four members and one callback, got {len(out)}: {out}"
+    assert ["squares", [1, 4, 9, 16], 30] in answers, answers
+    assert sorted(a for a in answers if isinstance(a, int)) == [1, 4, 9, 16], answers
+
+    # One that does not want the results is not handed them.
+    quiet = chord([square.si(2), square.si(3)], total.si([7], label="own"))
+    out = Supervisor("tests.demo_app:app", children=1).run([quiet])
+    assert ["own", [7], 7] in [v for _, v in out.values()], out
+
+    # And RabbitMQ is told no before anything is queued.
+    amqp = App(broker="amqp://guest:guest@127.0.0.1:1/")
+    lone = amqp.task(name="lone")(lambda: None)
+    try:
+        chord([lone.si()], lone.si()).send()
+    except ValueError as why:
+        assert "RabbitMQ" in str(why), why
+    else:
+        raise AssertionError("a chord was accepted on a broker that cannot count its members")
+
+
 def test_a_broker_failure_has_its_own_type():
     """An outage is a BrokerError; a URL no backend takes is still a ValueError.
 
@@ -450,6 +484,7 @@ if __name__ == "__main__":
                   test_a_worker_dependency_resolves_once,
                   test_each_send_mints_its_own_id,
                   test_send_many_is_one_call_unless_a_job_has_to_be_decided_alone,
+                  test_a_chord_calls_back_with_every_result_in_order,
                   test_a_broker_failure_has_its_own_type,
                   test_a_forked_process_gets_its_own_producer,
                   test_connecting_does_not_hold_the_gil):

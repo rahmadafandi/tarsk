@@ -297,3 +297,10 @@ async def stoppable(tag, ctx=Depends(Context)):
         raise
     _log(f"{tag}-end")
     return tag
+
+
+@app.task(name="adds_up", result_ttl=60)
+def adds_up(numbers, extra=0):
+    """A chord's callback: handed what every member returned."""
+    _log(f"adds_up-{len(numbers)}")
+    return sum(numbers) + extra

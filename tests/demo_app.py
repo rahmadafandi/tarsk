@@ -279,3 +279,14 @@ def uses_a_session(fail, s=Depends(a_session, scope="task")):
 async def uses_a_client(c=Depends(a_client)):
     _provided(f"handler-{c}")
     return c
+
+
+@app.task(name="square")
+def square(n):
+    time.sleep(0.05 * (5 - n))  # the later ones finish first
+    return n * n
+
+
+@app.task(name="total")
+def total(squares, label="sum"):
+    return [label, squares, sum(squares)]

@@ -62,7 +62,7 @@ class Supervisor:
         benchmarks. Production uses `work`, which consumes a real broker and
         does not return on its own.
         """
-        packed = [self._record(job) for job in jobs]
+        packed = [record for job in jobs for record in self._records(job)]
         outcomes, self.stats, self.exits = _core.run(
             self.app_spec,
             packed,
@@ -78,6 +78,18 @@ class Supervisor:
             task_id: ("ack", _proto.unpack_result(result)) if ok else ("nack", (error_type, tb))
             for task_id, ok, result, error_type, tb in outcomes
         }
+
+    @staticmethod
+    def _records(job) -> list[tuple]:
+        """The batch records one submitted job turns into: one, except for a
+        chord, which is one a member."""
+        from . import Chord
+
+        if isinstance(job, Chord):
+            # (id, queue, name, payload, timeout, delay, chain, meta, …) as the
+            # producer takes it, reordered into what `_core.run` takes.
+            return [(r[2], r[3], r[0], r[1], r[4], r[6], b"", 0) for r in job._records()]
+        return [Supervisor._record(job)]
 
     @staticmethod
     def _record(job) -> tuple:

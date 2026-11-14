@@ -45,6 +45,17 @@ create table if not exists tarsk_cron_runs (
     minute  bigint not null
 );
 
+-- A row per finished member of a chord, by its position, and one at position
+-- -1 naming the member that completed it.
+create table if not exists tarsk_chords (
+    id         text        not null,
+    idx        integer     not null,
+    result     bytea       not null,
+    created_at timestamptz not null default now(),
+    primary key (id, idx)
+);
+create index if not exists tarsk_chords_age on tarsk_chords (created_at);
+
 create table if not exists tarsk_paused (
     queue text primary key
 );
@@ -454,6 +465,65 @@ impl PgBroker {
             )
             .await?;
         Ok(())
+    }
+
+    pub(super) async fn chord_done(
+        &self,
+        chord: &str,
+        index: u64,
+        total: u64,
+        result: &[u8],
+    ) -> Res<Option<Vec<Vec<u8>>>> {
+        let db = self.db().await?;
+        let index = index as i32;
+        db.execute(
+            "insert into tarsk_chords (id, idx, result) values ($1, $2, $3)
+             on conflict (id, idx) do nothing",
+            &[&chord, &index, &result],
+        )
+        .await?;
+        let members: i64 = db
+            .query_one(
+                "select count(*) from tarsk_chords where id = $1 and idx >= 0",
+                &[&chord],
+            )
+            .await?
+            .get(0);
+        if (members as u64) < total {
+            return Ok(None);
+        }
+        // The primary key is the election: one member writes the -1 row, and
+        // the rest find somebody else's position in it.
+        let marker = index.to_string().into_bytes();
+        db.execute(
+            "insert into tarsk_chords (id, idx, result) values ($1, -1, $2)
+             on conflict (id, idx) do nothing",
+            &[&chord, &marker],
+        )
+        .await?;
+        let fired: Vec<u8> = db
+            .query_one(
+                "select result from tarsk_chords where id = $1 and idx = -1",
+                &[&chord],
+            )
+            .await?
+            .get(0);
+        if fired != marker {
+            return Ok(None);
+        }
+        let rows = db
+            .query(
+                "select result from tarsk_chords where id = $1 and idx >= 0 order by idx",
+                &[&chord],
+            )
+            .await?;
+        // Swept here, where a chord has just finished, rather than on a timer.
+        db.execute(
+            "delete from tarsk_chords where created_at < now() - interval '1 day'",
+            &[],
+        )
+        .await?;
+        Ok(Some(rows.iter().map(|row| row.get(0)).collect()))
     }
 
     pub(super) async fn claim_run(&self, name: &str, due: i64, now: i64) -> Res<bool> {

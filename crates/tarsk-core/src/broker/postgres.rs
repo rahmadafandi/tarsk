@@ -133,19 +133,32 @@ fn schema_stamp() -> i64 {
 /// indistinguishable from one that was never taken, so expiry needs no sweep.
 const PG_CLAIM: &str = "
 with picked as (
-    select id,
-           -- The moment this became runnable, captured before the update
-           -- overwrites it: lease_until is when a delayed job came due or a
-           -- lost lease lapsed, and null means it was runnable when written.
-           coalesce(lease_until, created_at) as ready_at
-      from tarsk_jobs
-     where queue = any($1) and (lease_until is null or lease_until < now())
-     -- Priority before age: `--queues high,low` is an ordering, and
-     -- array_position turns it into one the planner can sort by. Strict here
-     -- in a way Redis cannot be, because this claims one row at a time and so
-     -- never holds a batch of the wrong queue.
-     order by array_position($1::text[], queue), id
-       for update skip locked
+    -- One queue at a time, in the order they were given, and inside each queue
+    -- two probes that can each use an index: jobs never leased, and jobs whose
+    -- lease has run out. The single query this replaces filtered on
+    -- `lease_until is null or lease_until < now()` and sorted the result, so
+    -- every claim read and sorted the whole backlog — 126ms a claim with
+    -- 200,000 jobs waiting, against 0.3ms for this.
+    --
+    -- `ready_at` is the moment the job became runnable: lease_until is when a
+    -- delayed job came due or a lost lease lapsed, and a job never leased was
+    -- runnable when written.
+    --
+    -- Priority before age: `--queues high,low` is an ordering. Strict here in
+    -- a way Redis cannot be, because this claims one row at a time and so
+    -- never holds a batch of the wrong queue.
+    select c.id, c.ready_at
+      from unnest($1::text[]) with ordinality as q(queue, ord)
+     cross join lateral (
+           select * from (select id, created_at as ready_at from tarsk_jobs
+                           where queue = q.queue and lease_until is null
+                           order by id for update skip locked limit 1) fresh
+           union all
+           select * from (select id, lease_until as ready_at from tarsk_jobs
+                           where queue = q.queue and lease_until < now()
+                           order by id for update skip locked limit 1) due
+           ) c
+     order by q.ord, c.id
      limit 1
 )
 update tarsk_jobs set

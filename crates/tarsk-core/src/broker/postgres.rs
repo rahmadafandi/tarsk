@@ -288,6 +288,43 @@ impl PgBroker {
         Ok(())
     }
 
+    pub(super) async fn push_many(&self, jobs: Vec<NewJob>) -> Res<()> {
+        // One statement, so one transaction: all the rows or none. Columns
+        // travel as arrays and are unzipped by the server, which keeps this a
+        // single prepared statement whatever the batch size.
+        let mut ids = Vec::with_capacity(jobs.len());
+        let mut queues = Vec::with_capacity(jobs.len());
+        let mut names = Vec::with_capacity(jobs.len());
+        let mut payloads = Vec::with_capacity(jobs.len());
+        let mut timeouts = Vec::with_capacity(jobs.len());
+        let mut chains = Vec::with_capacity(jobs.len());
+        let mut metas = Vec::with_capacity(jobs.len());
+        let mut expires = Vec::with_capacity(jobs.len());
+        for job in jobs {
+            ids.push(job.id);
+            queues.push(job.queue);
+            names.push(job.name);
+            payloads.push(job.payload);
+            timeouts.push(job.timeout_ms as i32);
+            chains.push(job.chain);
+            metas.push(job.meta);
+            expires.push(job.expires_ms as i64);
+        }
+        self.db()
+            .await?
+            .execute(
+                "insert into tarsk_jobs
+                     (job_id, queue, name, payload, timeout_ms, chain, meta, expires_ms)
+                 select * from unnest($1::text[], $2::text[], $3::text[], $4::bytea[],
+                                      $5::int[], $6::bytea[], $7::bytea[], $8::bigint[])",
+                &[
+                    &ids, &queues, &names, &payloads, &timeouts, &chains, &metas, &expires,
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
     pub(super) async fn claim(&self, grace: Duration, block: Duration) -> Res<Option<Delivery>> {
         // ponytail: polls. LISTEN/NOTIFY is the upgrade and would cut idle
         // pickup latency to the round trip; it costs a dedicated connection to

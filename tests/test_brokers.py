@@ -1619,6 +1619,52 @@ def _b42_connecting_beside_a_busy_worker(url, label, skip, app, env, log, produc
         f"{label}: the worker hit a deadlock while others connected:\n{said.read_text()}"
 
 
+def _b43_a_batch_arrives_whole(url, label, skip, app, env, log, producer):
+    # --- three hundred jobs in one call, and every one of them runs ------
+    log.write_text("")
+    note = app.registry["note"]
+    tags = [f"bulk-{i}" for i in range(300)]
+    ids = app.send_many(note.si(tag) for tag in tags)
+    assert len(set(ids)) == 300, f"{label}: 300 sends were given {len(set(ids))} ids"
+    worker = start_worker(env, TARSK_SLOTS=50, TARSK_LEASE_GRACE=1)
+    try:
+        seen = wait_for(log, set(tags), timeout=60)
+    finally:
+        stop_worker(worker)
+    assert set(tags) <= set(seen), f"{label}: lost {len(set(tags) - set(seen))} of the batch"
+
+    if scheme_is(url, ("postgres://", "postgresql://")):
+        # One row the server will not take, in the middle: none of the batch
+        # may be queued. Sent one by one, the first half would have been.
+        log.write_text("")
+        batch = [note.si(f"half-{i}") for i in range(10)]
+        batch[5] = type(batch[0])(note, ("refused",), {}, feed=False)
+        batch[5].task = _on_queue(note, "no\x00such")
+        try:
+            app.send_many(batch)
+        except BrokerError:
+            pass
+        else:
+            raise AssertionError(f"{label}: a batch with a row Postgres refuses was accepted")
+        worker = start_worker(env, TARSK_LEASE_GRACE=1)
+        try:
+            time.sleep(4)
+        finally:
+            stop_worker(worker)
+        ran = [t for t in tags_in(log) if t.startswith("half-")]
+        assert not ran, f"{label}: a refused batch still queued {ran}"
+
+
+class _on_queue:
+    """A task as `send_many` sees it, with its queue swapped for one job."""
+
+    def __init__(self, task, queue):
+        import dataclasses
+
+        self.app, self.fn = task.app, task.fn
+        self.spec = dataclasses.replace(task.spec, queue=queue)
+
+
 def _b38_redis_only(url, label, skip, app, env, log, producer):
     if not scheme_is(url, ("redis://", "rediss://")):
         return
@@ -1830,6 +1876,7 @@ def check_broker(url: str, label: str, skip: frozenset = frozenset()) -> None:
         _b40_limits_hold_across_connections(url, label, skip, app, env, log, producer)
         _b41_a_missed_cron_run_is_caught_up(url, label, skip, app, env, log, producer)
         _b42_connecting_beside_a_busy_worker(url, label, skip, app, env, log, producer)
+        _b43_a_batch_arrives_whole(url, label, skip, app, env, log, producer)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 

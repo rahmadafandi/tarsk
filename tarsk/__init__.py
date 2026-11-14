@@ -324,6 +324,19 @@ class Enqueue:
         self.meta = meta or {}
 
     def send(self, *args, **kwargs) -> str:
+        record = self._record(args, kwargs)
+        held = self.task.app.producer().send(*record)
+        # A deduplicated send hands back the id of the job already covering it,
+        # so the caller waits on the same answer instead of on a job that was
+        # never queued.
+        return held or record[0]
+
+    def _record(self, args: tuple, kwargs: dict) -> tuple:
+        """Everything the producer is handed for one send, in its order.
+
+        Separate from sending it so that many can be prepared and then handed
+        over together — see `App.send_many`.
+        """
         from . import _proto  # lazy — see App.producer
 
         app = self.task.app
@@ -349,16 +362,12 @@ class Enqueue:
             kwargs = ctx.kwargs  # mutable, so a trace id can be attached here
         payload = _proto.pack_args(args, kwargs)
         key, ttl_ms = self._dedup(payload)
-        held = self.task.app.producer().send(
+        return (
             task_id, self.queue, self.task.spec.name, payload,
             self.timeout_ms, self.delay, self.chain,
             _proto.pack_result(self.meta) if self.meta else b"",
             key, ttl_ms, self.expires_ms,
         )
-        # A deduplicated send hands back the id of the job already covering it,
-        # so the caller waits on the same answer instead of on a job that was
-        # never queued.
-        return held or task_id
 
     def _dedup(self, payload: bytes) -> tuple[str, int]:
         ttl = self.dedup_ttl if self.dedup_ttl is not None else self.task.spec.unique_ms / 1000
@@ -601,6 +610,35 @@ class App:
             self._producer_pid = os.getpid()
         return self._producer
 
+    def send_many(self, signatures) -> list[str]:
+        """Enqueue many jobs in one round trip, and return their ids in order.
+
+        `app.send_many(resize.si(f) for f in files)`. On Redis and Postgres
+        they go in together or not at all: a group that is half queued when
+        the connection drops is a harder thing to recover from than one that
+        was never queued. A thousand sends are also a thousand round trips,
+        and this is one.
+
+        Jobs that cannot travel in a batch are sent one at a time, as
+        `send()` would: anything delayed, and anything with `unique=` or a
+        dedup key, whose whole point is to be decided one by one. RabbitMQ has
+        no way to take a batch as a unit, so there each is confirmed in turn.
+        """
+        records = [
+            Enqueue(step.task, task_id=step.task_id)._record(step.args, step.kwargs)
+            for step in signatures
+        ]
+        if not records:
+            return []
+        producer = self.producer()
+        # delay at index 5, the dedup key at 8.
+        if any(record[5] or record[8] for record in records):
+            return [producer.send(*record) or record[0] for record in records]
+        producer.send_many([
+            (r[0], r[1], r[2], r[3], r[4], r[6], r[7], r[10]) for r in records
+        ])
+        return [record[0] for record in records]
+
     def cancel(self, task_id: str, *, queue: str = "default", ttl: float = 86400.0) -> None:
         """Stop a job from running. Takes effect within a second.
 
@@ -782,8 +820,8 @@ class Group:
         return [s.task_id for s in self.steps]
 
     def send(self) -> list[str]:
-        for step in self.steps:
-            Enqueue(step.task, task_id=step.task_id).send(*step.args, **step.kwargs)
+        # Together, so the group is all queued or none of it is.
+        self.steps[0].task.app.send_many(self.steps)
         return self.result_ids
 
     async def send_async(self) -> list[str]:

@@ -214,6 +214,35 @@ impl RedisBroker {
         })
     }
 
+    pub(super) async fn push_many(&self, jobs: Vec<NewJob>) -> Res<()> {
+        // MULTI: every XADD or none, and one round trip for the lot.
+        let mut pipe = redis::pipe();
+        pipe.atomic();
+        for job in &jobs {
+            pipe.cmd("XADD")
+                .arg(stream_key(&job.queue))
+                .arg("*")
+                .arg("n")
+                .arg(&job.name)
+                .arg("p")
+                .arg(&job.payload)
+                .arg("t")
+                .arg(job.timeout_ms)
+                .arg("i")
+                .arg(&job.id)
+                .arg("c")
+                .arg(&job.chain)
+                .arg("m")
+                .arg(&job.meta)
+                .arg("x")
+                .arg(job.expires_ms)
+                .ignore();
+        }
+        let mut conn = self.conn.clone();
+        let _: () = pipe.query_async(&mut conn).await?;
+        Ok(())
+    }
+
     /// Find out that the connection has gone before something that matters is
     /// sent on it.
     ///

@@ -238,6 +238,9 @@ type DepthRow = (String, u64, u64, u64, u64);
 /// and whatever the sender attached, still packed.
 type JobRow = (String, String, String, String, u32, i64, String, Py<PyAny>);
 
+/// One job of a batch, as `Producer.send_many` takes it.
+type ManyJob = (String, String, String, Vec<u8>, u32, Vec<u8>, Vec<u8>, u64);
+
 /// Producer handle. Holds its own runtime and connection so enqueueing from a
 /// web request is one round trip, not a reconnect.
 #[pyclass]
@@ -348,6 +351,28 @@ impl Producer {
             })
         })
         .map_err(broker_err)
+    }
+
+    /// Enqueue many jobs for immediate delivery in one round trip. Each is
+    /// `(id, queue, name, payload, timeout_ms, chain, meta, expires_ms)`.
+    fn send_many(&self, py: Python<'_>, jobs: Vec<ManyJob>) -> PyResult<()> {
+        let jobs = jobs
+            .into_iter()
+            .map(
+                |(id, queue, name, payload, timeout_ms, chain, meta, expires_ms)| NewJob {
+                    id,
+                    queue,
+                    name,
+                    payload,
+                    timeout_ms,
+                    chain,
+                    meta,
+                    expires_ms,
+                },
+            )
+            .collect();
+        py.detach(|| self.wake_then(self.broker.push_many(jobs)))
+            .map_err(broker_err)
     }
 
     /// The stored envelope for `id`, or None while it is unfinished, was never

@@ -377,6 +377,34 @@ impl Broker {
         }
     }
 
+    /// Enqueue many jobs for immediate delivery, as one unit where the backend
+    /// has such a thing.
+    ///
+    /// Redis and Postgres take them all or none. AMQP has no multi-message
+    /// transaction worth the name with confirms on, so there they are
+    /// published in turn and a failure part-way leaves the first ones queued.
+    pub async fn push_many(&self, jobs: Vec<NewJob>) -> Res<()> {
+        match self {
+            Broker::Memory(b) => {
+                for job in jobs {
+                    b.push(job, Duration::ZERO)?;
+                }
+                Ok(())
+            }
+            #[cfg(feature = "redis")]
+            Broker::Redis(b) => b.push_many(jobs).await,
+            #[cfg(feature = "postgres")]
+            Broker::Postgres(b) => b.push_many(jobs).await,
+            #[cfg(feature = "amqp")]
+            Broker::Amqp(b) => {
+                for job in jobs {
+                    b.push(job, Duration::ZERO).await?;
+                }
+                Ok(())
+            }
+        }
+    }
+
     /// Take one job. The lease runs for the job's own timeout plus `grace`
     /// (spec §4.5) — a global lease would strand a 5-second task for as long
     /// as the slowest task in the system. Waits up to `block` for work.

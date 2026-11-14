@@ -303,6 +303,41 @@ def test_each_send_mints_its_own_id():
     assert pinned.send() == pinned.send() == "mine", "an explicit id must be kept"
 
 
+def test_send_many_is_one_call_unless_a_job_has_to_be_decided_alone():
+    """A batch goes to the producer as a batch — except what cannot."""
+    app = App(broker="memory://")
+    calls = []
+
+    class Capture:
+        def send(self, *record):
+            calls.append(("one", record[0]))
+            return ""
+
+        def send_many(self, records):
+            calls.append(("many", [r[0] for r in records]))
+
+    app._producer = Capture()
+    plain = app.task(name="plain")(lambda n: None)
+    once = app.task(name="once", unique=30)(lambda n: None)
+
+    ids = app.send_many(plain.si(n) for n in range(3))
+    assert calls == [("many", ids)] and len(set(ids)) == 3, calls
+    assert app.send_many([]) == [] and len(calls) == 1, "an empty batch reached the broker"
+
+    # `unique=` is a question asked of the broker per job. A batch has no way
+    # to ask it, so these go the long way round rather than skipping it.
+    calls.clear()
+    ids = app.send_many([plain.si(1), once.si(2)])
+    assert calls == [("one", ids[0]), ("one", ids[1])], calls
+
+    # And a group is a batch.
+    from tarsk import group
+
+    calls.clear()
+    held = group(plain.si(n) for n in range(4))
+    assert held.send() == held.result_ids and calls == [("many", held.result_ids)], calls
+
+
 def test_a_broker_failure_has_its_own_type():
     """An outage is a BrokerError; a URL no backend takes is still a ValueError.
 
@@ -414,6 +449,7 @@ if __name__ == "__main__":
                   test_waiting_for_a_slot_is_not_an_attempt,
                   test_a_worker_dependency_resolves_once,
                   test_each_send_mints_its_own_id,
+                  test_send_many_is_one_call_unless_a_job_has_to_be_decided_alone,
                   test_a_broker_failure_has_its_own_type,
                   test_a_forked_process_gets_its_own_producer,
                   test_connecting_does_not_hold_the_gil):

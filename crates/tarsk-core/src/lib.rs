@@ -1354,6 +1354,10 @@ async fn serve_inner(
     // rather than waiting on the spawn: a child that is not being watched can
     // run straight through the hard ceiling, and the wait was seconds long.
     let mut retiring: Option<&'static str> = None;
+    // For charging memory to tasks: the child's RSS when growth was last
+    // charged, and what has finished since. See `Metrics::observe_growth`.
+    let mut charged_at: Option<u64> = None;
+    let mut finished: Vec<String> = Vec::new();
 
     // Read the pressure, start the replacement if the trigger is close, and
     // report the trigger if it has already fired.
@@ -1371,6 +1375,20 @@ async fn serve_inner(
                 // first child to grow pays for the lesson once and every child
                 // after it starts already knowing.
                 shared.observe_growth(bytes, *baseline, *tasks_done, inflight.len() as u64);
+                // The mark moves only when something is charged, so the
+                // readings taken while a task is still running do not eat
+                // the growth that belongs to it.
+                match charged_at {
+                    None => charged_at = Some(bytes),
+                    Some(before) if !finished.is_empty() => {
+                        shared
+                            .metrics
+                            .observe_growth(&finished, bytes.saturating_sub(before));
+                        finished.clear();
+                        charged_at = Some(bytes);
+                    }
+                    Some(_) => {}
+                }
                 allowed = slot_budget(bytes, shared.growth_estimate(), cfg.max_rss);
             }
             if spare.is_none()
@@ -1642,6 +1660,11 @@ async fn serve_inner(
                         // max_tasks trigger, the projected RSS and the growth
                         // denominator on the child's say-so.
                         if let Some(job) = inflight.remove(&task_id) {
+                            finished.push(job.name.clone());
+                            // Absent from a child older than this field.
+                            if let Some(kept) = items.get(3).and_then(|v| v.as_i64()) {
+                                shared.metrics.observe_kept(&job.name, kept);
+                            }
                             let done = Outcome { ok: true, result: result.to_vec(), error_type: String::new(), traceback: String::new(), directive: Directive::Policy };
                             // A closed channel means the settle task is gone,
                             // so this ack and every one after it would reach
@@ -1662,6 +1685,10 @@ async fn serve_inner(
                         };
                         let directive = Directive::read(&items);
                         if let Some(job) = inflight.remove(&task_id) {
+                            finished.push(job.name.clone());
+                            if let Some(kept) = items.get(6).and_then(|v| v.as_i64()) {
+                                shared.metrics.observe_kept(&job.name, kept);
+                            }
                             let mut outcome = Outcome::nack(kind, tb.to_string());
                             outcome.directive = directive;
                             if settle.send(Settle::Done(job, outcome)).await.is_err() {
@@ -2299,6 +2326,15 @@ pub async fn supervise_until(
     );
     for (reason, count) in shared.reasons.lock().unwrap().iter() {
         stats.insert(format!("recycle_{reason}"), *count);
+    }
+    // Keyed by task, so the same numbers /metrics serves reach a batch run.
+    for row in shared.metrics.growth() {
+        stats.insert(format!("rss_growth_bytes:{}", row.task), row.total);
+        stats.insert(format!("rss_growth_runs:{}", row.task), row.runs);
+        // A count that can fall is reported as it stands, floored at zero:
+        // the stats are unsigned, and "kept fewer than nothing" is a cache
+        // emptying, not a finding.
+        stats.insert(format!("kept_objects:{}", row.task), row.kept.max(0) as u64);
     }
     drop(registry);
 

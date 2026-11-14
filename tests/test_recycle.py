@@ -64,6 +64,32 @@ def test_leaky_handler_is_bounded():
     assert sup.stats["children_crashed"] == 0, f"a child died unexpectedly: {sup.stats}"
 
 
+def test_growth_is_charged_to_the_task_that_caused_it():
+    """Two tasks, one leaking and one not, and the supervisor can say which.
+
+    The ceiling tells you a worker grew; it cannot tell you what grew it. One
+    slot, so each reading has exactly one task between it and the last.
+    """
+    MB = 1024 * 1024
+    sup = Supervisor("tests.leaky_app:app", children=1, max_rss=CEILING)
+    jobs = [("leak", (8,), {}), ("tidy", (8,), {})] * 6
+    results = sup.run(jobs)
+    assert all(kind == "ack" for kind, _ in results.values()), results
+
+    # Who: the leak keeps what it allocated, run after run, and the tidy task
+    # hands everything back. Counted in objects, where the allocator's habit
+    # of giving one task's freed memory to the next cannot move the blame.
+    leak, tidy = sup.stats["kept_objects:leak"], sup.stats["kept_objects:tidy"]
+    assert leak >= 6, f"six runs that each keep a bytearray kept {leak} objects"
+    assert tidy < leak, f"the tidy task kept {tidy} objects against the leak's {leak}"
+
+    # How much: between them the two were charged about what was leaked. Which
+    # of the two is not asserted, because the bytes do not know — taking turns
+    # like this, the tidy task is charged most of it.
+    grown = sup.stats.get("rss_growth_bytes:leak", 0) + sup.stats.get("rss_growth_bytes:tidy", 0)
+    assert grown >= 24 * MB, f"48 MB was leaked and {grown / MB:.1f} MB of growth was seen"
+
+
 def test_recycling_is_overlapped():
     """Every recycle should hand over to a child that is already running.
 
@@ -384,7 +410,8 @@ def test_memory_broker_carries_the_full_record():
 
 if __name__ == "__main__":
     ran, skipped = [], []
-    for check in (test_leaky_handler_is_bounded, test_recycling_is_overlapped,
+    for check in (test_leaky_handler_is_bounded, test_growth_is_charged_to_the_task_that_caused_it,
+                  test_recycling_is_overlapped,
                   test_a_recycled_child_loses_no_acks,
                   test_baseline_above_ceiling_is_refused,
                   test_hard_ceiling_kills_and_dead_letters,

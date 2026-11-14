@@ -525,6 +525,39 @@ async fn dashboard(shared: &Arc<Shared>, guard: &Guard) -> String {
     }
     page.push_str("</table>");
 
+    let growth = shared.metrics.growth();
+    if !growth.is_empty() {
+        page.push_str(
+            "<h2>Memory by task</h2>\
+             <p class=note><b>Objects kept</b> is what each run left the interpreter \
+             holding, averaged: a task that cleans up after itself is near zero, and one \
+             that is not is the leak. <b>Growth</b> is how much the worker's memory rose \
+             while the task ran, and is only read with a ceiling set — it says how much, \
+             and is a poor guide to who, because memory one task frees is handed to the \
+             next. Both are exact with <code>--slots 1</code> and blurred by overlap above \
+             it.</p>\
+             <table><tr><th>task<th>runs<th>objects kept per run<th>growth per run\
+             <th>largest<th>total growth",
+        );
+        for row in growth.iter().take(PAGE) {
+            let per_run = if row.kept_runs == 0 {
+                String::new()
+            } else {
+                format!("{:.1}", row.kept as f64 / row.kept_runs as f64)
+            };
+            page.push_str(&format!(
+                "<tr><td>{}<td class=n>{}<td class=n>{}<td class=n>{}<td class=n>{}<td class=n>{}",
+                escape(&row.task),
+                row.kept_runs.max(row.runs),
+                per_run,
+                megabytes(row.total / row.runs.max(1)),
+                megabytes(row.max),
+                megabytes(row.total),
+            ));
+        }
+        page.push_str("</table>");
+    }
+
     page.push_str("<h2>Jobs</h2>");
     if jobs.is_empty() {
         page.push_str("<p class=note>Nothing waiting or running.</p>");
@@ -591,6 +624,14 @@ async fn dashboard(shared: &Arc<Shared>, guard: &Guard) -> String {
 
     page.push_str("</body>");
     page
+}
+
+/// `12.3 MB`, or `0` for nothing: a column of these is read for its outliers.
+fn megabytes(bytes: u64) -> String {
+    if bytes == 0 {
+        return "0".to_string();
+    }
+    format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
 }
 
 fn action(

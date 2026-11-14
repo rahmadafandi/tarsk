@@ -225,14 +225,18 @@ _reports: set[asyncio.Task] = set()
 
 
 async def _one(app, wire: Wire, app_spec: str, task_id: int, name: str, payload,
-               meta: bytes = b"", attempt: int = 1, job_id: str = "") -> None:
-    """Run a single dispatched task and report it. Never raises."""
+               meta: bytes = b"", attempt: int = 1, job_id: str = "") -> tuple[tuple, bool]:
+    """Run a single dispatched task. Never raises.
+
+    Returns the frame that reports it, and whether this process can go on —
+    which it cannot after a sync handler has outlived its timeout. The caller
+    sends the frame, so it can measure what the task left behind once every
+    local in here has been let go.
+    """
     task = app.registry.get(name)
     if task is None:
-        await wire.send(
-            "Nack", task_id, "UnknownTask", f"no task named {name!r} in {app_spec}", "", 0
-        )
-        return
+        return ("Nack", task_id, "UnknownTask",
+                f"no task named {name!r} in {app_spec}", "", 0), True
 
     try:
         call_args, call_kwargs = _proto.unpack_args(payload)
@@ -275,37 +279,27 @@ async def _one(app, wire: Wire, app_spec: str, task_id: int, name: str, payload,
         # Its own outcome rather than folded into TimeoutError: the two say
         # different things about the handler. This one was asked and stopped
         # anyway; the other was never asked.
-        await wire.send("Nack", task_id, "SoftTimeout", f"{type(exc).__name__}: {exc}", "", 0)
+        return ("Nack", task_id, "SoftTimeout", f"{type(exc).__name__}: {exc}", "", 0), True
     except Reject as exc:
         # The handler knows this will never work. Skip the remaining attempts
         # rather than spending them to reach the same answer.
-        await wire.send("Nack", task_id, "Reject", f"{type(exc).__name__}: {exc}", "reject", 0)
+        return ("Nack", task_id, "Reject", f"{type(exc).__name__}: {exc}", "reject", 0), True
     except Retry as exc:
-        await wire.send(
-            "Nack", task_id, "Retry", f"{type(exc).__name__}: {exc}",
-            "retry", int(exc.delay * 1000),
-        )
+        return ("Nack", task_id, "Retry", f"{type(exc).__name__}: {exc}",
+                "retry", int(exc.delay * 1000)), True
     except _Deadline:
-        await wire.send(
-            "Nack", task_id, "TimeoutError",
-            f"{name} exceeded timeout of {task.spec.timeout_ms / 1000}s", "", 0,
-        )
-        if not task.is_async:
-            # A Python thread cannot be interrupted (spec §4.5). The work we
-            # just timed out on is still running and still holds whatever we
-            # killed it for, so the process has to go — and with more than one
-            # slot it takes its siblings with it. Their leases expire and the
-            # supervisor redelivers them; that is the cost of sharing a process.
-            raise _SyncTimeout
+        # A Python thread cannot be interrupted (spec §4.5). After a sync
+        # handler times out the work is still running and still holds whatever
+        # it was stopped for, so the process has to go — and with more than
+        # one slot it takes its siblings with it. Their leases expire and the
+        # supervisor redelivers them; that is the cost of sharing a process.
+        return ("Nack", task_id, "TimeoutError",
+                f"{name} exceeded timeout of {task.spec.timeout_ms / 1000}s", "", 0), task.is_async
     except Exception as exc:
         # Pre-formatted string — never reconstructed Rust-side (spec §4.2).
-        await wire.send("Nack", task_id, type(exc).__name__, traceback.format_exc(), "", 0)
+        return ("Nack", task_id, type(exc).__name__, traceback.format_exc(), "", 0), True
     else:
-        await wire.send("Ack", task_id, _proto.pack_result(result))
-
-
-class _SyncTimeout(Exception):
-    """A sync handler outlived its timeout, so this process cannot continue."""
+        return ("Ack", task_id, _proto.pack_result(result)), True
 
 
 async def main(socket_path: str, app_spec: str, child_id: int, slots: int = 1) -> None:
@@ -380,9 +374,16 @@ async def main(socket_path: str, app_spec: str, child_id: int, slots: int = 1) -
         await wire.send("Ready")
 
     async def run_and_report(task_id, name, payload, meta, attempt, job_id):
-        try:
-            await _one(app, wire, app_spec, task_id, name, payload, meta, attempt, job_id)
-        except _SyncTimeout:
+        # How many objects the interpreter is holding, before and after. What a
+        # task leaves behind is what it leaked, and unlike the process's size
+        # this is not fooled by the allocator handing one task's freed memory
+        # to the next: a block is counted where it is kept, not where the
+        # process happened to grow. Two calls that read a counter.
+        before = sys.getallocatedblocks()
+        frame, alive = await _one(app, wire, app_spec, task_id, name, payload, meta,
+                                  attempt, job_id)
+        await wire.send(*frame, sys.getallocatedblocks() - before)
+        if not alive:
             # Nothing above is awaiting this task, so the exit has to happen
             # here — letting it settle into the task object would leave the
             # process running with the thread it could not interrupt.

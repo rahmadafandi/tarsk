@@ -33,3 +33,10 @@ def _peak_rss() -> int:
 def leak(megabytes):
     _leaked.append(bytearray(megabytes * 1024 * 1024))  # zero-filled, so genuinely resident
     return [os.getpid(), _peak_rss()]
+
+
+@app.task(name="tidy")
+def tidy(megabytes):
+    """The same allocation, given back: what a task that does not leak looks like."""
+    scratch = bytearray(megabytes * 1024 * 1024)
+    return len(scratch)

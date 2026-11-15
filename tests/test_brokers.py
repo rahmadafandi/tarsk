@@ -1652,26 +1652,26 @@ def _b43_a_batch_arrives_whole(url, label, skip, app, env, log, producer):
         stop_worker(worker)
     assert set(tags) <= set(seen), f"{label}: lost {len(set(tags) - set(seen))} of the batch"
 
-    if scheme_is(url, ("postgres://", "postgresql://")):
-        # One row the server will not take, in the middle: none of the batch
-        # may be queued. Sent one by one, the first half would have been.
-        log.write_text("")
-        batch = [note.si(f"half-{i}") for i in range(10)]
-        batch[5] = type(batch[0])(note, ("refused",), {}, feed=False)
-        batch[5].task = _on_queue(note, "no\x00such")
-        try:
-            app.send_many(batch)
-        except BrokerError:
-            pass
-        else:
-            raise AssertionError(f"{label}: a batch with a row Postgres refuses was accepted")
-        worker = start_worker(env, TARSK_LEASE_GRACE=1)
-        try:
-            time.sleep(4)
-        finally:
-            stop_worker(worker)
-        ran = [t for t in tags_in(log) if t.startswith("half-")]
-        assert not ran, f"{label}: a refused batch still queued {ran}"
+    # One job no broker may take, in the middle: none of the batch may be
+    # queued, whichever backend. Sent one by one, the first half would have
+    # been, and Redis used to queue the rest where Postgres refused the lot.
+    log.write_text("")
+    batch = [note.si(f"half-{i}") for i in range(10)]
+    batch[5] = type(batch[0])(note, ("refused",), {}, feed=False)
+    batch[5].task = _on_queue(note, "no\x00such")
+    try:
+        app.send_many(batch)
+    except BrokerError:
+        pass
+    else:
+        raise AssertionError(f"{label}: a batch with a job no broker can take was accepted")
+    worker = start_worker(env, TARSK_LEASE_GRACE=1)
+    try:
+        time.sleep(4)
+    finally:
+        stop_worker(worker)
+    ran = [t for t in tags_in(log) if t.startswith("half-")]
+    assert not ran, f"{label}: a refused batch still queued {ran}"
 
 
 class _on_queue:

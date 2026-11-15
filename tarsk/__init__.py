@@ -624,9 +624,9 @@ class App:
         `app.send_many(resize.si(f) for f in files)`. On Redis and Postgres
         they go in together or not at all: a group that is half queued when
         the connection drops is a harder thing to recover from than one that
-        was never queued. (Postgres refuses the whole batch for one bad row
-        as well; Redis runs the rest.) A thousand sends are also a thousand round trips,
-        and this is one.
+        was never queued. A batch with one job the broker cannot take is
+        refused whole, on every backend. A thousand sends are also a thousand
+        round trips, and this is one.
 
         Jobs that cannot travel in a batch are sent one at a time, as
         `send()` would: anything delayed, and anything with `unique=` or a

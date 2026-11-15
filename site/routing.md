@@ -207,7 +207,7 @@ ids = app.send_many(resize.si(f) for f in files)
 
 One round trip instead of one a job, and on Redis and Postgres one unit: they are all queued
 or none are, where a loop of `send()` leaves half a batch behind when the connection drops in
-the middle. A group and a chord are sent this way. Jobs that have to be decided one at a time
+the middle. A batch holding one job the broker cannot take is refused whole, on every backend. A group and a chord are sent this way. Jobs that have to be decided one at a time
 still are — anything delayed, and anything with `unique=` or a dedup key — and RabbitMQ
 confirms each in turn, having no way to take a batch as a unit.
 

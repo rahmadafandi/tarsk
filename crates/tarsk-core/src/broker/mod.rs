@@ -41,6 +41,20 @@ pub use redis_streams::RedisBroker;
 
 pub type Res<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+/// Refuse a job that one backend would take and another would not.
+///
+/// Postgres has no NUL in text; Redis and AMQP carry one without comment. Left
+/// to the backends, the same batch was refused whole by one and queued by the
+/// others, so the rule is applied here, the same for all of them.
+fn sendable(job: &NewJob) -> Res<()> {
+    for (what, value) in [("id", &job.id), ("queue", &job.queue), ("name", &job.name)] {
+        if value.contains('\0') {
+            return Err(format!("a job's {what} cannot contain a NUL byte: {value:?}").into());
+        }
+    }
+    Ok(())
+}
+
 /// What a broker's waiters sleep on instead of a timer.
 ///
 /// Two things here were polled: a Postgres worker asking for work forty times
@@ -388,6 +402,7 @@ impl Broker {
 
     /// Enqueue, optionally not before `delay` has passed.
     pub async fn push(&self, job: NewJob, delay: Duration) -> Res<()> {
+        sendable(&job)?;
         match self {
             Broker::Memory(b) => b.push(job, delay),
             #[cfg(feature = "redis")]
@@ -405,7 +420,13 @@ impl Broker {
     /// Redis and Postgres take them all or none. AMQP has no multi-message
     /// transaction worth the name with confirms on, so there they are
     /// published in turn and a failure part-way leaves the first ones queued.
+    ///
+    /// Every job is checked before any is sent, so a batch with one job no
+    /// backend could take is refused whole on all of them.
     pub async fn push_many(&self, jobs: Vec<NewJob>) -> Res<()> {
+        for job in &jobs {
+            sendable(job)?;
+        }
         match self {
             Broker::Memory(b) => {
                 for job in jobs {

@@ -36,7 +36,9 @@ const EXIT_STARTUP_FAILED: i32 = 78;
 
 // ---------------------------------------------------------------- framing
 
-async fn read_frame(reader: &mut transport::Reader) -> io::Result<Option<Vec<u8>>> {
+async fn read_frame<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+) -> io::Result<Option<Vec<u8>>> {
     let mut header = [0u8; 4];
     match reader.read_exact(&mut header).await {
         Ok(_) => {}
@@ -56,11 +58,14 @@ async fn read_frame(reader: &mut transport::Reader) -> io::Result<Option<Vec<u8>
 }
 
 async fn write_frame(writer: &mut transport::Writer, value: &Value) -> io::Result<()> {
-    let mut body = Vec::new();
-    rmpv::encode::write_value(&mut body, value)
+    // Length and body in one write: the socket is unbuffered, and two writes
+    // were two system calls and, as often as not, two wake-ups for the reader.
+    let mut frame = vec![0u8; 4];
+    rmpv::encode::write_value(&mut frame, value)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    writer.write_all(&(body.len() as u32).to_be_bytes()).await?;
-    writer.write_all(&body).await?;
+    let size = (frame.len() - 4) as u32;
+    frame[..4].copy_from_slice(&size.to_be_bytes());
+    writer.write_all(&frame).await?;
     writer.flush().await
 }
 
@@ -1131,12 +1136,15 @@ async fn spawn_child(shared: &Arc<Shared>, cfg: &Cfg) -> Option<ChildHandle> {
         let _ = proc.kill().await;
         return None;
     };
-    let (mut reader, writer) = halves;
+    let (reader, writer) = halves;
 
     // Frames arrive through a channel so the serve loop can select! on them:
     // read_exact is not cancel-safe, mpsc::Receiver::recv is.
     let (frame_tx, frames) = mpsc::channel(8);
     tokio::spawn(async move {
+        // Buffered: a child answers with an Ack and a Ready together, and
+        // read bare that was four reads where one will do.
+        let mut reader = tokio::io::BufReader::new(reader);
         while let Ok(Some(body)) = read_frame(&mut reader).await {
             if frame_tx.send(body).await.is_err() {
                 return;

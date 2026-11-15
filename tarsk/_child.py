@@ -78,6 +78,12 @@ class Wire:
         async with self.lock:
             await _proto.write(self.writer, tag, *args)
 
+    async def send_frames(self, *frames):
+        """Several frames in one write, so the supervisor wakes once for them."""
+        async with self.lock:
+            self.writer.write(b"".join(_proto.encode(*frame) for frame in frames))
+            await self.writer.drain()
+
     def send_threadsafe(self, loop, tag, *args):
         """Block the calling thread until the frame is out."""
         asyncio.run_coroutine_threadsafe(self.send(tag, *args), loop).result()
@@ -499,14 +505,18 @@ async def main(socket_path: str, app_spec: str, child_id: int, slots: int = 1) -
         finally:
             controls.pop(task_id, None)
         kept = census.count() - before if counted and starts == mine else None
-        await wire.send(*frame, kept)
         if not alive:
+            await wire.send(*frame, kept)
             # Nothing above is awaiting this task, so the exit has to happen
             # here — letting it settle into the task object would leave the
             # process running with the thread it could not interrupt.
             await _die(writer, EXIT_SYNC_TIMEOUT)
-        if not draining:
-            await wire.send("Ready")
+        if draining:
+            await wire.send(*frame, kept)
+        else:
+            # The answer and the offer to take another, together: apart they
+            # were two writes and two wake-ups for every task.
+            await wire.send_frames((*frame, kept), ("Ready",))
 
     while True:
         frame = await _proto.read(reader)

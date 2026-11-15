@@ -875,7 +875,11 @@ impl Broker {
         }
     }
 
-    /// Fetch at most one message per child per read.
+    /// Read ahead by at most one message per child.
+    ///
+    /// This bounds the guess. A caller that can start more than that at once
+    /// says so through `claim_for`, and the read takes what it has room for:
+    /// that is not read-ahead, because none of it waits.
     ///
     /// Sixty-four per read measures the same as four, so this is not chosen for
     /// speed — it is chosen because a claimed message holds a lease whether or

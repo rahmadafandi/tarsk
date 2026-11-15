@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **A worker is no longer held to one broker round trip per job.** Free slots are filled by
+  one claim, a run of successes is acknowledged in one request, and results are stored side
+  by side instead of in a row. With Redis a millisecond away, 2,000 tasks that each wait
+  100ms across two children of a hundred slots took 4.9s and now take 1.08s; a thousand that
+  keep a result took 7.3s through one child and now take 1.08s. Next to a local Redis
+  nothing changes.
+- **With a memory ceiling set, a task costs 101µs to hand out and take back, where it cost
+  170µs.** The child's memory is read from `/proc/<pid>/statm` on Linux rather than through
+  a refresh of everything known about the process.
+- **Postgres prepares each statement once per connection** rather than on every call.
+  Sending 5,000 jobs took 5.2s and takes 3.5s; draining them took 10.2s and takes 5.5s.
+- **The Redis sweep no longer reads every long-running job every second.** Finding out
+  whether a pending entry was overdue took an `XRANGE` each, per worker, per second: 150 jobs
+  in flight were 150 reads a second. An entry's timeout is now read once and remembered.
+- Frames between the supervisor and a child are written in one call, and a child sends its
+  answer and its readiness for the next task together.
+
 ## 0.4.1
 
 ### Fixed

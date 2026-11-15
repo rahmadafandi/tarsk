@@ -424,6 +424,16 @@ in one burst blocked every other Redis command. The mutex is gone and so is the 
 conclusion happened to survive — the cap is still the child count — but the reason given for it
 was wrong.
 
+That cap is on reading *ahead*, and it was once the cap on reading at all, which was a
+different mistake. A child with a hundred slots free was filled one claim at a time, a round
+trip each, and its answers were acked the same way. Against a Redis on the same machine
+nobody could tell. Through a proxy adding a millisecond in each direction, 2,000 tasks that
+each wait 100ms across two children of a hundred slots took 4.9s, and 10.9s at three
+milliseconds, where the arithmetic floor is 1.0s. A read now takes as many as the child has
+room to start at that moment, and a run of successes is acknowledged together: 1.08s and
+1.25s. Tasks that keep a result were worse — 7.3s and 16.9s for a thousand through one child
+— and are 1.08s and 1.24s.
+
 ### Waiting, not working — 500 tasks that each await 100ms
 
 Nothing computes; everything waits, which is what most real task queue work does — call an API,

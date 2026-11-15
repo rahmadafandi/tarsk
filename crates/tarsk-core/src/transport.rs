@@ -107,10 +107,31 @@ mod windows {
 /// and its descendants. Double-counting shared pages errs towards recycling
 /// early, which is the safe direction for a limit. Unix keeps the single cheap
 /// read: nothing there stands between the spawn and the interpreter.
-#[cfg(unix)]
+///
+/// On Linux it is read straight from `/proc/<pid>/statm`. Going through
+/// sysinfo refreshed everything it knows about the process — several files,
+/// parsed — for the one number wanted, and with a ceiling set that is done
+/// once per finished task: 75µs each, against a task round trip of 95.
+#[cfg(target_os = "linux")]
+pub fn child_rss_with(_sys: &mut sysinfo::System, pid: u32) -> Option<u64> {
+    static PAGE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    // "size resident shared text lib data dt", in pages.
+    let statm = std::fs::read_to_string(format!("/proc/{pid}/statm")).ok()?;
+    let resident: u64 = statm.split_ascii_whitespace().nth(1)?.parse().ok()?;
+    // SAFETY: sysconf reads a constant and touches no memory of ours.
+    let page = *PAGE.get_or_init(|| unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(1) as u64);
+    Some(resident * page)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
 pub fn child_rss_with(sys: &mut sysinfo::System, pid: u32) -> Option<u64> {
     let key = sysinfo::Pid::from_u32(pid);
-    sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[key]), false);
+    // Memory and nothing else: the default also refreshes CPU and disk usage.
+    sys.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::Some(&[key]),
+        false,
+        sysinfo::ProcessRefreshKind::nothing().with_memory(),
+    );
     sys.process(key).map(|p| p.memory())
 }
 

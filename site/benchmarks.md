@@ -322,10 +322,17 @@ another 4% in 0.4.0.
 The 0.4.0 part was traced and mostly taken back. Seven commits between the two releases were
 measured side by side, and the step was the one that counts what each task leaves behind:
 `sys.getallocatedblocks()` walks the interpreter's heap rather than reading a counter, and
-it was called twice round every task. With the call removed 0.4.0 drains as fast as 0.3.0
-did; rationed to half a percent of the worker's time, which is what ships after 0.4.0, it
-gives back about three quarters of the loss. The cost also grew with the size of the heap,
-which a no-op benchmark cannot show and an application would have.
+it was called twice round every task. On a laptop pinned to four cores, with the call
+removed 0.4.0 drains as fast as 0.3.0 did, and rationed to half a percent of the worker's
+time — which is what 0.4.1 ships — it gave back about three quarters of the loss.
+
+**The runner does not agree, and the runner is what this page goes by.** 0.4.0 and the commit
+after 0.4.1, side by side there, read 1.709s and 1.707s against 1.718s and 1.703s: nothing
+either way. So 0.4.1 is not faster than 0.4.0 at draining a no-op queue on the machine these
+tables come from, and the 4.6% is still there. What the rationing does remove is a cost that
+grew with the size of the heap — under a microsecond a call in a fresh interpreter, a fifth
+of a millisecond in one holding five million objects — which a no-op benchmark cannot show
+and an application would have.
 
 The 0.3.0 part was not found. Five commits across that release, twenty runs each on four
 pinned cores, read between 1.49s and 1.60s in no order: whatever it is, it is smaller than

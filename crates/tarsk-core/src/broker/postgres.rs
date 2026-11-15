@@ -35,6 +35,13 @@ alter table tarsk_jobs add column if not exists meta       bytea;
 alter table tarsk_jobs add column if not exists expires_ms bigint not null default 0;
 create index if not exists tarsk_jobs_ready on tarsk_jobs (queue, id) where lease_until is null;
 create index if not exists tarsk_jobs_leased on tarsk_jobs (lease_until) where lease_until is not null;
+-- A queue is a table that is nearly all churn: every job is an insert, an
+-- update and a delete, and the rows left behind are what a claim wades
+-- through. The default waits for a fifth of the table to be dead, which on a
+-- table that is mostly empty is either at once or, with a backlog, far too
+-- late. A fixed count keeps what is left behind bounded whatever the backlog.
+alter table tarsk_jobs set (autovacuum_vacuum_scale_factor = 0, autovacuum_vacuum_threshold = 2000,
+                            autovacuum_analyze_scale_factor = 0, autovacuum_analyze_threshold = 5000);
 
 -- The last minute each schedule was fired for. One row a schedule: `tarsk_cron`,
 -- which 0.2 used, held a row per schedule per minute and could only answer
@@ -162,16 +169,26 @@ with picked as (
     -- Priority before age: `--queues high,low` is an ordering. $4 is how many
     -- the caller can start at once, so what is taken is what runs now, and
     -- no batch of the wrong queue is left waiting behind it.
-    select c.id, c.ready_at, q.ord
-      from unnest($1::text[]) with ordinality as q(queue, ord)
+    --
+    -- Both probes have to stay cheap on a table that has been busy, which is
+    -- where they were not. A claimed row leaves a dead entry at the low end
+    -- of the ready index until a vacuum takes it, and a probe that starts at
+    -- the bottom walks every one of them: with 10,000 jobs done since the
+    -- last vacuum a claim read 214 pages to hand out one row. So the first
+    -- probe starts from $5, a little below the highest id this worker has
+    -- already claimed from that queue, and the second walks the lease index
+    -- in lease order, where the entries of finished jobs sit in the future
+    -- until long after a vacuum has had them.
+    select c.id, c.ready_at, q.ord, c.fresh
+      from unnest($1::text[], $5::bigint[]) with ordinality as q(queue, floor, ord)
      cross join lateral (
-           select * from (select id, created_at as ready_at from tarsk_jobs
-                           where queue = q.queue and lease_until is null
+           select * from (select id, created_at as ready_at, true as fresh from tarsk_jobs
+                           where queue = q.queue and lease_until is null and id > q.floor
                            order by id for update skip locked limit $4) fresh
            union all
-           select * from (select id, lease_until as ready_at from tarsk_jobs
+           select * from (select id, lease_until as ready_at, false as fresh from tarsk_jobs
                            where queue = q.queue and lease_until < now()
-                           order by id for update skip locked limit $4) due
+                           order by lease_until for update skip locked limit $4) due
            ) c
      order by q.ord, c.id
      limit $4
@@ -184,8 +201,22 @@ update tarsk_jobs set
 from picked, (select set_config('synchronous_commit', 'off', true)) relaxed
 where tarsk_jobs.id = picked.id
 returning tarsk_jobs.id, name, payload, attempt, run_lease, job_id, picked.ready_at,
-          chain, meta, expires_ms, picked.ord, timeout_ms
+          chain, meta, expires_ms, picked.ord, timeout_ms, picked.fresh, tarsk_jobs.queue
 ";
+
+/// How far below the highest id it has claimed a worker still looks.
+///
+/// Ids are handed out in order and committed in whatever order the inserts
+/// finish, so a row can appear just below one already claimed. This many ids
+/// of slack covers that; anything older is found by the full look below.
+const FLOOR_SLACK: i64 = 1024;
+
+/// How often a claim looks from the very bottom regardless.
+///
+/// A row handed back with no delay keeps its old id and is below every floor.
+/// So is anything the slack did not cover. This is how long such a row can
+/// wait while newer ones are taken ahead of it.
+const FULL_LOOK: Duration = Duration::from_secs(1);
 
 /// Why a claim and an ack do not wait for the disk.
 ///
@@ -306,6 +337,9 @@ pub struct PgBroker {
     /// the calls that follow: each with when it was claimed and how long its
     /// lease runs, so one that waited too long is left for the sweep.
     claimed: Mutex<VecDeque<(Delivery, std::time::Instant, u64)>>,
+    /// The highest id claimed fresh from each queue, and when a claim last
+    /// looked from the bottom. See `PG_CLAIM`.
+    floors: Mutex<(HashMap<String, i64>, std::time::Instant)>,
     stores: AtomicU64,
     /// The same identity Redis gets for free from its consumer group. Postgres
     /// has no equivalent, so a claim writes it down.
@@ -374,6 +408,7 @@ impl PgBroker {
             wake: Arc::default(),
             held: Mutex::new(std::collections::HashSet::new()),
             claimed: Mutex::new(VecDeque::new()),
+            floors: Mutex::new((HashMap::new(), std::time::Instant::now())),
             queues,
             stores: AtomicU64::new(0),
         })
@@ -597,7 +632,13 @@ impl PgBroker {
                 .await?
                 .query(
                     PG_CLAIM,
-                    &[&queues, &grace.as_secs_f64(), &self.consumer, &room],
+                    &[
+                        &queues,
+                        &grace.as_secs_f64(),
+                        &self.consumer,
+                        &room,
+                        &self.floors_for(&queues),
+                    ],
                 )
                 .await?;
             // RETURNING promises no order, and the order is the priority.
@@ -609,6 +650,11 @@ impl PgBroker {
                 let run_lease: i64 = row.get(4);
                 let ready: std::time::SystemTime = row.get(6);
                 let lease_ms = row.get::<_, i32>(11).max(1) as u64;
+                if row.get::<_, bool>(12) {
+                    let mut floors = self.floors.lock().unwrap();
+                    let top = floors.0.entry(row.get(13)).or_insert(0);
+                    *top = (*top).max(row.get::<_, i64>(0));
+                }
                 let delivery = Delivery {
                     id: row.get(5),
                     name: row.get(1),
@@ -681,6 +727,25 @@ impl PgBroker {
             )
             .await?;
         Ok(())
+    }
+
+    /// Where each queue's first probe starts: just below the highest id this
+    /// worker has claimed from it, or the bottom when a full look is due.
+    fn floors_for(&self, queues: &[String]) -> Vec<i64> {
+        let mut floors = self.floors.lock().unwrap();
+        if floors.1.elapsed() >= FULL_LOOK {
+            floors.1 = std::time::Instant::now();
+            return vec![0; queues.len()];
+        }
+        queues
+            .iter()
+            .map(|queue| {
+                floors
+                    .0
+                    .get(queue)
+                    .map_or(0, |top| (top - FLOOR_SLACK).max(0))
+            })
+            .collect()
     }
 
     /// `ack` for many rows, as one statement and one commit.

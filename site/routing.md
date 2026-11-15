@@ -96,6 +96,15 @@ have to write handlers for. A job sent, a result, and a dead letter still wait f
 because those are the ones that would be lost and not repeated. It is half of what a job
 costs on Postgres.
 
+**A Postgres queue is a table that is nearly all churn**, and two things keep that from
+showing. A claim does not start from the bottom of the table: it starts just below the
+highest id the worker has already taken, so the dead rows finished jobs leave behind are not
+walked on every claim, and once a second it looks from the bottom anyway for anything handed
+back with no delay. And `tarsk_jobs` asks for a vacuum after 2,000 dead rows instead of the
+default fifth of the table, set as a storage parameter on that one table when the schema is
+created. If your Postgres runs with autovacuum off, vacuum `tarsk_jobs` yourself; the queue
+keeps its speed either way, and the table keeps its size only if something does.
+
 Both speak TLS, which every managed instance requires. `rediss://` for Redis, and for Postgres
 whatever `sslmode` says — `require`, `verify-ca` and `verify-full` all verify the chain and the
 hostname, since rustls does that on every handshake. The last two are spellings tokio-postgres

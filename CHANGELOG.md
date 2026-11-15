@@ -22,6 +22,14 @@
   sent, a result and a dead letter still wait. Postgres also claims as many rows as there
   are free slots in one statement and acknowledges a run of successes in one: 2,000 tasks
   that each wait 100ms across two children of a hundred slots took 2.2s and take 0.98s.
+- **A Postgres queue no longer slows down as it is used.** Every finished job leaves dead
+  rows behind until a vacuum takes them, and a claim walked all of them: three drains of
+  5,000 jobs in a row took 4.4s, 7.2s and 9.3s, and a claim read 214 pages to hand out one
+  row. A claim now starts just below the highest id the worker has already taken and finds
+  lapsed leases through their index: 13 pages, and four drains in a row with autovacuum
+  switched off altogether took 4.6s, 4.1s, 3.9s and 4.2s. The table also asks to be
+  vacuumed after 2,000 dead rows rather than a fifth of itself. One thing this costs: a job
+  handed back with no delay keeps its old id, and can wait up to a second behind newer ones.
 - **`max_tasks` is held closer with several slots.** A child with eight slots and a limit of
   five ran about twelve tasks before it was replaced, and now runs about ten.
 - **The Redis sweep no longer reads every long-running job every second.** Finding out

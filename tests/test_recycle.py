@@ -8,6 +8,7 @@ Run: python tests/test_recycle.py
 
 import os
 import sys
+import time
 from pathlib import Path
 from unittest import SkipTest
 
@@ -108,6 +109,25 @@ def test_a_task_is_not_charged_for_its_neighbour():
     alone = Supervisor("tests.leaky_app:app", children=1, slots=2)
     alone.run([("hoard", (20_000,), {})])
     assert alone.stats["kept_objects:hoard"] >= 20_000, alone.stats
+
+
+def test_counting_objects_stays_within_its_budget():
+    """The count walks the heap, so it is rationed rather than taken every run."""
+    from tarsk._child import _Census
+
+    census = _Census()
+    assert census.affordable(), "a fresh child could not afford its first count"
+    before = census.credit
+    census.count()
+    assert census.credit < before, "a count cost nothing"
+
+    # As after one count of a very large heap: nothing more until it is earned
+    # back, and it is earned back at SHARE of the clock.
+    census.credit = -census.SHARE * 0.05
+    assert not census.affordable(), "counted again while in debt"
+    time.sleep(0.1)
+    assert census.affordable(), "0.1s did not earn back 0.05s worth of credit"
+    assert census.credit <= census.CAP
 
 
 def test_recycling_is_overlapped():
@@ -476,6 +496,7 @@ if __name__ == "__main__":
                   test_a_recycled_child_loses_no_acks,
                   test_baseline_above_ceiling_is_refused,
                   test_a_task_is_not_charged_for_its_neighbour,
+                  test_counting_objects_stays_within_its_budget,
                   test_hard_ceiling_kills_and_dead_letters,
                   test_hard_ceiling_holds_past_the_soft_one,
                   test_a_provider_cleans_up_after_its_yield,

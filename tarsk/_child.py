@@ -13,6 +13,7 @@ import inspect
 import os
 import signal
 import sys
+import time
 import traceback
 from typing import Callable
 
@@ -25,6 +26,40 @@ EXIT_SYNC_TIMEOUT = 75
 # A start hook raised. Distinct so the supervisor can say so rather than
 # reporting a child that simply never showed up.
 EXIT_STARTUP_FAILED = 78
+
+
+class _Census:
+    """Counts the interpreter's live objects, on a budget of its own time.
+
+    `sys.getallocatedblocks()` reads like a counter and is a walk of the heap:
+    under a microsecond in a fresh interpreter, a fifth of a millisecond in
+    one holding five million objects. Taken twice round every task it was 4%
+    of a no-op's throughput, and with no upper bound for an app with a large
+    heap — a cost that grew with exactly the thing it was there to find.
+
+    So counting earns its time at `SHARE` of the clock, saved up to `CAP`, and
+    a run it cannot afford is not counted. What a task keeps is an average
+    over runs, and survives being sampled.
+    """
+
+    SHARE = 0.005
+    CAP = 0.005  # seconds: what a second of running earns
+
+    def __init__(self) -> None:
+        self.credit = self.CAP
+        self.last = time.perf_counter()
+
+    def affordable(self) -> bool:
+        now = time.perf_counter()
+        self.credit = min(self.CAP, self.credit + self.SHARE * (now - self.last))
+        self.last = now
+        return self.credit > 0
+
+    def count(self) -> int:
+        began = time.perf_counter()
+        blocks = sys.getallocatedblocks()
+        self.credit -= time.perf_counter() - began
+        return blocks
 
 
 class Wire:
@@ -420,6 +455,7 @@ async def main(socket_path: str, app_spec: str, child_id: int, slots: int = 1) -
     draining = False
     leaving = False
     starts = 0
+    census = _Census()
 
     # A terminal's ctrl-C and systemd's default stop both signal the whole
     # process group, children included. The supervisor is the one that decides
@@ -446,7 +482,7 @@ async def main(socket_path: str, app_spec: str, child_id: int, slots: int = 1) -
         # task leaves behind is what it leaked, and unlike the process's size
         # this is not fooled by the allocator handing one task's freed memory
         # to the next: a block is counted where it is kept, not where the
-        # process happened to grow. Two calls that read a counter.
+        # process happened to grow. Counting is not free; see `_Census`.
         #
         # The counter is the whole process's, so it only says something about
         # this task if no other ran beside it: with several slots busy, one
@@ -454,15 +490,15 @@ async def main(socket_path: str, app_spec: str, child_id: int, slots: int = 1) -
         nonlocal starts
         starts += 1
         mine = starts
-        alone = len(controls) == 1
-        before = sys.getallocatedblocks()
+        counted = len(controls) == 1 and census.affordable()
+        before = census.count() if counted else 0
         control = controls[task_id]
         try:
             frame, alive = await _one(app, wire, app_spec, task_id, name, payload, meta,
                                       attempt, job_id, control)
         finally:
             controls.pop(task_id, None)
-        kept = sys.getallocatedblocks() - before if alone and starts == mine else None
+        kept = census.count() - before if counted and starts == mine else None
         await wire.send(*frame, kept)
         if not alive:
             # Nothing above is awaiting this task, so the exit has to happen

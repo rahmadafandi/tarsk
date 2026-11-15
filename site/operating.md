@@ -84,7 +84,9 @@ one taking turns, the tidy one was charged 40 MB of growth and the leak 16 — a
 Both are exact with `--slots 1`. Above that, growth is shared between tasks that overlap:
 good for ranking, not for accounting. Objects kept stays exact, because a run that had
 company in its worker is not counted at all — so under steady load with many slots it is
-measured rarely, and a worker run with `--slots 1` for a while is how to get an answer. Objects are a count, not a size, so a task that leaks
+measured rarely, and a worker run with `--slots 1` for a while is how to get an answer.
+Counting walks the interpreter's heap, so it is also rationed to half a percent of the
+worker's time: with a very large heap, or very short tasks, some runs go uncounted. Objects are a count, not a size, so a task that leaks
 one enormous buffer scores low on it and high on growth.
 
 ## Stopping a worker

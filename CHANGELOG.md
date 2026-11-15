@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **Counting what a task kept no longer costs more as the worker grows.** The count walks
+  the interpreter's heap: 4% of a no-op's throughput in 0.4.0, and without a bound for an
+  app holding millions of objects. It is now rationed to half a percent of the worker's
+  time, and a run it cannot afford is not counted.
+
 ## 0.4.0
 
 ### Upgrading from 0.3

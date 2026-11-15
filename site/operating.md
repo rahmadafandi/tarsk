@@ -80,8 +80,10 @@ so a leak is paid for by whoever allocates after it. Measured with a leaking tas
 one taking turns, the tidy one was charged 40 MB of growth and the leak 16 — and the leak kept
 738 objects to the tidy task's 42.
 
-Both are exact with `--slots 1`. Above that, tasks that overlap are in each other's numbers:
-good for ranking, not for accounting. Objects are a count, not a size, so a task that leaks
+Both are exact with `--slots 1`. Above that, growth is shared between tasks that overlap:
+good for ranking, not for accounting. Objects kept stays exact, because a run that had
+company in its worker is not counted at all — so under steady load with many slots it is
+measured rarely, and a worker run with `--slots 1` for a while is how to get an answer. Objects are a count, not a size, so a task that leaks
 one enormous buffer scores low on it and high on growth.
 
 ## Stopping a worker

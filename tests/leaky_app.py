@@ -35,6 +35,28 @@ def leak(megabytes):
     return [os.getpid(), _peak_rss()]
 
 
+_hoard: list[object] = []
+
+
+@app.task(name="hoard")
+async def hoard(count):
+    """Keeps `count` small objects, while something else is running."""
+    import asyncio
+
+    await asyncio.sleep(0.3)
+    _hoard.extend(object() for _ in range(count))
+    return count
+
+
+@app.task(name="bystander")
+async def bystander():
+    """Keeps nothing, and is still running when `hoard` does its keeping."""
+    import asyncio
+
+    await asyncio.sleep(1.0)
+    return 0
+
+
 @app.task(name="tidy")
 def tidy(megabytes):
     """The same allocation, given back: what a task that does not leak looks like."""

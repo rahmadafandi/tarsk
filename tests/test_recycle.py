@@ -91,6 +91,25 @@ def test_growth_is_charged_to_the_task_that_caused_it():
     assert grown >= 24 * MB, f"48 MB was leaked and {grown / MB:.1f} MB of growth was seen"
 
 
+def test_a_task_is_not_charged_for_its_neighbour():
+    """Two slots, and a task that keeps nothing running beside one that hoards.
+
+    The count is the whole process's, so the bystander used to be charged the
+    twenty thousand objects kept while it waited. A run that had company now
+    reports nothing, and one that ran alone still does.
+    """
+    sup = Supervisor("tests.leaky_app:app", children=1, slots=2)
+    results = sup.run([("bystander", (), {}), ("hoard", (20_000,), {})])
+    assert all(kind == "ack" for kind, _ in results.values()), results
+    for name in ("bystander", "hoard"):
+        kept = sup.stats.get(f"kept_objects:{name}", 0)
+        assert kept < 1_000, f"{name} ran beside another task and was charged {kept} objects"
+
+    alone = Supervisor("tests.leaky_app:app", children=1, slots=2)
+    alone.run([("hoard", (20_000,), {})])
+    assert alone.stats["kept_objects:hoard"] >= 20_000, alone.stats
+
+
 def test_recycling_is_overlapped():
     """Every recycle should hand over to a child that is already running.
 
@@ -456,6 +475,7 @@ if __name__ == "__main__":
                   test_recycling_is_overlapped,
                   test_a_recycled_child_loses_no_acks,
                   test_baseline_above_ceiling_is_refused,
+                  test_a_task_is_not_charged_for_its_neighbour,
                   test_hard_ceiling_kills_and_dead_letters,
                   test_hard_ceiling_holds_past_the_soft_one,
                   test_a_provider_cleans_up_after_its_yield,

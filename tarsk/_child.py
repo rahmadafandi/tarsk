@@ -419,6 +419,7 @@ async def main(socket_path: str, app_spec: str, child_id: int, slots: int = 1) -
     draining = False
     leaving = False
 
+    starts = 0
     # A terminal's ctrl-C and systemd's default stop both signal the whole
     # process group, children included. The supervisor is the one that decides
     # when a child stops — it sends Drain and waits for in-flight work — so a
@@ -446,13 +447,22 @@ async def main(socket_path: str, app_spec: str, child_id: int, slots: int = 1) -
         # to the next: a block is counted where it is kept, not where the
         # process happened to grow. Two calls that read a counter.
         before = sys.getallocatedblocks()
+        #
+        # The counter is the whole process's, so it only says something about
+        # this task if no other ran beside it: with several slots busy, one
+        # task's garbage would be another's leak. Such a run reports nothing.
+        nonlocal starts
+        starts += 1
+        mine = starts
+        alone = len(controls) == 1
         control = controls[task_id]
         try:
             frame, alive = await _one(app, wire, app_spec, task_id, name, payload, meta,
                                       attempt, job_id, control)
         finally:
             controls.pop(task_id, None)
-        await wire.send(*frame, sys.getallocatedblocks() - before)
+        kept = sys.getallocatedblocks() - before if alone and starts == mine else None
+        await wire.send(*frame, kept)
         if not alive:
             # Nothing above is awaiting this task, so the exit has to happen
             # here — letting it settle into the task object would leave the

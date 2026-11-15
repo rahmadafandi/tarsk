@@ -55,6 +55,9 @@ jobs:
           # packaging: kombu's Redis transport imports it and does not ask for it.
           .venv/bin/pip install -q maturin celery taskiq taskiq-redis redis packaging
           .venv/bin/maturin develop --release -F redis
+          # What was measured against: the results page names these.
+          .venv/bin/pip freeze | grep -iE "^(celery|kombu|taskiq|taskiq-redis|redis)=="
+          redis-server --version
 
       - name: Run the benchmark
         # pipefail: through `tee` alone, a harness that crashed was a green run

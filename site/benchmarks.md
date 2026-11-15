@@ -60,8 +60,9 @@ taskiq 0.12.4, Redis 8.10.0. One worker process, concurrency 1 throughout. Singl
 these are not medians, and anything inside ~10% of another number should be read as a tie.
 
 The tables were last measured on 2026-11-15, at the commit after 0.3.0, on the same runner type
-as the run before them, three months and two releases earlier. Where a figure moved enough to
-change what a paragraph says, the paragraph says so. The versions named above are that earlier
+as the run before them, three months and two releases earlier. Two figures moved enough to
+change what a paragraph says, and both were then traced by measuring four releases side by
+side on one machine: see the bounded memory and drain sections. The versions named above are that earlier
 run's: this one installed the current release of each and did not record which.
 
 **These runners had two cores until recently and now have four.** Every absolute number below
@@ -198,11 +199,16 @@ is about the machine's speed while it was measured and says nothing against an R
 what a task costs and refuses to fill a slot the ceiling cannot afford, so a hundred slots and
 one slot stop in the same place.
 
-The run before this one read 123MB in the hundred-slot row, and this page explained it: more
-concurrency climbs faster between two readings, so the projection meets the ceiling sooner and
-the bound comes out tighter. That explanation is withdrawn along with the number. One run said
-123 and the next said 183, and a mechanism fitted to a single reading is the mistake the drain
-section below has already had to own three times.
+The run before this one read 123MB in the hundred-slot row, and this page explained it as a
+feature: more concurrency climbs faster between two readings, so the bound comes out tighter.
+It was a miscount. The supervisor divided a child's growth by the tasks that had *finished*,
+so with many in flight each looked several times its size and the child was retired early.
+0.2.0 counts the ones in flight as well, and the row has read 183MB since — the same as one
+slot, which is what a ceiling that measures correctly should give.
+
+That is established rather than supposed: 0.1.0 and the three releases after it were built
+and measured in turn on one runner, twice over. 0.1.0 read 123MB both times and every later
+version 183MB both times. `--refs` on the bench workflow is how to repeat it.
 
 **This table used to read 824MB in that row**, against 841MB for no recycling whatsoever — the
 ceiling barely bound at all above one slot. A child advertises every slot at once, so a hundred
@@ -289,16 +295,39 @@ same handler. tarsk is the faster one at ten thousand, 1.21s against 1.79s, and 
 five runs do not overlap: tarsk's slowest is 1.224s, taskiq's fastest 1.770s. That is **1.48×**,
 well outside the ~10% tie rule at the top of this page.
 
-**It is also the third ratio this runner type has given, and this page is not calling it.**
-The two runs before it read 1.06× and 1.04×, and the paragraph that stood here said so and
-concluded that at four cores these two brokers drain a no-op queue at the same speed. Before
-those, a two-core runner read 1.45×, which this page claimed and then retracted. A 16-core
-laptop read 1.1×, across four runs ranging 1.03× to 1.18×.
+**Two runs on two machines could not say whether that was the code or the runner, so four
+versions were measured on one.** Each release was built in its own worktree and ran its own
+harness, in turn, twice over, on a single four-core runner. Median seconds to drain ten
+thousand, and taskiq's stream broker beside it as the control:
 
-Something may well have changed: three months and two tarsk releases separate this run from
-the last, and nobody has rebuilt the old commits beside the new one to find out which. Until
-that is done, or a second run agrees, 1.48× is a reading. What has held in every run on every
-machine is the direction, and the 10, 100 and startup columns.
+| tarsk | round 1 | round 2 | taskiq, same rounds | ratio |
+|---|---|---|---|---|
+| 0.1.0 | 2.238 | 2.234 | 2.611 / 2.604 | 1.17× |
+| 0.2.1 | 1.560 | 1.564 | 2.610 / 2.595 | 1.67× |
+| 0.3.0 | 1.656 | 1.650 | 2.586 / 2.565 | 1.56× |
+| 0.4.0 | 1.714 | 1.719 | 2.596 / 2.593 | 1.51× |
+
+taskiq did not move, which is what a control is for, and each version repeated itself to
+within half a percent. So the change is tarsk's, and it happened between 0.1.0 and 0.2.1: draining a
+no-op queue got 30% quicker. The likeliest cause is that 0.2.0 took settling a finished job
+off the loop that reads a child's frames, where each one used to wait on a broker round
+trip; the releases were not bisected, so that is the candidate and not the finding. Either
+way it is the difference between the 1.04× this section used to report and the 1.48× above —
+the earlier figure was 0.1.0's.
+
+**Two things this table says against tarsk.** It has got slower twice since: 6% in 0.3.0 and
+another 4% in 0.4.0. Both releases added work to every dispatch — cancellation that reaches
+a running job, pausing, per-task accounting — and which of it costs what has not been
+measured. And 0.1.0 reads 1.17× here where the
+published runs of the same code read 1.06× and 1.04×, so the ratio still moves between
+machines of the same type by more than the tie rule allows. On a 16-core laptop it read 1.1×.
+
+What can be said, then: on this runner tarsk drains a no-op queue about half again as fast
+as taskiq's acked broker, repeatably, and the lead arrived with a known release. It is still a no-op handler on
+one kind of machine, and still not what this project claims.
+
+**This page claimed 1.45× here once, from a two-core runner, and retracted it** when four-core
+runners read 1.06× and 1.04×. Neither the claim nor the retraction had a control beside it.
 
 Those two four-core runs are worth reading against each other. Every absolute figure in the
 second is about 25% slower than the first — 9.99s against 7.76s for Celery, 2.27s against 1.78s
@@ -480,7 +509,7 @@ two-core runner and none of them survived it being replaced.
 
 What did travel is the I/O row's ordering — 0.12s against 0.15s here, 0.13s against 0.20s on
 the laptop — and every memory figure on the page but one, the hundred-slot row of the bounded
-memory table. That is the shape of it: the footprint claims are
+memory table, which moved because 0.2.0 fixed how it was counted. That is the shape of it: the footprint claims are
 properties of the software, and the speed claims were properties of a machine. Compare rows
 within a table, do not carry a ratio across, and treat any ordering here as provisional until
 it has held on a machine that was not the one it was found on.

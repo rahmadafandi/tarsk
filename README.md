@@ -99,11 +99,12 @@ trigger fires and the slot never goes empty.
 
 ## What it does not claim
 
-**Not faster.** With a 50 ms handler tarsk, Celery and taskiq all reach 20 tasks/s. Draining
-10,000 no-op tasks across four processes: Celery 7.3s, taskiq 1.8s, tarsk 1.2s on the latest
-run — and 4% apart on the run before it, on the same kind of machine. Ahead in every run, by an
-amount that has not held still, so it is not claimed. It starts in half the time and runs in
-half the memory; that is the claim, and speed is not.
+**Not faster.** With a 50 ms handler tarsk, Celery and taskiq all reach 20 tasks/s, and that is
+the row that matters. Draining 10,000 no-op tasks across four processes, measured side by side
+on one machine: Celery 10.8s, taskiq 2.6s, tarsk 1.7s. That lead is repeatable there, and it is
+still a no-op handler on one kind of machine — on a 16-core laptop the same
+pair are 10% apart. It starts in half the time and runs in half the memory; that is the claim,
+and speed is not.
 
 This file claimed a 1.45× lead until the numbers were checked on more than one machine. The full
 retraction, and every column where tarsk loses, is in

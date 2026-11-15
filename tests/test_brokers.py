@@ -1769,21 +1769,27 @@ def _b45_a_running_job_can_be_stopped(url, label, skip, app, env, log, producer)
     before = count_dead(url)
     waiting = app.registry["stoppable"].send("halfway")
     blocking = app.registry["medium"].send("sync-runs-on")
+    looking = app.registry["stoppable_sync"].send("thread")
     worker = start_worker(env, TARSK_SLOTS=4, TARSK_LEASE_GRACE=1)
     try:
-        wait_for(log, {"halfway-start"}, timeout=60)
+        wait_for(log, {"halfway-start", "thread-start"}, timeout=60)
         app.cancel(waiting, interrupt=True)
         app.cancel(blocking, interrupt=True)
-        seen = wait_for(log, {"halfway-stopped-True"}, timeout=15)
+        app.cancel(looking, interrupt=True)
+        seen = wait_for(log, {"halfway-stopped-True", "thread-saw-it"}, timeout=15)
         assert "halfway-stopped-True" in seen, \
             f"{label}: the running job was not interrupted, or was not told why: {seen}"
-        try:
-            app.result(waiting).get(timeout=15)
-        except TaskFailed as why:
-            assert why.error_type == "Cancelled", why.error_type
-        else:
-            raise AssertionError(f"{label}: an interrupted job reported a result")
-        # A thread cannot be interrupted: the sync handler finishes its work.
+        # A thread cannot be interrupted, but it can be told.
+        assert "thread-saw-it" in seen, \
+            f"{label}: a sync handler was never told it had been cancelled: {seen}"
+        for stopped in (waiting, looking):
+            try:
+                app.result(stopped).get(timeout=15)
+            except TaskFailed as why:
+                assert why.error_type == "Cancelled", why.error_type
+            else:
+                raise AssertionError(f"{label}: an interrupted job reported a result")
+        # One that never looks finishes its work.
         seen = wait_for(log, {"sync-runs-on"}, timeout=30)
         assert "sync-runs-on" in seen, f"{label}: a sync handler was cut off: {seen}"
         time.sleep(1.5)
@@ -1792,6 +1798,8 @@ def _b45_a_running_job_can_be_stopped(url, label, skip, app, env, log, producer)
     seen = tags_in(log)
     # It had two retries to spend and spent none: cancelled is not failed.
     assert seen.count("halfway-start") == 1, f"{label}: a cancelled job was retried: {seen}"
+    assert seen.count("thread-start") == 1, f"{label}: a cancelled job was retried: {seen}"
+    assert "thread-end" not in seen, f"{label}: {seen}"
     assert "halfway-end" not in seen, f"{label}: {seen}"
     assert count_dead(url) == before, \
         f"{label}: a cancelled job was left in the dead letters for a replay to revive"

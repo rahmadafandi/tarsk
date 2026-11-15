@@ -16,7 +16,7 @@ import sys
 import traceback
 from typing import Callable
 
-from . import Context, Reject, Retry, SoftTimeout, Task, _finish, load_app
+from . import Cancelled, Context, Reject, Retry, SoftTimeout, Task, _finish, load_app
 from . import _proto
 
 # Distinct exit code so the supervisor can tell "recycled after a sync timeout"
@@ -82,15 +82,16 @@ async def _call(app, task: Task, ctx: Context, args: list, kwargs: dict,
             chain = functools.partial(_layer, middleware, ctx, chain)
     hard = task.spec.timeout_ms / 1000
     soft = task.spec.soft_timeout_ms / 1000
-    return await _both_deadlines(chain, ctx, soft, hard, control if task.is_async else None)
+    return await _both_deadlines(chain, ctx, soft, hard, control, task.is_async)
 
 
 class _Control:
     """How a job that is running can be reached from outside it.
 
-    `stop` is filled in once the work has started, and cancels it. Only async
-    handlers get one: a thread cannot be interrupted, so for a sync handler
-    there is nothing a `stop` could do.
+    `stop` is filled in once the work has started. It cancels an async
+    handler where it waits. A sync handler runs in a thread nothing can
+    interrupt, so it is only told: `ctx.cancelled` turns true, and stopping is
+    up to the handler.
     """
 
     __slots__ = ("stop", "asked")
@@ -109,10 +110,6 @@ class _Control:
             self.asked = True
 
 
-class _Cancelled(Exception):
-    """The job was cancelled while it ran, on the caller's say-so."""
-
-
 class _Deadline(Exception):
     """The task's own `timeout` ran out.
 
@@ -125,7 +122,7 @@ class _Deadline(Exception):
 
 
 async def _both_deadlines(chain, ctx: Context, soft: float, hard: float,
-                          control: "_Control | None" = None):
+                          control: "_Control | None" = None, interruptible: bool = True):
     """Run the work under its deadlines, and report which one stopped it.
 
     `soft` is zero for a task that set none, and then only the hard one is
@@ -178,9 +175,13 @@ async def _both_deadlines(chain, ctx: Context, soft: float, hard: float,
         # already read why.
         nonlocal fired
         if not fired:
-            fired = "cancel"
             object.__setattr__(ctx, "cancelled", True)
-            running.cancel()
+            # Cancelling the wait on a thread would report the job stopped
+            # while its handler ran on, so a sync handler is left to read the
+            # flag and raise `Cancelled` itself.
+            if interruptible:
+                fired = "cancel"
+                running.cancel()
 
     if control is not None:
         control.stop = stop
@@ -202,7 +203,7 @@ async def _both_deadlines(chain, ctx: Context, soft: float, hard: float,
         if fired == "soft":
             raise SoftTimeout(f"exceeded soft_timeout of {soft}s") from None
         if fired == "cancel":
-            raise _Cancelled("cancelled while running") from None
+            raise Cancelled("cancelled while running") from None
         raise  # the worker is going down, not a deadline
     finally:
         for timer in timers:
@@ -335,10 +336,10 @@ async def _one(app, wire: Wire, app_spec: str, task_id: int, name: str, payload,
             _emit=emit,
         )
         result = await _call(app, task, ctx, call_args, call_kwargs, control)
-    except _Cancelled as exc:
+    except Cancelled as exc:
         # Settled and dropped: not retried, and not parked where a replay
         # would bring back something its caller asked to be rid of.
-        return ("Nack", task_id, "Cancelled", str(exc), "drop", 0), True
+        return ("Nack", task_id, "Cancelled", str(exc) or "cancelled while running", "drop", 0), True
     except SoftTimeout as exc:
         # Its own outcome rather than folded into TimeoutError: the two say
         # different things about the handler. This one was asked and stopped
@@ -418,8 +419,8 @@ async def main(socket_path: str, app_spec: str, child_id: int, slots: int = 1) -
     controls: dict[int, _Control] = {}
     draining = False
     leaving = False
-
     starts = 0
+
     # A terminal's ctrl-C and systemd's default stop both signal the whole
     # process group, children included. The supervisor is the one that decides
     # when a child stops — it sends Drain and waits for in-flight work — so a
@@ -446,7 +447,6 @@ async def main(socket_path: str, app_spec: str, child_id: int, slots: int = 1) -
         # this is not fooled by the allocator handing one task's freed memory
         # to the next: a block is counted where it is kept, not where the
         # process happened to grow. Two calls that read a counter.
-        before = sys.getallocatedblocks()
         #
         # The counter is the whole process's, so it only says something about
         # this task if no other ran beside it: with several slots busy, one
@@ -455,6 +455,7 @@ async def main(socket_path: str, app_spec: str, child_id: int, slots: int = 1) -
         starts += 1
         mine = starts
         alone = len(controls) == 1
+        before = sys.getallocatedblocks()
         control = controls[task_id]
         try:
             frame, alive = await _one(app, wire, app_spec, task_id, name, payload, meta,
@@ -480,9 +481,9 @@ async def main(socket_path: str, app_spec: str, child_id: int, slots: int = 1) -
             draining = True
             break
         if tag == "Cancel":
-            # For a job that has already finished, or a sync handler, there is
-            # nothing to stop and nothing to say: the supervisor learns how it
-            # ended from the frame that reports it.
+            # For a job that has already finished there is nothing to stop and
+            # nothing to say: the supervisor learns how it ended from the
+            # frame that reports it.
             control = controls.get(args[0])
             if control is not None:
                 control.cancel()

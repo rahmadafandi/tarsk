@@ -299,6 +299,21 @@ async def stoppable(tag, ctx=Depends(Context)):
     return tag
 
 
+@app.task(name="stoppable_sync", result_ttl=60, retries=2)
+def stoppable_sync(tag, ctx=Depends(Context)):
+    """A thread nothing can interrupt, that looks up between steps."""
+    from tarsk import Cancelled
+
+    _log(f"{tag}-start")
+    for _ in range(250):
+        if ctx.cancelled:
+            _log(f"{tag}-saw-it")
+            raise Cancelled
+        time.sleep(0.1)
+    _log(f"{tag}-end")
+    return tag
+
+
 @app.task(name="adds_up", result_ttl=60)
 def adds_up(numbers, extra=0):
     """A chord's callback: handed what every member returned."""

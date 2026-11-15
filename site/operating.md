@@ -39,7 +39,8 @@ half-happened is worse than one that admits it finished.
 it sees `asyncio.CancelledError` with `ctx.cancelled` set, which is what tells this from a
 deadline or a worker shutting down, and whatever it had already done stays done — so it is for
 work that can be abandoned halfway. A sync handler runs in a thread, which cannot be
-interrupted, and finishes regardless.
+interrupted, so it is told instead: `ctx.cancelled` turns true, and a handler that checks it
+between steps stops by raising `tarsk.Cancelled`. One that never looks finishes regardless.
 
 A cancelled job is settled and gone, started or not: not retried, and not left in the dead
 letters where a replay would bring back something its caller asked to be rid of. If it keeps a

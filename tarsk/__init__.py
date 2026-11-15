@@ -23,7 +23,7 @@ P = ParamSpec("P")
 R = TypeVar("R")
 
 __all__ = [
-    "App", "AsyncResult", "BrokerError", "Chain", "Chord", "Context", "Depends", "Group",
+    "App", "AsyncResult", "BrokerError", "Cancelled", "Chain", "Chord", "Context", "Depends", "Group",
     "Signature", "Task", "TaskFailed", "TaskSpec", "Reject", "Retry", "SoftTimeout",
     "chain", "chord", "group", "load_app",
 ]
@@ -154,7 +154,8 @@ class Context:
     soft_expired: bool = False
     #: True once the job has been cancelled while running, with
     #: `app.cancel(task_id, interrupt=True)`. Like `soft_expired`, it is what
-    #: tells this cancellation from a deadline or a worker shutting down.
+    #: tells this cancellation from a deadline or a worker shutting down. A
+    #: sync handler is not interrupted, and polls this to stop: see `Cancelled`.
     cancelled: bool = False
     #: Set by the worker. Sends progress to the supervisor, which is the only
     #: process here holding a broker connection (spec §4.1).
@@ -664,7 +665,8 @@ class App:
         is waiting: it sees `asyncio.CancelledError` with `ctx.cancelled` set,
         and what it had already done stays done, so this is for work that can
         be abandoned halfway. A sync handler runs in a thread that cannot be
-        interrupted and finishes regardless. Either way the job is not
+        interrupted: it sees `ctx.cancelled` turn true, and stops by raising
+        `Cancelled` if it chooses to look. A job stopped either way is not
         retried and not dead-lettered; a result, if it keeps one, says
         `Cancelled`.
 
@@ -985,6 +987,22 @@ class SoftTimeout(Exception):
     This type is what the supervisor and the dead-letter store see, so a job
     that ran too long is distinguishable from one stopped at `timeout` without
     ever being asked.
+    """
+
+
+class Cancelled(Exception):
+    """How a job stopped by `app.cancel(task_id, interrupt=True)` is reported.
+
+    An async handler never raises it: the worker cancels it where it waits. A
+    sync handler runs in a thread nothing can interrupt, so it is told through
+    `ctx.cancelled` and stops by raising this:
+
+        for row in rows:
+            if ctx.cancelled:
+                raise Cancelled
+            ...
+
+    Either way the job is settled and gone: not retried, not dead-lettered.
     """
 
 

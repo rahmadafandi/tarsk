@@ -13,7 +13,9 @@
   them or none. A batch holding a job the broker cannot take is refused whole on every
   backend. Groups and chords are sent this way.
 - **Cancelling a job that is already running.** `app.cancel(task_id, interrupt=True)`
-  cancels an async handler where it is waiting, with `ctx.cancelled` set.
+  cancels an async handler where it is waiting, with `ctx.cancelled` set. A sync handler
+  cannot be interrupted, so it is told: it reads `ctx.cancelled` between steps and stops by
+  raising `tarsk.Cancelled`.
 - **Pausing a queue.** `app.pause(queue)`, `tarsk pause`, and a console button. Not on
   RabbitMQ.
 - **`backoff_base=` and `backoff_max=`** on a task, where the wait between retries was one
@@ -33,14 +35,14 @@
   more connection per worker, and per producer that waits on results.
 - **A cancelled job is settled and dropped.** It used to be retried, cancelled again each
   time, and left in the dead letters where a replay would run it.
-- RabbitMQ is documented as the basic backend, with a table of what it does not do.
-- Postgres adds `tarsk_chords` and `tarsk_paused`; Redis adds `tarsk:paused`,
 - **A job's id, queue and task name may not contain a NUL byte**, on any backend. Postgres
   always refused one; Redis and RabbitMQ queued it.
 - **An idle RabbitMQ producer checks its connection before it sends.** The first call after
   the server had closed the connection used to fail, and that call was a job being sent.
 - **Objects kept is counted only for a run that had its worker to itself.** With several
   slots busy, one task's objects were charged to whichever ran beside it.
+- RabbitMQ is documented as the basic backend, with a table of what it does not do.
+- Postgres adds `tarsk_chords` and `tarsk_paused`; Redis adds `tarsk:paused`,
   `tarsk:chord:<id>` and the `tarsk:results` channel.
 - The version lives in `Cargo.toml` alone. The producer's test hooks are behind a
   `test-hooks` build feature and are not in published wheels.

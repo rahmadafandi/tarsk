@@ -83,7 +83,7 @@ changes. Same configuration, different workloads:
 
 | | leak 20MB/task | leak 40MB/task | payload-dependent 2–80MB |
 |---|---|---|---|
-| celery `--max-tasks-per-child=6` | **162 MB** | 282 MB | 327 MB |
+| celery `--max-tasks-per-child=6` | **163 MB** | 283 MB | 328 MB |
 | tarsk `--max-rss=200MB` | 183 MB | **183 MB** | **187 MB** |
 
 Celery wins the first column, and that is the honest result: when the leak per task is known
@@ -91,17 +91,18 @@ and constant, dividing the budget by it works — someone divided 200 by 20 and 
 the other two columns tarsk was built for: nothing was reconfigured between them, the workload
 moved, and the guess encoded in that 6 went with it.
 
-The worker that runs your code is 27 MB against Celery's 41 MB and taskiq's 44 MB, because it
+The worker that runs your code is 28 MB against Celery's 42 MB and taskiq's 47 MB, because it
 imports your tasks and nothing else — no broker driver, no scheduler. Recycling costs 7 ms at
-the 99th percentile against Celery's 139 ms, because the replacement child starts before the
+the 99th percentile against Celery's 144 ms, because the replacement child starts before the
 trigger fires and the slot never goes empty.
 
 ## What it does not claim
 
-**Not faster.** With a 50 ms handler tarsk, Celery and taskiq all reach 19–20 tasks/s. Draining
-10,000 no-op tasks across four processes: Celery 10.0s, taskiq 2.3s, tarsk 2.2s — ahead in every
-run and by 4%, which this project's own benchmark rules call a tie. It starts in half the time
-and runs in half the memory; that is the claim, and speed is not.
+**Not faster.** With a 50 ms handler tarsk, Celery and taskiq all reach 20 tasks/s. Draining
+10,000 no-op tasks across four processes: Celery 7.3s, taskiq 1.8s, tarsk 1.2s on the latest
+run — and 4% apart on the run before it, on the same kind of machine. Ahead in every run, by an
+amount that has not held still, so it is not claimed. It starts in half the time and runs in
+half the memory; that is the claim, and speed is not.
 
 This file claimed a 1.45× lead until the numbers were checked on more than one machine. The full
 retraction, and every column where tarsk loses, is in

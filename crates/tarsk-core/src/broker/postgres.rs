@@ -196,11 +196,92 @@ type PgConnection = tokio_postgres::Connection<
     >>::Stream,
 >;
 
+/// A connection, and the statements it has already prepared.
+///
+/// Handed SQL as text, the driver prepares it on every call: a parse, a plan
+/// and a round trip of its own before the one that does the work. Every claim,
+/// ack and send was paying that — on a local server, more than the statement
+/// itself cost. A statement is prepared once per connection and kept.
+///
+/// The text is the key. Everything asked here is one of a few dozen fixed
+/// strings, so the cache is bounded by the source and needs no eviction.
+struct Db {
+    client: tokio_postgres::Client,
+    prepared: Mutex<HashMap<String, tokio_postgres::Statement>>,
+}
+
+type Params<'a> = &'a [&'a (dyn tokio_postgres::types::ToSql + Sync)];
+
+impl Db {
+    fn new(client: tokio_postgres::Client) -> Self {
+        Db {
+            client,
+            prepared: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        self.client.is_closed()
+    }
+
+    async fn statement(
+        &self,
+        sql: &str,
+    ) -> Result<tokio_postgres::Statement, tokio_postgres::Error> {
+        if let Some(known) = self.prepared.lock().unwrap().get(sql) {
+            return Ok(known.clone());
+        }
+        let made = self.client.prepare(sql).await?;
+        self.prepared
+            .lock()
+            .unwrap()
+            .insert(sql.to_string(), made.clone());
+        Ok(made)
+    }
+
+    /// A statement that failed is forgotten, so the next call prepares it
+    /// afresh: a plan can be invalidated under a connection, by a migration
+    /// another worker ran, and a kept one would then fail for good.
+    fn forget<T>(
+        &self,
+        sql: &str,
+        outcome: Result<T, tokio_postgres::Error>,
+    ) -> Result<T, tokio_postgres::Error> {
+        if outcome.is_err() {
+            self.prepared.lock().unwrap().remove(sql);
+        }
+        outcome
+    }
+
+    async fn execute(&self, sql: &str, params: Params<'_>) -> Result<u64, tokio_postgres::Error> {
+        let statement = self.statement(sql).await?;
+        self.forget(sql, self.client.execute(&statement, params).await)
+    }
+
+    async fn query(
+        &self,
+        sql: &str,
+        params: Params<'_>,
+    ) -> Result<Vec<tokio_postgres::Row>, tokio_postgres::Error> {
+        let statement = self.statement(sql).await?;
+        self.forget(sql, self.client.query(&statement, params).await)
+    }
+
+    async fn query_one(
+        &self,
+        sql: &str,
+        params: Params<'_>,
+    ) -> Result<tokio_postgres::Row, tokio_postgres::Error> {
+        let statement = self.statement(sql).await?;
+        self.forget(sql, self.client.query_one(&statement, params).await)
+    }
+}
+
 pub struct PgBroker {
     /// Replaced when the server goes away. A `Client` whose connection has
     /// ended fails every query from then on, and nothing short of a new one
     /// brings it back.
-    link: tokio::sync::Mutex<Arc<tokio_postgres::Client>>,
+    link: tokio::sync::Mutex<Arc<Db>>,
     url: String,
     pub(super) reconnects: AtomicU64,
     pub(super) wake: Arc<Wake>,
@@ -271,7 +352,7 @@ impl PgBroker {
     pub(super) async fn connect(url: &str, queues: Vec<String>) -> Res<PgBroker> {
         Ok(PgBroker {
             consumer: format!("tarsk-{}", std::process::id()),
-            link: tokio::sync::Mutex::new(Arc::new(Self::open(url).await?)),
+            link: tokio::sync::Mutex::new(Arc::new(Db::new(Self::open(url).await?))),
             url: url.to_string(),
             reconnects: AtomicU64::new(0),
             wake: Arc::default(),
@@ -342,10 +423,10 @@ impl PgBroker {
     /// Held behind a lock so a restart is met with one reconnect rather than
     /// one per waiting caller. While the server is still down this fails like
     /// any other query, and the next call tries again.
-    async fn db(&self) -> Res<Arc<tokio_postgres::Client>> {
+    async fn db(&self) -> Res<Arc<Db>> {
         let mut link = self.link.lock().await;
         if link.is_closed() {
-            *link = Arc::new(Self::open(&self.url).await?);
+            *link = Arc::new(Db::new(Self::open(&self.url).await?));
             self.reconnects.fetch_add(1, Ordering::Relaxed);
         }
         Ok(link.clone())

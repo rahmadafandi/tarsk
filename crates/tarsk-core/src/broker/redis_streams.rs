@@ -11,6 +11,9 @@ const REDIS_GROUP: &str = "tarsk";
 /// to keep every child fed helps; fetching more than that means parsing a burst
 /// on a single-threaded runtime while the children it was meant to feed wait.
 const DEFAULT_PREFETCH_CAP: u64 = 4;
+/// The most one read may take. A reply this size is parsed in one go, on the
+/// connection every other command shares.
+const MAX_BATCH: u64 = 256;
 
 /// Pending entries the lease sweep reads per round trip.
 const PENDING_PAGE: usize = 64;
@@ -599,7 +602,7 @@ impl RedisBroker {
         Ok(queues)
     }
 
-    pub(super) async fn claim(&self, block: Duration) -> Res<Option<Delivery>> {
+    pub(super) async fn claim(&self, block: Duration, room: usize) -> Res<Option<Delivery>> {
         // Anything already owned goes out first — but only while its lease has
         // time left. Past that the sweep may have handed it to someone else,
         // and running it here would be a duplicate we chose to create.
@@ -620,7 +623,14 @@ impl RedisBroker {
                 None => break,
             }
         }
-        let batch = self.prefetch.load(Ordering::Relaxed).max(1);
+        // The read-ahead the children earn between them, or what this caller
+        // can start at once, whichever is more: the first is a guess that
+        // pays when slots are scarce, the second is known.
+        let batch = self
+            .prefetch
+            .load(Ordering::Relaxed)
+            .max(room as u64)
+            .clamp(1, MAX_BATCH);
         let Some(reply) = self.read_in_order(batch, block).await? else {
             return Ok(None);
         };
@@ -697,6 +707,34 @@ impl RedisBroker {
             .arg(id)
             .query_async(&mut conn)
             .await?;
+        Ok(())
+    }
+
+    /// `ack` for many entries, as one request: an XACK and an XDEL per queue.
+    pub(super) async fn ack_many(&self, receipts: &[&Receipt]) -> Res<()> {
+        let mut by_queue: Vec<(&str, Vec<&str>)> = Vec::new();
+        for receipt in receipts {
+            let Receipt::Redis { queue, id } = receipt else {
+                return Err("not a redis receipt".into());
+            };
+            match by_queue.iter_mut().find(|(name, _)| name == queue) {
+                Some((_, ids)) => ids.push(id),
+                None => by_queue.push((queue, vec![id])),
+            }
+        }
+        let mut pipe = redis::pipe();
+        pipe.atomic();
+        for (queue, ids) in &by_queue {
+            let key = stream_key(queue);
+            pipe.cmd("XACK")
+                .arg(&key)
+                .arg(REDIS_GROUP)
+                .arg(ids)
+                .ignore();
+            pipe.cmd("XDEL").arg(&key).arg(ids).ignore();
+        }
+        let mut conn = self.conn.clone();
+        let _: () = pipe.query_async(&mut conn).await?;
         Ok(())
     }
 

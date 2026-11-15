@@ -466,6 +466,61 @@ impl Shared {
         }
     }
 
+    /// Settle what a child answered, in the order it answered.
+    ///
+    /// A success with nothing else to do — no result to keep, no chain to
+    /// advance, no slot to free — is only an ack, and a run of those goes to
+    /// the broker as one request. Anything else is settled on its own, after
+    /// the acks ahead of it, so the order the broker sees is the order the
+    /// child gave.
+    async fn settle_all(&self, items: Vec<Settle>) {
+        let mut acks: Vec<(Job, Outcome)> = Vec::new();
+        for item in items {
+            match item {
+                Settle::Done(job, outcome) if self.only_an_ack(&job, &outcome) => {
+                    acks.push((job, outcome));
+                }
+                Settle::Done(job, outcome) => {
+                    self.ack_all(std::mem::take(&mut acks)).await;
+                    self.settle(job, outcome).await;
+                }
+                Settle::Progress { id, name, blob } => {
+                    self.ack_all(std::mem::take(&mut acks)).await;
+                    self.keep_progress(&id, &name, blob).await;
+                }
+            }
+        }
+        self.ack_all(acks).await;
+    }
+
+    fn only_an_ack(&self, job: &Job, outcome: &Outcome) -> bool {
+        outcome.ok
+            && job.chain.is_empty()
+            && self.specs.lock().unwrap().get(&job.name).is_none_or(|s| {
+                s.max_concurrency == 0 && (s.result_ttl_ms == 0 || job.id.is_empty())
+            })
+    }
+
+    async fn ack_all(&self, mut done: Vec<(Job, Outcome)>) {
+        if done.len() < 2 {
+            if let Some((job, outcome)) = done.pop() {
+                self.settle(job, outcome).await;
+            }
+            return;
+        }
+        for (job, _) in &done {
+            self.metrics
+                .observe(&job.name, true, job.dispatched.elapsed());
+        }
+        let receipts: Vec<&Receipt> = done.iter().map(|(job, _)| &job.receipt).collect();
+        if let Err(err) = self.broker.ack_many(&receipts).await {
+            self.broker_error("ack", err.as_ref());
+        }
+        for (job, outcome) in done {
+            self.record(job.task_id, outcome);
+        }
+    }
+
     async fn settle(&self, job: Job, outcome: Outcome) {
         if outcome.ok {
             self.free_slot(&job).await;
@@ -744,14 +799,25 @@ impl Shared {
     /// no such thing as finished: only a shutdown ends the wait.
     /// One claim attempt. Never parks, so it is safe to call from a frame loop
     /// that still owes itself the reading of an Ack.
+    #[cfg(test)]
     async fn try_job(&self, lease: Duration) -> Option<Job> {
+        self.try_room(lease, 1).await
+    }
+
+    /// `room` is how many jobs the caller could start right now; a broker
+    /// that reads in batches may take that many in the one round trip.
+    async fn try_room(&self, lease: Duration, room: usize) -> Option<Job> {
         // Shutting down means no new work, not "no new work once the queue is
         // empty". Without this a worker told to stop kept claiming for as long
         // as there was a backlog, and was eventually killed mid-task instead.
         if self.done.load(Ordering::SeqCst) {
             return None;
         }
-        match self.broker.claim(lease, Duration::from_millis(0)).await {
+        match self
+            .broker
+            .claim_for(lease, Duration::from_millis(0), room)
+            .await
+        {
             Ok(Some(delivery)) => Some(self.adopt(delivery)),
             Ok(None) => None,
             Err(err) => {
@@ -761,14 +827,19 @@ impl Shared {
         }
     }
 
+    #[cfg(test)]
     async fn next_job(&self, lease: Duration, block: Duration) -> Option<Job> {
+        self.next_room(lease, block, 1).await
+    }
+
+    async fn next_room(&self, lease: Duration, block: Duration, room: usize) -> Option<Job> {
         loop {
             // Before the claim as well as after it, for the reason in
             // `try_job`: a claim that succeeds is a job this worker now owes.
             if self.done.load(Ordering::SeqCst) {
                 return None;
             }
-            match self.broker.claim(lease, block).await {
+            match self.broker.claim_for(lease, block, room).await {
                 Ok(Some(delivery)) => return Some(self.adopt(delivery)),
                 Ok(None) => {}
                 Err(err) => {
@@ -1140,7 +1211,8 @@ async fn spawn_child(shared: &Arc<Shared>, cfg: &Cfg) -> Option<ChildHandle> {
 
     // Frames arrive through a channel so the serve loop can select! on them:
     // read_exact is not cancel-safe, mpsc::Receiver::recv is.
-    let (frame_tx, frames) = mpsc::channel(8);
+    // Deep enough that a burst of answers is all there to be read at once.
+    let (frame_tx, frames) = mpsc::channel(64);
     tokio::spawn(async move {
         // Buffered: a child answers with an Ack and a Ready together, and
         // read bare that was four reads where one will do.
@@ -1395,15 +1467,25 @@ fn settle_task(
     let (tx, mut rx) = mpsc::channel::<Settle>(capacity.max(1));
     let shared = shared.clone();
     let task = tokio::spawn(async move {
-        while let Some(item) = rx.recv().await {
-            match item {
-                Settle::Done(job, outcome) => shared.settle(job, outcome).await,
-                Settle::Progress { id, name, blob } => shared.keep_progress(&id, &name, blob).await,
+        while let Some(first) = rx.recv().await {
+            // Whatever else has been acked by now goes with it. One at a time
+            // was a round trip each, in a row: with the broker a millisecond
+            // away, a thousand acks a second was all a child could have.
+            let mut items = vec![first];
+            while items.len() < SETTLE_BATCH {
+                match rx.try_recv() {
+                    Ok(item) => items.push(item),
+                    Err(_) => break,
+                }
             }
+            shared.settle_all(items).await;
         }
     });
     (tx, task)
 }
+
+/// The most settles taken off a child's queue for one trip to the broker.
+const SETTLE_BATCH: usize = 256;
 
 /// What a child's frame loop hands to its settle task.
 ///
@@ -1540,8 +1622,14 @@ async fn serve_inner(
             // ceiling: every one of them was handed a task while the RSS read
             // baseline, and nothing looked again until they had all allocated.
             while free > 0 && inflight.len() < allowed {
+                // As many as could start this instant, so slots that came
+                // free together cost one round trip between them.
+                let room = free.min(allowed.saturating_sub(inflight.len())).max(1);
                 let job = if inflight.is_empty() {
-                    match shared.next_job(cfg.lease_grace, cfg.claim_block).await {
+                    match shared
+                        .next_room(cfg.lease_grace, cfg.claim_block, room)
+                        .await
+                    {
                         Some(job) => job,
                         None => {
                             outcome = Fill::Done;
@@ -1549,7 +1637,7 @@ async fn serve_inner(
                         }
                     }
                 } else {
-                    match shared.try_job(cfg.lease_grace).await {
+                    match shared.try_room(cfg.lease_grace, room).await {
                         Some(job) => job,
                         None => break,
                     }
@@ -1728,7 +1816,18 @@ async fn serve_inner(
                 }
             }
             frame = frames.recv() => {
-                let Some(body) = frame else { return Served { exit: Exit::Died, spare } };
+                // Everything the child has already said is read before
+                // anything is claimed for it. Filling at each Ready meant a
+                // broker round trip per free slot, one after another, while
+                // the rest of what the child had sent waited behind it: with
+                // the broker a millisecond away, that round trip was the
+                // ceiling on a child's throughput whatever its slot count.
+                // Read together, the slots that came free together are
+                // filled by one claim.
+                let mut waiting = frame;
+                let mut offered = false;
+                loop {
+                let Some(body) = waiting.take() else { return Served { exit: Exit::Died, spare } };
                 let Some(items) = decode(&body) else { return Served { exit: Exit::Died, spare } };
                 match items[0].as_str() {
                     Some("Ready") => {
@@ -1751,18 +1850,12 @@ async fn serve_inner(
                                 // The timer below does the waiting; see `retiring`.
                                 retiring = Some(reason);
                                 free += 1;
-                                continue;
+                            } else {
+                                return Served { exit: Exit::Recycle(reason), spare };
                             }
-                            return Served { exit: Exit::Recycle(reason), spare };
-                        }
-                        free += 1;
-                        match fill!() {
-                            Fill::Sent | Fill::Empty => {}
-                            Fill::Dead => return Served { exit: Exit::Died, spare },
-                            Fill::Done => {
-                                let _ = write_frame(writer, &Value::Array(vec![Value::from("Drain")])).await;
-                                return Served { exit: Exit::Finished, spare };
-                            }
+                        } else {
+                            free += 1;
+                            offered = true;
                         }
                     }
                     Some("Ack") => {
@@ -1832,6 +1925,23 @@ async fn serve_inner(
                         }
                     }
                     _ => return Served { exit: Exit::Died, spare },
+                }
+                match frames.try_recv() {
+                    Ok(body) => waiting = Some(body),
+                    // Nothing more yet, or the child has gone: the next
+                    // `recv` says which.
+                    Err(_) => break,
+                }
+                }
+                if offered {
+                    match fill!() {
+                        Fill::Sent | Fill::Empty => {}
+                        Fill::Dead => return Served { exit: Exit::Died, spare },
+                        Fill::Done => {
+                            let _ = write_frame(writer, &Value::Array(vec![Value::from("Drain")])).await;
+                            return Served { exit: Exit::Finished, spare };
+                        }
+                    }
                 }
             }
             _ = ticker.tick() => {
@@ -3016,6 +3126,27 @@ mod settle_tests {
             .await
             .unwrap();
         new_shared(broker, 0, false)
+    }
+
+    #[tokio::test]
+    async fn a_run_of_acks_goes_together_and_a_chain_among_them_still_advances() {
+        let shared = on_memory().await;
+        let mut items: Vec<Settle> = claimed(&shared, 4)
+            .await
+            .into_iter()
+            .map(|job| Settle::Done(job, succeeded()))
+            .collect();
+        let step = claimed_with_a_chain(&shared).await;
+        items.insert(2, Settle::Done(step, succeeded()));
+        assert_eq!(memory(&shared).unsettled(), 5);
+
+        shared.settle_all(items).await;
+
+        // All five acked, and the one thing left is what the chain handed on:
+        // a step swept into the batch would have been acked and gone no
+        // further.
+        assert_eq!(memory(&shared).unsettled(), 1);
+        assert_eq!(shared.counters.chained.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

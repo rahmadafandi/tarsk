@@ -209,6 +209,12 @@ impl MemoryBroker {
         }
     }
 
+    /// Jobs not yet settled, queued or claimed.
+    #[cfg(test)]
+    pub fn unsettled(&self) -> usize {
+        self.jobs.lock().unwrap().len()
+    }
+
     pub(super) fn settle(&self, id: u64) -> Res<()> {
         self.jobs.lock().unwrap().remove(&id);
         Ok(())

@@ -452,10 +452,25 @@ impl Broker {
     /// (spec §4.5) — a global lease would strand a 5-second task for as long
     /// as the slowest task in the system. Waits up to `block` for work.
     pub async fn claim(&self, grace: Duration, block: Duration) -> Res<Option<Delivery>> {
+        self.claim_for(grace, block, 1).await
+    }
+
+    /// `claim`, from a caller with `room` to start that many jobs at once.
+    ///
+    /// One job is still what comes back. Redis reads in batches and keeps the
+    /// rest for the calls that follow, so `room` is how deep that read may go:
+    /// what can be started now, and not a guess about what might be later.
+    pub async fn claim_for(
+        &self,
+        grace: Duration,
+        block: Duration,
+        room: usize,
+    ) -> Res<Option<Delivery>> {
+        let _ = room;
         match self {
             Broker::Memory(b) => Ok(b.claim()),
             #[cfg(feature = "redis")]
-            Broker::Redis(b) => b.claim(block).await,
+            Broker::Redis(b) => b.claim(block, room).await,
             #[cfg(feature = "postgres")]
             Broker::Postgres(b) => b.claim(grace, block).await,
             // `grace` is the lease slack, and AMQP needs none: an unacked
@@ -463,6 +478,19 @@ impl Broker {
             #[cfg(feature = "amqp")]
             Broker::Amqp(b) => b.claim(block).await,
         }
+    }
+
+    /// Settle several deliveries for good, in as few round trips as the
+    /// backend allows: one on Redis, one each elsewhere.
+    pub async fn ack_many(&self, receipts: &[&Receipt]) -> Res<()> {
+        #[cfg(feature = "redis")]
+        if let Broker::Redis(b) = self {
+            return b.ack_many(receipts).await;
+        }
+        for receipt in receipts {
+            self.ack(receipt).await?;
+        }
+        Ok(())
     }
 
     /// Settle a delivery for good.

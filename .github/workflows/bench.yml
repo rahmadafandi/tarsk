@@ -10,13 +10,19 @@ on:
         description: "scenarios to run, space separated (empty = all)"
         required: false
         default: ""
+      refs:
+        description: "tags or commits to measure against each other on this one machine (empty = this checkout only)"
+        required: false
+        default: ""
 
 jobs:
   bench:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-python@v7
         with:
@@ -50,6 +56,7 @@ jobs:
           echo "memory-limited scopes work"
 
       - name: Build the extension
+        if: inputs.refs == ''
         run: |
           python -m venv .venv
           # packaging: kombu's Redis transport imports it and does not ask for it.
@@ -60,11 +67,35 @@ jobs:
           redis-server --version
 
       - name: Run the benchmark
+        if: inputs.refs == ''
         # pipefail: through `tee` alone, a harness that crashed was a green run
         # with an empty report.
         run: |
           set -o pipefail
           .venv/bin/python bench/run.py ${{ inputs.scenarios }} | tee bench-output.md
+
+      - name: Measure several versions on this one machine
+        # Two runs on two runners cannot say whether the code changed or the
+        # machine did. Each ref is built in its own worktree and runs its own
+        # harness, in turn and twice over, so a difference between them that
+        # is not also a difference between the rounds is the code's.
+        if: inputs.refs != ''
+        run: |
+          set -o pipefail
+          for ref in ${{ inputs.refs }}; do
+            git worktree add -q "../ref-$ref" "$ref"
+            ( cd "../ref-$ref"
+              python -m venv .venv
+              .venv/bin/pip install -q maturin celery taskiq taskiq-redis redis packaging
+              # Before 0.2 the Redis backend was not a feature to ask for.
+              .venv/bin/maturin develop --release -F redis || .venv/bin/maturin develop --release )
+          done
+          for round in 1 2; do
+            for ref in ${{ inputs.refs }}; do
+              echo "## $ref, round $round" | tee -a bench-output.md
+              ( cd "../ref-$ref" && .venv/bin/python bench/run.py ${{ inputs.scenarios }} ) | tee -a bench-output.md
+            done
+          done
 
       - uses: actions/upload-artifact@v7
         with:

@@ -52,11 +52,16 @@ jobs:
       - name: Build the extension
         run: |
           python -m venv .venv
-          .venv/bin/pip install -q maturin celery taskiq taskiq-redis redis
+          # packaging: kombu's Redis transport imports it and does not ask for it.
+          .venv/bin/pip install -q maturin celery taskiq taskiq-redis redis packaging
           .venv/bin/maturin develop --release -F redis
 
       - name: Run the benchmark
-        run: .venv/bin/python bench/run.py ${{ inputs.scenarios }} | tee bench-output.md
+        # pipefail: through `tee` alone, a harness that crashed was a green run
+        # with an empty report.
+        run: |
+          set -o pipefail
+          .venv/bin/python bench/run.py ${{ inputs.scenarios }} | tee bench-output.md
 
       - uses: actions/upload-artifact@v7
         with:

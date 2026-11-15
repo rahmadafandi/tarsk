@@ -1,6 +1,17 @@
 # Changelog
 
-## Unreleased
+## 0.4.0
+
+### Upgrading from 0.3
+
+Nothing in your tasks has to change. Three things are worth knowing before you roll it out:
+
+- **A cancelled job is dropped**, where it used to be retried and then left in the dead
+  letters. Anything that replayed cancelled jobs from there will no longer find them.
+- **Postgres takes one more connection per worker**, and per producer that waits on a
+  result, for `LISTEN`. Count them against `max_connections`. Two tables are added on first
+  connect.
+- **A job whose id, queue or task name contains a NUL byte is refused** on every backend.
 
 ### Added
 

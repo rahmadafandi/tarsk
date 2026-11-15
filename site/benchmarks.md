@@ -309,9 +309,10 @@ thousand, and taskiq's stream broker beside it as the control:
 
 taskiq did not move, which is what a control is for, and each version repeated itself to
 within half a percent. So the change is tarsk's, and it happened between 0.1.0 and 0.2.1: draining a
-no-op queue got 30% quicker. The likeliest cause is that 0.2.0 took settling a finished job
-off the loop that reads a child's frames, where each one used to wait on a broker round
-trip; the releases were not bisected, so that is the candidate and not the finding. Either
+no-op queue got 30% quicker. Part of it is that 0.2.0 took settling a finished job off
+the loop that reads a child's frames, where each one used to wait on a broker round trip:
+measured on its own, that commit is worth about 15%. The rest arrived in the commits between
+it and 0.2.1 and was not traced further. Either
 way it is the difference between the 1.04× this section used to report and the 1.48× above —
 the earlier figure was 0.1.0's.
 

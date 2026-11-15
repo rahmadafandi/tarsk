@@ -159,33 +159,45 @@ with picked as (
     -- delayed job came due or a lost lease lapsed, and a job never leased was
     -- runnable when written.
     --
-    -- Priority before age: `--queues high,low` is an ordering. Strict here in
-    -- a way Redis cannot be, because this claims one row at a time and so
-    -- never holds a batch of the wrong queue.
-    select c.id, c.ready_at
+    -- Priority before age: `--queues high,low` is an ordering. $4 is how many
+    -- the caller can start at once, so what is taken is what runs now, and
+    -- no batch of the wrong queue is left waiting behind it.
+    select c.id, c.ready_at, q.ord
       from unnest($1::text[]) with ordinality as q(queue, ord)
      cross join lateral (
            select * from (select id, created_at as ready_at from tarsk_jobs
                            where queue = q.queue and lease_until is null
-                           order by id for update skip locked limit 1) fresh
+                           order by id for update skip locked limit $4) fresh
            union all
            select * from (select id, lease_until as ready_at from tarsk_jobs
                            where queue = q.queue and lease_until < now()
-                           order by id for update skip locked limit 1) due
+                           order by id for update skip locked limit $4) due
            ) c
      order by q.ord, c.id
-     limit 1
+     limit $4
 )
 update tarsk_jobs set
     lease_until = now() + make_interval(secs => timeout_ms / 1000.0 + $2::double precision),
     attempt     = attempt + 1,
     run_lease   = run_lease + 1,
     claimed_by  = $3
-from picked
+from picked, (select set_config('synchronous_commit', 'off', true)) relaxed
 where tarsk_jobs.id = picked.id
 returning tarsk_jobs.id, name, payload, attempt, run_lease, job_id, picked.ready_at,
-          chain, meta, expires_ms
+          chain, meta, expires_ms, picked.ord, timeout_ms
 ";
+
+/// Why a claim and an ack do not wait for the disk.
+///
+/// `synchronous_commit` off, for that statement alone: the server answers
+/// once the change is in its own memory and writes it out within a fraction
+/// of a second. If the server crashes inside that window the change is lost,
+/// and for these two that means a job is delivered again — a claim forgotten
+/// leaves the job unclaimed while it runs, an ack forgotten leaves it to be
+/// redelivered when its lease lapses. That is the at-least-once this queue
+/// already promises, bought for half of what a job costs here. Everything
+/// that must not be lost — a job sent, a result, a dead letter — still waits.
+const RELAXED: &str = "(select set_config('synchronous_commit', 'off', true)) is not null";
 
 /// The half of a Postgres connection that reads the socket. Named because it
 /// is long, and because the listener needs to hold one itself.
@@ -290,6 +302,10 @@ pub struct PgBroker {
     /// store says, refreshed on the timer that pulls cancellations, so a claim
     /// does not pay a round trip to learn that nothing is paused.
     pub(super) held: Mutex<std::collections::HashSet<String>>,
+    /// Claimed in the same read as a job already handed out, and waiting for
+    /// the calls that follow: each with when it was claimed and how long its
+    /// lease runs, so one that waited too long is left for the sweep.
+    claimed: Mutex<VecDeque<(Delivery, std::time::Instant, u64)>>,
     stores: AtomicU64,
     /// The same identity Redis gets for free from its consumer group. Postgres
     /// has no equivalent, so a claim writes it down.
@@ -357,6 +373,7 @@ impl PgBroker {
             reconnects: AtomicU64::new(0),
             wake: Arc::default(),
             held: Mutex::new(std::collections::HashSet::new()),
+            claimed: Mutex::new(VecDeque::new()),
             queues,
             stores: AtomicU64::new(0),
         })
@@ -537,7 +554,26 @@ impl PgBroker {
         Ok(())
     }
 
-    pub(super) async fn claim(&self, grace: Duration, block: Duration) -> Res<Option<Delivery>> {
+    pub(super) async fn claim(
+        &self,
+        grace: Duration,
+        block: Duration,
+        room: usize,
+    ) -> Res<Option<Delivery>> {
+        // What an earlier read took beyond the one job it handed back.
+        loop {
+            let head = self.claimed.lock().unwrap().pop_front();
+            match head {
+                Some((_, claimed_at, lease_ms))
+                    if claimed_at.elapsed().as_millis() as u64 >= lease_ms =>
+                {
+                    continue; // its lease may have lapsed: the sweep's to redeliver
+                }
+                Some((delivery, _, _)) => return Ok(Some(delivery)),
+                None => break,
+            }
+        }
+        let room = room.clamp(1, 256) as i64;
         // ponytail: polls. LISTEN/NOTIFY is the upgrade and would cut idle
         // pickup latency to the round trip; it costs a dedicated connection to
         // hold the notification stream, which is not worth it until someone
@@ -559,12 +595,21 @@ impl PgBroker {
             let rows = self
                 .db()
                 .await?
-                .query(PG_CLAIM, &[&queues, &grace.as_secs_f64(), &self.consumer])
+                .query(
+                    PG_CLAIM,
+                    &[&queues, &grace.as_secs_f64(), &self.consumer, &room],
+                )
                 .await?;
-            if let Some(row) = rows.first() {
+            // RETURNING promises no order, and the order is the priority.
+            let mut rows = rows;
+            rows.sort_by_key(|row| (row.get::<_, i64>(10), row.get::<_, i64>(0)));
+            let now = std::time::Instant::now();
+            let mut first = None;
+            for row in &rows {
                 let run_lease: i64 = row.get(4);
                 let ready: std::time::SystemTime = row.get(6);
-                return Ok(Some(Delivery {
+                let lease_ms = row.get::<_, i32>(11).max(1) as u64;
+                let delivery = Delivery {
                     id: row.get(5),
                     name: row.get(1),
                     payload: row.get(2),
@@ -580,7 +625,18 @@ impl PgBroker {
                         row: row.get(0),
                         run_lease,
                     },
-                }));
+                };
+                if first.is_none() {
+                    first = Some(delivery);
+                } else {
+                    self.claimed
+                        .lock()
+                        .unwrap()
+                        .push_back((delivery, now, lease_ms));
+                }
+            }
+            if first.is_some() {
+                return Ok(first);
             }
             let now = tokio::time::Instant::now();
             if now >= deadline {
@@ -620,11 +676,51 @@ impl PgBroker {
         self.db()
             .await?
             .execute(
-                "delete from tarsk_jobs where id = $1 and run_lease = $2",
+                &format!("delete from tarsk_jobs where id = $1 and run_lease = $2 and {RELAXED}"),
                 &[row, run_lease],
             )
             .await?;
         Ok(())
+    }
+
+    /// `ack` for many rows, as one statement and one commit.
+    pub(super) async fn ack_many(&self, receipts: &[&Receipt]) -> Res<()> {
+        let mut rows = Vec::with_capacity(receipts.len());
+        let mut leases = Vec::with_capacity(receipts.len());
+        for receipt in receipts {
+            let Receipt::Postgres { row, run_lease } = receipt else {
+                return Err("not a postgres receipt".into());
+            };
+            rows.push(*row);
+            leases.push(*run_lease);
+        }
+        self.db()
+            .await?
+            .execute(
+                &format!(
+                    "delete from tarsk_jobs job
+                      using unnest($1::bigint[], $2::bigint[]) as done(id, run_lease)
+                      where job.id = done.id and job.run_lease = done.run_lease and {RELAXED}"
+                ),
+                &[&rows, &leases],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Hand back what a read took and no call came for: unleased, and with
+    /// the attempt the claim charged returned, since none was spent.
+    pub(super) async fn release_unstarted(&self) {
+        let held: Vec<Delivery> = self
+            .claimed
+            .lock()
+            .unwrap()
+            .drain(..)
+            .map(|(delivery, _, _)| delivery)
+            .collect();
+        for delivery in held {
+            let _ = self.requeue_as(&delivery.receipt, Duration::ZERO, 1).await;
+        }
     }
 
     /// The lease column doubles as the visibility timer: a row leased into the

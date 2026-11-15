@@ -1957,7 +1957,10 @@ async fn serve_inner(
                     Err(_) => break,
                 }
                 }
-                if offered {
+                // Not once a limit has fired, even for the slots offered before
+                // it did: they were read in the same breath, and a child on
+                // its way out is handed nothing more.
+                if offered && retiring.is_none() {
                     match fill!() {
                         Fill::Sent | Fill::Empty => {}
                         Fill::Dead => return Served { exit: Exit::Died, spare },

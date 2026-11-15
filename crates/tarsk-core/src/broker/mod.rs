@@ -457,8 +457,9 @@ impl Broker {
 
     /// `claim`, from a caller with `room` to start that many jobs at once.
     ///
-    /// One job is still what comes back. Redis reads in batches and keeps the
-    /// rest for the calls that follow, so `room` is how deep that read may go:
+    /// One job is still what comes back. Redis and Postgres read several and
+    /// keep the rest for the calls that follow, so `room` is how deep that
+    /// read may go:
     /// what can be started now, and not a guess about what might be later.
     pub async fn claim_for(
         &self,
@@ -472,7 +473,7 @@ impl Broker {
             #[cfg(feature = "redis")]
             Broker::Redis(b) => b.claim(block, room).await,
             #[cfg(feature = "postgres")]
-            Broker::Postgres(b) => b.claim(grace, block).await,
+            Broker::Postgres(b) => b.claim(grace, block, room).await,
             // `grace` is the lease slack, and AMQP needs none: an unacked
             // delivery returns the instant its connection dies.
             #[cfg(feature = "amqp")]
@@ -481,10 +482,14 @@ impl Broker {
     }
 
     /// Settle several deliveries for good, in as few round trips as the
-    /// backend allows: one on Redis, one each elsewhere.
+    /// backend allows: one on Redis and Postgres, one each elsewhere.
     pub async fn ack_many(&self, receipts: &[&Receipt]) -> Res<()> {
         #[cfg(feature = "redis")]
         if let Broker::Redis(b) = self {
+            return b.ack_many(receipts).await;
+        }
+        #[cfg(feature = "postgres")]
+        if let Broker::Postgres(b) = self {
             return b.ack_many(receipts).await;
         }
         for receipt in receipts {
@@ -1015,13 +1020,17 @@ impl Broker {
 
     /// Hand back what this worker fetched ahead and will now never start.
     ///
-    /// Only Redis reads ahead. A worker that stops claiming still owns the
-    /// entries it prefetched, and left alone they sit out their whole lease —
-    /// minutes, at the default timeout — before anyone else may run them.
+    /// Redis and Postgres read more than one job at a time. A worker that
+    /// stops claiming still owns what it read and did not start, and left
+    /// alone those sit out their whole lease — minutes, at the default
+    /// timeout — before anyone else may run them.
     pub async fn release_unstarted(&self) {
-        #[cfg(feature = "redis")]
-        if let Broker::Redis(b) = self {
-            b.release_unstarted().await;
+        match self {
+            #[cfg(feature = "redis")]
+            Broker::Redis(b) => b.release_unstarted().await,
+            #[cfg(feature = "postgres")]
+            Broker::Postgres(b) => b.release_unstarted().await,
+            _ => {}
         }
     }
 

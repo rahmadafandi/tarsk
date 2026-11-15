@@ -14,7 +14,16 @@
   170µs.** The child's memory is read from `/proc/<pid>/statm` on Linux rather than through
   a refresh of everything known about the process.
 - **Postgres prepares each statement once per connection** rather than on every call.
-  Sending 5,000 jobs took 5.2s and takes 3.5s; draining them took 10.2s and takes 5.5s.
+  Sending 5,000 jobs took 5.2s and takes 3.5s; draining them took 10.2s and takes between
+  4.4s and 5.9s.
+- **On Postgres a claim and an ack no longer wait for the disk.** They run with
+  `synchronous_commit` off for that statement alone. A server crash in the fraction of a
+  second before the write redelivers the job, which at-least-once already allows; a job
+  sent, a result and a dead letter still wait. Postgres also claims as many rows as there
+  are free slots in one statement and acknowledges a run of successes in one: 2,000 tasks
+  that each wait 100ms across two children of a hundred slots took 2.2s and take 0.98s.
+- **`max_tasks` is held closer with several slots.** A child with eight slots and a limit of
+  five ran about twelve tasks before it was replaced, and now runs about ten.
 - **The Redis sweep no longer reads every long-running job every second.** Finding out
   whether a pending entry was overdue took an `XRANGE` each, per worker, per second: 150 jobs
   in flight were 150 reads a second. An entry's timeout is now read once and remembered.

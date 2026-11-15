@@ -23,8 +23,9 @@ by workers that asked for more than one queue.
 
 **Strict at the moment of claiming, which is the only moment it can be.** A batch already
 claimed is already leased to this worker and still runs; priority decides what is read next,
-not what is already held. On Redis that is a prefetch batch of slack; on Postgres, which claims
-one row at a time, there is none.
+not what is already held. On Redis that is a prefetch batch of slack. Postgres takes only as
+many rows as the worker has free slots to start them in, highest queue first, so nothing is
+held back behind them.
 
 This page used to say `--queues high,low` merely preferred the first within one read, which was
 true and is what a single `XREADGROUP` over two streams does — Redis answers it with up to
@@ -86,6 +87,14 @@ anything that is about *more than one process*: a second worker, the CLI inspect
 worker's queues or dead letters, cancellation from outside, send deduplication between
 producers. Those need a broker that outlives a process, which is the entire difference between
 it and the other two.
+
+**On Postgres a claim and an ack do not wait for the disk.** Those two statements run with
+`synchronous_commit` off, for themselves alone: the server answers once the change is in its
+memory and writes it out within a fraction of a second. A server that crashes inside that
+window forgets it, and the job is delivered again — which is the at-least-once you already
+have to write handlers for. A job sent, a result, and a dead letter still wait for the disk,
+because those are the ones that would be lost and not repeated. It is half of what a job
+costs on Postgres.
 
 Both speak TLS, which every managed instance requires. `rediss://` for Redis, and for Postgres
 whatever `sslmode` says — `require`, `verify-ca` and `verify-full` all verify the chain and the

@@ -316,9 +316,20 @@ way it is the difference between the 1.04× this section used to report and the 
 the earlier figure was 0.1.0's.
 
 **Two things this table says against tarsk.** It has got slower twice since: 6% in 0.3.0 and
-another 4% in 0.4.0. Both releases added work to every dispatch — cancellation that reaches
-a running job, pausing, per-task accounting — and which of it costs what has not been
-measured. And 0.1.0 reads 1.17× here where the
+another 4% in 0.4.0.
+
+The 0.4.0 part was traced and mostly taken back. Seven commits between the two releases were
+measured side by side, and the step was the one that counts what each task leaves behind:
+`sys.getallocatedblocks()` walks the interpreter's heap rather than reading a counter, and
+it was called twice round every task. With the call removed 0.4.0 drains as fast as 0.3.0
+did; rationed to half a percent of the worker's time, which is what ships after 0.4.0, it
+gives back about three quarters of the loss. The cost also grew with the size of the heap,
+which a no-op benchmark cannot show and an application would have.
+
+The 0.3.0 part was not found. Five commits across that release, twenty runs each on four
+pinned cores, read between 1.49s and 1.60s in no order: whatever it is, it is smaller than
+the noise of the machines available, and the Redis commands issued per job are identical in
+all three releases. And 0.1.0 reads 1.17× here where the
 published runs of the same code read 1.06× and 1.04×, so the ratio still moves between
 machines of the same type by more than the tie rule allows. On a 16-core laptop it read 1.1×.
 

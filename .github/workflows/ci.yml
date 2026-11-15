@@ -1,11 +1,20 @@
 name: ci
 
 on:
+  # Every branch, so work is tested before it is merged rather than after.
+  # `bench/**` is where benchmark runs are dispatched from and changes no code.
   push:
-    branches: [main]
+    branches-ignore: ["bench/**"]
+  # For forks, whose pushes do not run here. A pull request from a branch in
+  # this repository is run twice, which is the price of not missing a fork.
   pull_request:
   # So release.yml can run every job here before it builds anything to publish.
   workflow_call:
+
+# A branch pushed twice in a row is only worth testing at its newest commit.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   test:

@@ -2907,6 +2907,23 @@ mod settle_tests {
     }
 
     #[tokio::test]
+    async fn a_schedule_that_cannot_be_read_is_refused_once_and_alone() {
+        let shared = on_memory().await;
+        scheduled(&shared, "broken", "every tuesday");
+        scheduled(&shared, "every", "* * * * *");
+        let mut state = CronState::default();
+        fire_due(&shared, NOW, &mut state).await;
+        fire_due(&shared, NOW + 1, &mut state).await;
+        assert!(
+            state.refused.contains("broken"),
+            "nothing was said about it"
+        );
+        // The one beside it is not held up by it.
+        let ran: Vec<String> = queued(&shared).await.into_iter().map(|(_, n)| n).collect();
+        assert_eq!(ran, vec!["every", "every"]);
+    }
+
+    #[tokio::test]
     async fn a_schedule_seen_for_the_first_time_does_not_run_late() {
         // Deployed at 17:04 with a job due at 03:00: there is no record of it
         // ever having run, and that is not the same as its having been missed.

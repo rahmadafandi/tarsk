@@ -466,39 +466,63 @@ impl Shared {
         }
     }
 
-    /// Settle what a child answered, in the order it answered.
+    /// Settle what a child answered.
     ///
-    /// A success with nothing else to do — no result to keep, no chain to
-    /// advance, no slot to free — is only an ack, and a run of those goes to
-    /// the broker as one request. Anything else is settled on its own, after
-    /// the acks ahead of it, so the order the broker sees is the order the
-    /// child gave.
-    async fn settle_all(&self, items: Vec<Settle>) {
+    /// Order matters where one settle can be told from another by what comes
+    /// after it: a failure is requeued, a chain hands on its next step, and
+    /// progress has to land before the result it leads up to. Those go to the
+    /// broker one at a time, in the order the child gave them.
+    ///
+    /// A success that hands nothing on owes the broker nothing in any order.
+    /// A run of those is settled together: the ones that are only an ack as
+    /// one request, the ones with a result to keep or a slot to free each on
+    /// its own but all at once. In a row they were a round trip or two apiece,
+    /// which with the broker a millisecond away was the whole of a child's
+    /// throughput.
+    async fn settle_all(self: &Arc<Self>, items: Vec<Settle>) {
         let mut acks: Vec<(Job, Outcome)> = Vec::new();
+        let mut apart: Vec<(Job, Outcome)> = Vec::new();
         for item in items {
             match item {
-                Settle::Done(job, outcome) if self.only_an_ack(&job, &outcome) => {
-                    acks.push((job, outcome));
+                Settle::Done(job, outcome) if outcome.ok && job.chain.is_empty() => {
+                    if self.only_an_ack(&job) {
+                        acks.push((job, outcome));
+                    } else {
+                        apart.push((job, outcome));
+                    }
                 }
                 Settle::Done(job, outcome) => {
-                    self.ack_all(std::mem::take(&mut acks)).await;
+                    self.settle_run(std::mem::take(&mut acks), std::mem::take(&mut apart))
+                        .await;
                     self.settle(job, outcome).await;
                 }
                 Settle::Progress { id, name, blob } => {
-                    self.ack_all(std::mem::take(&mut acks)).await;
+                    self.settle_run(std::mem::take(&mut acks), std::mem::take(&mut apart))
+                        .await;
                     self.keep_progress(&id, &name, blob).await;
                 }
             }
         }
-        self.ack_all(acks).await;
+        self.settle_run(acks, apart).await;
     }
 
-    fn only_an_ack(&self, job: &Job, outcome: &Outcome) -> bool {
-        outcome.ok
-            && job.chain.is_empty()
-            && self.specs.lock().unwrap().get(&job.name).is_none_or(|s| {
-                s.max_concurrency == 0 && (s.result_ttl_ms == 0 || job.id.is_empty())
-            })
+    async fn settle_run(self: &Arc<Self>, acks: Vec<(Job, Outcome)>, apart: Vec<(Job, Outcome)>) {
+        let mut together = tokio::task::JoinSet::new();
+        for (job, outcome) in apart {
+            let shared = self.clone();
+            together.spawn(async move { shared.settle(job, outcome).await });
+        }
+        self.ack_all(acks).await;
+        while together.join_next().await.is_some() {}
+    }
+
+    /// Whether a success that hands nothing on has only its ack left to do.
+    fn only_an_ack(&self, job: &Job) -> bool {
+        self.specs
+            .lock()
+            .unwrap()
+            .get(&job.name)
+            .is_none_or(|s| s.max_concurrency == 0 && (s.result_ttl_ms == 0 || job.id.is_empty()))
     }
 
     async fn ack_all(&self, mut done: Vec<(Job, Outcome)>) {

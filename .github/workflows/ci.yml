@@ -76,7 +76,10 @@ jobs:
       - if: matrix.backend == 'redis'
         run: sudo apt-get update && sudo apt-get install -y redis-server
       - if: matrix.backend == 'amqp'
-        run: sudo apt-get update && sudo apt-get install -y rabbitmq-server
+        # The management plugin is how the reconnect test closes connections.
+        run: |
+          sudo apt-get update && sudo apt-get install -y rabbitmq-server
+          sudo rabbitmq-plugins enable rabbitmq_management
       - run: python -m venv .venv
       - run: .venv/bin/pip install --upgrade pip maturin msgpack
       - run: .venv/bin/maturin develop --release -F redis,postgres,amqp,test-hooks

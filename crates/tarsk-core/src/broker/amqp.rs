@@ -42,6 +42,7 @@ pub struct AmqpBroker {
     link: tokio::sync::Mutex<Arc<AmqpLink>>,
     url: String,
     pub(super) reconnects: AtomicU64,
+    last_used_ms: AtomicU64,
     /// Never signalled: AMQP has no way to announce a stored result, so
     /// whoever waits on this broker falls back to asking.
     pub(super) wake: Arc<Wake>,
@@ -208,11 +209,31 @@ impl AmqpBroker {
         Ok(link.clone())
     }
 
+    /// Find out that the server closed the connection before something that
+    /// matters is sent on it; the same bargain as `RedisBroker::refresh`.
+    ///
+    /// The client goes on reporting a connection the server has closed as
+    /// open until something is sent on it, and that something then fails —
+    /// for an idle producer, a job being published. So after a second of
+    /// quiet a throwaway channel is opened first: it is what fails, and
+    /// `link` then finds the connection down and reopens it.
+    pub(super) async fn refresh(&self) {
+        let now = now_ms();
+        let idle = now.saturating_sub(self.last_used_ms.swap(now, Ordering::Relaxed));
+        if idle >= 1_000 {
+            let conn = self.link.lock().await.clone();
+            if let Ok(probe) = conn.conn.create_channel().await {
+                let _ = probe.close(200, "probe".into()).await;
+            }
+        }
+    }
+
     pub(super) async fn connect(url: &str, queues: Vec<String>) -> Res<AmqpBroker> {
         let broker = AmqpBroker {
             link: tokio::sync::Mutex::new(Arc::new(Self::open(url).await?)),
             url: url.to_string(),
             reconnects: AtomicU64::new(0),
+            last_used_ms: AtomicU64::new(now_ms()),
             wake: Arc::default(),
             queues,
             declared: Mutex::new(std::collections::HashSet::new()),

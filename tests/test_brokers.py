@@ -1163,7 +1163,48 @@ def _drop_connections(url: str, label: str) -> bool:
             capture_output=True, text=True, check=True).stdout.split()
         assert "t" in ended, f"{label}: found no connections to drop"
         return True
-    return False
+    return _drop_amqp_connections(url, label)
+
+
+def _drop_amqp_connections(url: str, label: str) -> bool:
+    """The same, through RabbitMQ's management API, which is the only way in."""
+    import base64
+    import json
+    import urllib.error
+    import urllib.request
+    from urllib.parse import quote, unquote
+
+    parts = urlsplit(url)
+    api = f"http://{parts.hostname}:{os.environ.get('TARSK_AMQP_MANAGEMENT_PORT', '15672')}/api"
+    vhost = unquote(parts.path.lstrip("/")) or "/"
+    login = base64.b64encode(
+        f"{unquote(parts.username or 'guest')}:{unquote(parts.password or 'guest')}".encode())
+
+    def call(path, method="GET"):
+        request = urllib.request.Request(
+            f"{api}{path}", method=method, headers={"Authorization": f"Basic {login.decode()}"})
+        with urllib.request.urlopen(request, timeout=5) as reply:
+            return reply.read()
+
+    try:
+        call("/overview")
+    except (urllib.error.URLError, OSError):
+        print(f"  {label}: skip reconnect — no management API here to close connections with")
+        return False
+    # The API learns of a connection a few seconds after it opens.
+    deadline = time.time() + 15
+    while True:
+        names = [c["name"] for c in json.loads(call("/connections")) if c.get("vhost") == vhost]
+        if names or time.time() > deadline:
+            break
+        time.sleep(1)
+    assert names, f"{label}: found no connections to drop"
+    for name in names:
+        try:
+            call(f"/connections/{quote(name, safe='')}", "DELETE")
+        except urllib.error.HTTPError:
+            pass  # gone between the listing and the request
+    return True
 
 
 def _send_until_it_lands(send, label: str, tries: int = 5) -> str:
@@ -1344,7 +1385,6 @@ def _b35_a_dropped_connection_comes_back(url, label, skip, app, env, log, produc
             raise AssertionError(f"{label}: the conflicting declare was expected to fail")
         rows = producer.depth(["default"])
         assert rows and rows[0][0] == "default", f"{label}: the channel never came back: {rows}"
-        return
 
     app.registry["note"].send("before-the-drop")
     said = Path(env["TARSK_LOG"]).with_name("worker.err")

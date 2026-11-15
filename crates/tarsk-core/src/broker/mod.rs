@@ -969,12 +969,15 @@ impl Broker {
     }
 
     /// Give an idle connection the chance to find out it has been closed,
-    /// before the caller sends anything it would mind losing. Only Redis needs
-    /// asking; see `RedisBroker::refresh`.
+    /// before the caller sends anything it would mind losing. Postgres checks
+    /// its connection on every use and has nothing to ask.
     pub async fn refresh(&self) {
-        #[cfg(feature = "redis")]
-        if let Broker::Redis(b) = self {
-            b.refresh().await;
+        match self {
+            #[cfg(feature = "redis")]
+            Broker::Redis(b) => b.refresh().await,
+            #[cfg(feature = "amqp")]
+            Broker::Amqp(b) => b.refresh().await,
+            _ => {}
         }
     }
 

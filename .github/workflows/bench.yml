@@ -11,7 +11,7 @@ on:
         required: false
         default: ""
       refs:
-        description: "tags or commits to measure against each other on this one machine (empty = this checkout only)"
+        description: "tags or commits to measure against each other on this one machine, oldest first (empty = this checkout only). Before a release: '<last tag> HEAD'"
         required: false
         default: ""
 
@@ -83,7 +83,7 @@ jobs:
         run: |
           set -o pipefail
           for ref in ${{ inputs.refs }}; do
-            git worktree add -q "../ref-$ref" "$ref"
+            git worktree add -q --detach "../ref-$ref" "$ref"
             ( cd "../ref-$ref"
               python -m venv .venv
               .venv/bin/pip install -q maturin celery taskiq taskiq-redis redis packaging
@@ -101,3 +101,10 @@ jobs:
         with:
           name: bench-${{ github.sha }}
           path: bench-output.md
+
+      - name: Did the newest ref get slower
+        # After the upload, so a run that fails here still leaves its report.
+        if: inputs.refs != '' && (inputs.scenarios == '' || contains(inputs.scenarios, 'scale'))
+        run: |
+          set -o pipefail
+          python bench/compare.py bench-output.md | tee -a "$GITHUB_STEP_SUMMARY"

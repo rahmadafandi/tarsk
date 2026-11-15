@@ -114,6 +114,8 @@ jobs:
       # Pyflakes-level only; the rule set is in pyproject.toml. The package
       # ships py.typed and nothing had ever looked at the Python.
       - run: pipx run ruff check tarsk tests packaging
+      # The script that decides whether a release got slower, against itself.
+      - run: python3 bench/compare.py --demo
       # The package ships py.typed and typed signatures for send(); this is
       # what holds them to it. msgpack is installed so its import resolves.
       # A venv, because the runner's own Python refuses a bare `pip install`.

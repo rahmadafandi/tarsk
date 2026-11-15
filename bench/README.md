@@ -27,6 +27,20 @@ harness uses `FLUSHDB`, so a database number in the URL is respected and the res
 instance is left alone. A throwaway server is still the better measurement, since it runs
 without persistence and without other traffic.
 
+## Before a release
+
+```bash
+gh workflow run bench.yml -f refs="<last tag> HEAD" -f scenarios=scale
+```
+
+Both are built and drained in turn on one runner, twice over, and the run fails if `HEAD` is
+more than 3% slower than the tag in both rounds once each is divided by taskiq's figure from
+the same round; the table is in the run's summary. About a quarter of an hour. It is not part
+of CI because a shared runner is too noisy to gate every push on, and it is here at all
+because 0.4.0 shipped a 4.6% slowdown nothing had measured. `bench/compare.py` reads the
+report; `refs` takes any number of tags or commits, oldest first, to find where a change
+came in.
+
 The published tables come from a GitHub Actions runner via
 [`.github/workflows/bench.yml`](../.github/workflows/bench.yml), which anyone with the
 repository can dispatch. Prefer those over anything a laptop produces: a machine nobody else has

@@ -44,6 +44,9 @@ pub struct RedisBroker {
     /// store says, refreshed on the timer that pulls cancellations, so a claim
     /// does not pay a round trip to learn that nothing is paused.
     pub(super) held: Mutex<std::collections::HashSet<String>>,
+    /// The timeout of each entry the last sweep found still inside its lease,
+    /// by stream and id. See `reclaim_expired`.
+    leases: Mutex<HashMap<String, u64>>,
     /// Shortest timeout registered anywhere, the floor for the pending sweep.
     pub(super) min_timeout_ms: AtomicU64,
     /// Slack added to every job's own timeout before its lease is considered
@@ -229,6 +232,7 @@ impl RedisBroker {
                     .unwrap_or(0),
             ),
             held: Mutex::new(std::collections::HashSet::new()),
+            leases: Mutex::new(HashMap::new()),
             claimed: Mutex::new(VecDeque::new()),
             prefetch: AtomicU64::new(1),
             prefetch_cap: AtomicU64::new(DEFAULT_PREFETCH_CAP),
@@ -1329,6 +1333,14 @@ impl RedisBroker {
         if self.min_timeout_ms.load(Ordering::Relaxed) == u64::MAX {
             return Ok(0); // nothing claimed yet, so nothing can be overdue
         }
+        // An entry's timeout is in the entry, which the pending list does not
+        // carry, so telling "overdue" from "a long job" took an XRANGE each —
+        // for every job in flight past the shortest timeout, every second,
+        // from every worker: 150 long jobs were 150 reads a second apiece.
+        // The answer does not change while the entry lives, so it is asked
+        // once and remembered for as long as the entry keeps turning up.
+        let known = std::mem::take(&mut *self.leases.lock().unwrap());
+        let mut still: HashMap<String, u64> = HashMap::new();
         let mut reclaimed = 0;
         for queue in &self.queues {
             let key = stream_key(queue);
@@ -1358,6 +1370,13 @@ impl RedisBroker {
                     start = format!("({}", last.id); // exclusive: the next page
                 }
                 for candidate in pending.ids {
+                    let tag = format!("{key}/{}", candidate.id);
+                    if let Some(timeout_ms) = known.get(&tag) {
+                        if (candidate.last_delivered_ms as u64) <= timeout_ms + grace_ms {
+                            still.insert(tag, *timeout_ms);
+                            continue; // known, and still inside its own lease
+                        }
+                    }
                     let entries: redis::streams::StreamRangeReply = redis::cmd("XRANGE")
                         .arg(&key)
                         .arg(&candidate.id)
@@ -1370,6 +1389,7 @@ impl RedisBroker {
                     let (name, payload, timeout_ms) = entry_fields(entry);
                     let deadline = timeout_ms + grace_ms;
                     if (candidate.last_delivered_ms as u64) <= deadline {
+                        still.insert(tag, timeout_ms);
                         continue; // still inside its own lease
                     }
                     let claimed: redis::streams::StreamClaimReply = redis::cmd("XCLAIM")
@@ -1408,6 +1428,7 @@ impl RedisBroker {
                 }
             }
         }
+        *self.leases.lock().unwrap() = still;
         Ok(reclaimed)
     }
 }

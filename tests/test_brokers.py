@@ -1714,6 +1714,23 @@ def _b43_a_batch_arrives_whole(url, label, skip, app, env, log, producer):
     assert not ran, f"{label}: a refused batch still queued {ran}"
 
 
+def _b47_a_job_handed_back_is_not_left_behind(url, label, skip, app, env, log, producer):
+    # --- a retry keeps its place, far below where the worker now looks ---
+    # Postgres starts a claim just under the newest id it has taken, and a job
+    # handed back with no delay sits where it was. It has to be found anyway.
+    log.write_text("")
+    app.registry["comes_back"].send("came-back")
+    app.send_many(app.registry["note"].si(f"ahead-{i}") for i in range(3000))
+    worker = start_worker(env, TARSK_SLOTS=50, TARSK_LEASE_GRACE=1)
+    try:
+        seen = wait_for(log, {"came-back"}, timeout=90)
+    finally:
+        stop_worker(worker)
+    ahead = sum(1 for tag in seen if tag.startswith("ahead-"))
+    assert "came-back" in seen, \
+        f"{label}: handed back after {ahead} newer jobs ran, and never taken again"
+
+
 class _on_queue:
     """A task as `send_many` sees it, with its queue swapped for one job."""
 

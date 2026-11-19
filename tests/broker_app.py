@@ -4,7 +4,7 @@ import os
 import time
 from pathlib import Path
 
-from tarsk import App, Context, Depends
+from tarsk import App, Context, Depends, Retry
 
 app = App(broker=os.environ.get("TARSK_BROKER"), default_timeout=30, max_timeout=30)
 
@@ -246,6 +246,21 @@ def holds(tag):
     """Sits in flight, inside its lease, for as long as a test needs it there."""
     if not os.path.exists(os.environ["TARSK_LOG"] + ".release"):
         time.sleep(30)
+    return tag
+
+
+@app.task(name="comes_back", retries=1, backoff="none")
+def comes_back(tag, ctx=Depends(Context)):
+    """Holds on until thousands of newer jobs have run, then asks to go again."""
+    if ctx.attempt == 1:
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            with open(os.environ["TARSK_LOG"]) as fh:
+                if sum(1 for _ in fh) >= 2500:
+                    break
+            time.sleep(0.05)
+        raise Retry(delay=0)
+    _log(tag)
     return tag
 
 

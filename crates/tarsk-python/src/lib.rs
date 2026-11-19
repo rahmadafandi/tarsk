@@ -232,7 +232,7 @@ fn work(
 type DeadRow = (String, String, String, String, u64);
 
 /// One queue's backlog crossing into Python: name, ready, in flight, delayed, dead.
-type DepthRow = (String, u64, u64, u64, u64);
+type DepthRow = (String, u64, u64, u64, u64, Option<u64>);
 
 /// One job crossing into Python: id, queue, name, state, attempt, age, worker,
 /// and whatever the sender attached, still packed.
@@ -432,7 +432,8 @@ impl Producer {
         Ok(queues)
     }
 
-    /// Backlog per queue: (queue, ready, in flight, delayed, dead).
+    /// Backlog per queue: (queue, ready, in flight, delayed, dead, and how many
+    /// milliseconds the oldest ready job has waited, where the broker can say).
     #[pyo3(signature = (queues))]
     fn depth(&self, py: Python<'_>, queues: Vec<String>) -> PyResult<Vec<DepthRow>> {
         let rows = py
@@ -440,7 +441,16 @@ impl Producer {
             .map_err(broker_err)?;
         Ok(rows
             .into_iter()
-            .map(|d| (d.queue, d.ready, d.in_flight, d.delayed, d.dead))
+            .map(|d| {
+                (
+                    d.queue,
+                    d.ready,
+                    d.in_flight,
+                    d.delayed,
+                    d.dead,
+                    d.oldest_ms,
+                )
+            })
             .collect())
     }
 

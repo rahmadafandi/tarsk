@@ -997,7 +997,10 @@ impl PgBroker {
                 "select queue,
                         count(*) filter (where lease_until is null or lease_until < now()),
                         count(*) filter (where lease_until >= now() and run_lease > 0),
-                        count(*) filter (where lease_until >= now() and run_lease = 0)
+                        count(*) filter (where lease_until >= now() and run_lease = 0),
+                        (extract(epoch from now() - min(coalesce(lease_until, created_at))
+                            filter (where lease_until is null or lease_until < now()))
+                            * 1000)::bigint
                    from tarsk_jobs where queue = any($1) group by queue",
                 &[&queues],
             )
@@ -1024,6 +1027,11 @@ impl PgBroker {
                 in_flight: row.map(|r| r.get::<_, i64>(2)).unwrap_or(0).max(0) as u64,
                 delayed: row.map(|r| r.get::<_, i64>(3)).unwrap_or(0).max(0) as u64,
                 dead: buried.max(0) as u64,
+                oldest_ms: Some(
+                    row.and_then(|r| r.get::<_, Option<i64>>(4))
+                        .unwrap_or(0)
+                        .max(0) as u64,
+                ),
             });
         }
         Ok(out)

@@ -690,7 +690,7 @@ def _b14_the_backlog_is_visible(url, label, skip, app, env, log, producer):
 
     def depth():
         rows = producer.depth(["default"])
-        return rows[0][1:] if rows else (0, 0, 0, 0)
+        return rows[0][1:5] if rows else (0, 0, 0, 0)
 
     before = depth()
     for i in range(4):
@@ -698,6 +698,15 @@ def _b14_the_backlog_is_visible(url, label, skip, app, env, log, producer):
     ready, running, delayed, _dead = depth()
     assert ready == before[0] + 4, f"{label}: four sent, ready went {before[0]} → {ready}"
     assert delayed == before[2], f"{label}: nothing was delayed, but delayed={delayed}"
+    # How long the front of the queue has waited, where the broker can say.
+    time.sleep(1.2)
+    waiting = app.depth(["default"])[0]
+    listed = [job for job in app.jobs(["default"]) if job.state == "ready"]
+    if scheme_is(url, ("amqp", "amqps")):
+        assert waiting.oldest is None, f"{label}: an age it cannot know: {waiting}"
+    else:
+        assert (waiting.oldest or 0) >= 1.0, f"{label}: four waited 1.2s: {waiting}"
+        assert len(listed) >= 4, f"{label}: four ready, {len(listed)} listed"
     worker = start_worker(env, TARSK_LEASE_GRACE=1)
     try:
         deadline = time.time() + 30
@@ -708,6 +717,8 @@ def _b14_the_backlog_is_visible(url, label, skip, app, env, log, producer):
     ready, running, _delayed, _dead = depth()
     assert (ready, running) == (0, 0), \
         f"{label}: queue drained but reports ready={ready} running={running}"
+    assert not app.depth(["default"])[0].oldest, \
+        f"{label}: nothing waits, but something is old: {app.depth(['default'])}"
 
 
 def _b15_a_chain_runs_in(url, label, skip, app, env, log, producer):
@@ -1328,6 +1339,11 @@ def _b34_the_console_acts_on_what_it_was_sent(url, label, skip, app, env, log, p
         parked = producer.dead_list(queue="default", limit=50)
         assert len(parked) >= 2, f"{label}: expected two dead letters, found {len(parked)}"
         scrape_metrics(port)  # the listener is up
+
+        # The probes answer without a token and from any name, as a scrape does.
+        for probe in ("/healthz", "/readyz"):
+            said = _console(port, f"GET {probe} HTTP/1.1\r\nHost: probe\r\n\r\n".encode())
+            assert said.startswith("HTTP/1.1 200"), f"{label}: {probe} said {said[:40]!r}"
 
         # No token, so it answers only as the machine itself. A page that has
         # re-pointed its own name at 127.0.0.1 still arrives under that name.

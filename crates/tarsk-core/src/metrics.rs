@@ -34,6 +34,10 @@ const BUCKETS: [f64; 15] = [
     f64::INFINITY,
 ];
 
+/// One queue: its name, how many jobs are ready, in flight, delayed and dead,
+/// and how long the oldest ready one has waited where the broker can say.
+pub type QueueRow = (String, [u64; 4], Option<u64>);
+
 #[derive(Default)]
 pub struct Metrics {
     /// task name → [succeeded, failed]. Bounded by the registry, so the label
@@ -48,7 +52,7 @@ pub struct Metrics {
     /// Backlog per queue: (ready, in flight, delayed, dead). Polled on a timer
     /// rather than counted here, because the numbers live in the broker and
     /// this process is not the only one working the queue.
-    depth: Mutex<Vec<(String, [u64; 4])>>,
+    depth: Mutex<Vec<QueueRow>>,
     /// task name → (runs measured, bytes of child RSS they left behind, the
     /// most any one of them left). See `observe_growth`.
     growth: Mutex<HashMap<String, (u64, u64, u64)>>,
@@ -163,7 +167,7 @@ impl Metrics {
         rows
     }
 
-    pub fn set_depth(&self, rows: Vec<(String, [u64; 4])>) {
+    pub fn set_depth(&self, rows: Vec<QueueRow>) {
         *self.depth.lock().unwrap() = rows;
     }
 
@@ -206,7 +210,7 @@ pub fn render(
     if !depth.is_empty() {
         out.push_str("# HELP tarsk_queue_jobs How much work is waiting, by queue and state.\n");
         out.push_str("# TYPE tarsk_queue_jobs gauge\n");
-        for (queue, [ready, in_flight, delayed, dead]) in depth.iter() {
+        for (queue, [ready, in_flight, delayed, dead], _) in depth.iter() {
             for (state, value) in [
                 ("ready", ready),
                 ("in_flight", in_flight),
@@ -217,6 +221,24 @@ pub fn render(
                     "tarsk_queue_jobs{{queue=\"{}\",state=\"{state}\"}} {value}\n",
                     escape(queue)
                 ));
+            }
+        }
+        // Depth says how much is waiting and not for how long: a deep queue
+        // that is draining and a shallow one nobody is serving look alike
+        // until the age of the job at the front is beside them.
+        if depth.iter().any(|(_, _, oldest)| oldest.is_some()) {
+            out.push_str(
+                "# HELP tarsk_queue_oldest_ready_seconds How long the oldest claimable job has waited.\n",
+            );
+            out.push_str("# TYPE tarsk_queue_oldest_ready_seconds gauge\n");
+            for (queue, _, oldest) in depth.iter() {
+                if let Some(ms) = oldest {
+                    out.push_str(&format!(
+                        "tarsk_queue_oldest_ready_seconds{{queue=\"{}\"}} {:.3}\n",
+                        escape(queue),
+                        *ms as f64 / 1000.0
+                    ));
+                }
             }
         }
     }
@@ -397,10 +419,23 @@ mod tests {
         assert_eq!(escape("two\nlines"), "two\\nlines");
 
         let metrics = Metrics::default();
-        metrics.set_depth(vec![("odd\"queue\n".to_string(), [1, 0, 0, 0])]);
+        metrics.set_depth(vec![
+            ("odd\"queue\n".to_string(), [1, 0, 0, 0], Some(2500)),
+            ("unknowable".to_string(), [1, 0, 0, 0], None),
+        ]);
         let text = render(&metrics, &[], &std::collections::HashMap::new(), 0);
         assert!(
             text.contains(r#"tarsk_queue_jobs{queue="odd\"queue\n",state="ready"} 1"#),
+            "{text}"
+        );
+        // An age for the queue that has one, and no line at all for the one
+        // whose broker cannot say: a zero there would read as "no lag".
+        assert!(
+            text.contains(r#"tarsk_queue_oldest_ready_seconds{queue="odd\"queue\n"} 2.500"#),
+            "{text}"
+        );
+        assert!(
+            !text.contains(r#"tarsk_queue_oldest_ready_seconds{queue="unknowable"}"#),
             "{text}"
         );
     }

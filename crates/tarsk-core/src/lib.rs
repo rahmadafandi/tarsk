@@ -2476,7 +2476,13 @@ pub async fn supervise_until(
                     match shared.broker.depth().await {
                         Ok(rows) => shared.metrics.set_depth(
                             rows.into_iter()
-                                .map(|d| (d.queue, [d.ready, d.in_flight, d.delayed, d.dead]))
+                                .map(|d| {
+                                    (
+                                        d.queue,
+                                        [d.ready, d.in_flight, d.delayed, d.dead],
+                                        d.oldest_ms,
+                                    )
+                                })
                                 .collect(),
                         ),
                         Err(err) => shared.broker_error("reading queue depth", err.as_ref()),

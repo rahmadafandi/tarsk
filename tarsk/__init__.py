@@ -17,13 +17,14 @@ import os
 import re
 import secrets
 from dataclasses import dataclass, field
-from typing import Any, Callable, Generic, ParamSpec, TypeVar
+from typing import Any, Callable, Generic, NamedTuple, ParamSpec, TypeVar
 
 P = ParamSpec("P")
 R = TypeVar("R")
 
 __all__ = [
-    "App", "AsyncResult", "BrokerError", "Cancelled", "Chain", "Chord", "Context", "Depends", "Group",
+    "App", "AsyncResult", "BrokerError", "Cancelled", "Chain", "Chord", "Context", "DeadLetter", "Depends",
+    "Group", "Job", "QueueDepth",
     "Signature", "Task", "TaskFailed", "TaskSpec", "Reject", "Retry", "SoftTimeout",
     "chain", "chord", "group", "load_app",
 ]
@@ -710,6 +711,43 @@ class App:
         """Let workers take from `queue` again. See `pause`."""
         self.producer().pause(queue, False)
 
+    def _queues(self) -> list[str]:
+        return sorted({t.spec.queue for t in self.registry.values()} or {"default"})
+
+    def depth(self, queues: "list[str] | None" = None) -> "list[QueueDepth]":
+        """How much is waiting on each queue, and for how long.
+
+        Every queue a task here is registered on, unless told which. This and
+        the four below are what `tarsk status`, `jobs` and `dead` print, for
+        an admin page or an autoscaler that wants the numbers and not the text.
+        """
+        wanted = queues or self._queues()
+        return [QueueDepth(*row[:5], None if row[5] is None else row[5] / 1000)
+                for row in self.producer().depth(wanted)]
+
+    def jobs(self, queues: "list[str] | None" = None, limit: int = 50) -> "list[Job]":
+        """The jobs waiting or running, oldest first. See `depth`."""
+        from . import _proto  # lazy — see App.producer
+
+        wanted = queues or self._queues()
+        return [Job(*row[:5], row[5] / 1000, row[6],
+                    _proto.unpack_result(row[7]) if row[7] else {})
+                for row in self.producer().jobs(wanted, limit)]
+
+    def dead(self, queue: str = "default", limit: int = 50) -> "list[DeadLetter]":
+        """What the retries gave up on, oldest first."""
+        return [DeadLetter(*row[:4], row[4] / 1000)
+                for row in self.producer().dead_list(queue=queue, limit=limit)]
+
+    def replay_dead(self, queue: str = "default", ids: "list[str] | None" = None) -> int:
+        """Send dead letters round again, all of them unless given ids. Returns
+        how many moved."""
+        return self.producer().dead_replay(queue=queue, ids=ids or [])
+
+    def purge_dead(self, queue: str = "default", ids: "list[str] | None" = None) -> int:
+        """Drop dead letters, all of them unless given ids. Returns how many went."""
+        return self.producer().dead_purge(queue=queue, ids=ids or [])
+
     def result(self, task_id: str) -> "AsyncResult":
         """Handle for reading back a task that set `result_ttl`."""
         return AsyncResult(self, task_id)
@@ -760,6 +798,41 @@ async def _finish(finishers: list) -> None:
 
 _RATE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*/\s*(\d*)\s*([smh])\s*$")
 _PER = {"s": 1.0, "m": 60.0, "h": 3600.0}
+
+
+class QueueDepth(NamedTuple):
+    queue: str
+    ready: int
+    running: int
+    delayed: int
+    dead: int
+    #: Seconds the oldest ready job has waited: zero with nothing ready, and
+    #: None on RabbitMQ, which cannot say.
+    oldest: float | None
+
+
+class Job(NamedTuple):
+    id: str
+    queue: str
+    name: str
+    #: "ready", "running" or "delayed".
+    state: str
+    attempt: int
+    #: Seconds since it became ready or was claimed; negative for a delayed
+    #: job, which is that long from coming due.
+    age: float
+    #: Who holds it, for a running job.
+    worker: str
+    meta: dict
+
+
+class DeadLetter(NamedTuple):
+    id: str
+    name: str
+    error: str
+    traceback: str
+    #: Unix seconds, or zero when the broker kept no time.
+    died_at: float
 
 
 def parse_rate(text: str) -> tuple[float, int]:

@@ -261,10 +261,14 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:  # noqa: BLE001 — a backend that cannot pause has none paused
             paused = set()
         width = max((len(r[0]) for r in rows), default=5)
-        print(f"{'queue':<{width}}  {'ready':>8} {'running':>8} {'delayed':>8} {'dead':>8}")
-        for queue, ready, running, delayed, dead in rows:
+        print(f"{'queue':<{width}}  {'ready':>8} {'oldest':>8} {'running':>8} "
+              f"{'delayed':>8} {'dead':>8}")
+        for queue, ready, running, delayed, dead, oldest_ms in rows:
             held = "  paused" if queue in paused else ""
-            print(f"{queue:<{width}}  {ready:>8} {running:>8} {delayed:>8} {dead:>8}{held}")
+            # Blank where nothing waits, and where the broker cannot say.
+            oldest = _span(oldest_ms) if ready and oldest_ms is not None else ""
+            print(f"{queue:<{width}}  {ready:>8} {oldest:>8} {running:>8} {delayed:>8} "
+                  f"{dead:>8}{held}")
         if not rows:
             print("(no such queue, or nothing has ever been sent to it)")
         return 0

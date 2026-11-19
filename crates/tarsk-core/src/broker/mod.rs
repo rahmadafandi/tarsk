@@ -311,6 +311,9 @@ pub struct Depth {
     /// Enqueued for later and not yet due.
     pub delayed: u64,
     pub dead: u64,
+    /// How long the oldest claimable job has been waiting, in milliseconds:
+    /// zero with nothing ready, and `None` where the broker cannot say.
+    pub oldest_ms: Option<u64>,
 }
 
 /// One job in a queue, as someone looking for a stuck one needs to see it.

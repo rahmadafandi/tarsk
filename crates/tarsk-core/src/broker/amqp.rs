@@ -743,6 +743,7 @@ impl AmqpBroker {
                 in_flight: 0,
                 delayed: 0,
                 dead,
+                oldest_ms: None,
             });
         }
         Ok(rows)

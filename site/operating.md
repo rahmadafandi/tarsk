@@ -143,9 +143,9 @@ not retried for you: whether the server acted on it is not something a client ca
 
 ```
 $ tarsk status --broker redis://localhost:6379/0 --queues default,reports
-queue       ready  running  delayed     dead
-default        25        0        5        0
-reports         0        1        0        2
+queue       ready   oldest  running  delayed     dead
+default        25      40s        0        5        0
+reports         0                 1        0        2
 
 $ tarsk jobs --broker redis://localhost:6379/0 --state running
 70cd39698ff0f529  running  rebuild_report  14m ago  attempt 2  on tarsk-25530
@@ -169,6 +169,25 @@ nothing in the supervisor ever looks at what is in it.
 
 And as `tarsk_queue_jobs{queue,state}` on the metrics endpoint, refreshed by the worker on the
 same timer that pulls cancellations.
+
+`oldest` is how long the job at the front has been waiting, and
+`tarsk_queue_oldest_ready_seconds{queue}` on the metrics endpoint. It is the one to alert on.
+Depth says how much is waiting and nothing about whether it is moving: a thousand jobs deep
+and draining is a busy afternoon, three jobs deep and ten minutes old is a worker that has
+stopped. RabbitMQ cannot say how old a message is without taking it, so the column is blank
+there and the gauge absent, rather than a zero that would read as no lag.
+
+The same numbers are there from Python, for an admin page or an autoscaler:
+
+```python
+for q in app.depth():                 # every queue a task is registered on
+    print(q.queue, q.ready, q.oldest)
+
+app.jobs(limit=20)                    # what `tarsk jobs` lists
+app.dead("reports")                   # what `tarsk dead list` lists
+app.replay_dead("reports")            # all of them, or ids=[...]
+app.purge_dead("reports", ids=[...])
+```
 
 This is the question an operator asks first — *how far behind are we* — and until this existed
 the metrics could not answer it. They counted tasks finished, which is throughput; a queue can
@@ -268,6 +287,13 @@ the supervision loop takes anyway, so a Python worker never learns it is being o
 
 Including `tarsk_supervisor_rss_bytes`, so the constant this project calls constant can be
 checked rather than believed.
+
+The same address answers two probes, neither of which needs the console's token. `/healthz`
+is 200 for as long as the supervisor is answering at all. `/readyz` is 200 when the broker
+answers it and 503 with the broker's error when it does not. A worker takes no traffic, so
+readiness gates nothing by itself; it is there for a rollout that should stop when the new
+workers cannot reach the queue. Do not point a liveness probe at `/readyz`: a broker outage
+would restart every worker, which fixes nothing and throws away the tasks they are running.
 
 ## Running the tests
 

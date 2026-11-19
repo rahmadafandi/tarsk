@@ -959,12 +959,39 @@ impl RedisBroker {
                 Some(redis::streams::StreamPendingReply::Data(d)) => d.count as u64,
                 _ => 0,
             };
+            let ready = len.saturating_sub(in_flight);
+            // An entry's id is when it was written, and what nobody has been
+            // handed yet starts right after the last id the group delivered.
+            let mut oldest_ms = 0;
+            if ready > 0 {
+                let groups: Option<redis::streams::StreamInfoGroupsReply> = redis::cmd("XINFO")
+                    .arg("GROUPS")
+                    .arg(&key)
+                    .query_async(&mut conn)
+                    .await
+                    .ok();
+                let after = groups
+                    .and_then(|g| g.groups.into_iter().find(|g| g.name == REDIS_GROUP))
+                    .map_or("-".to_string(), |g| format!("({}", g.last_delivered_id));
+                let next: redis::streams::StreamRangeReply = redis::cmd("XRANGE")
+                    .arg(&key)
+                    .arg(after)
+                    .arg("+")
+                    .arg("COUNT")
+                    .arg(1)
+                    .query_async(&mut conn)
+                    .await?;
+                if let Some(entry) = next.ids.first() {
+                    oldest_ms = now_ms().saturating_sub(stream_id_ms(&entry.id));
+                }
+            }
             out.push(Depth {
                 queue: queue.clone(),
-                ready: len.saturating_sub(in_flight),
+                ready,
                 in_flight,
                 delayed,
                 dead,
+                oldest_ms: Some(oldest_ms),
             });
         }
         Ok(out)

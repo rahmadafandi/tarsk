@@ -263,6 +263,18 @@ async fn handle(
         return respond(&mut stream, 200, "text/plain; version=0.0.4", &metrics_body).await;
     }
 
+    // Probes, exempt for the same reason. Alive is this process answering;
+    // ready is the broker answering it, which is the half a restart can fix.
+    if request.path == "/healthz" {
+        return respond(&mut stream, 200, "text/plain", "ok\n").await;
+    }
+    if request.path == "/readyz" {
+        return match shared.broker.depth().await {
+            Ok(_) => respond(&mut stream, 200, "text/plain", "ok\n").await,
+            Err(err) => respond(&mut stream, 503, "text/plain", &format!("broker: {err}\n")).await,
+        };
+    }
+
     if guard.expect.is_empty() && !request.names_loopback() {
         return respond(
             &mut stream,
@@ -521,11 +533,13 @@ async fn dashboard(shared: &Arc<Shared>, guard: &Guard) -> String {
     // A backend with nowhere to keep a pause refuses the question; the column
     // is then simply empty rather than the page failing.
     let paused = shared.broker.paused().await.unwrap_or_default();
-    page.push_str("<h2>Queues</h2><table><tr><th>queue<th>ready<th>running<th>delayed<th>dead<th>");
+    page.push_str(
+        "<h2>Queues</h2><table><tr><th>queue<th>ready<th>oldest<th>running<th>delayed<th>dead<th>",
+    );
     for row in &depth {
         let held = paused.contains(&row.queue);
         page.push_str(&format!(
-            "<tr><td>{}{}<td class=n>{}<td class=n>{}<td class=n>{}<td class=n>{}<td>{}",
+            "<tr><td>{}{}<td class=n>{}<td class=n>{}<td class=n>{}<td class=n>{}<td class=n>{}<td>{}",
             escape(&row.queue),
             if held {
                 " <span class=\"s delayed\">paused</span>"
@@ -533,6 +547,10 @@ async fn dashboard(shared: &Arc<Shared>, guard: &Guard) -> String {
                 ""
             },
             row.ready,
+            match row.oldest_ms {
+                Some(ms) if row.ready > 0 => span(ms as i64),
+                _ => String::new(),
+            },
             row.in_flight,
             row.delayed,
             row.dead,
@@ -728,6 +746,7 @@ async fn respond(
         400 => "Bad Request",
         403 => "Forbidden",
         404 => "Not Found",
+        503 => "Service Unavailable",
         _ => "Error",
     };
     let head = format!(

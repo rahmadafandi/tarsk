@@ -192,7 +192,7 @@ jobs:
           subject-path: "dist/*"
       # Pinned to the full version: setup-uv stopped publishing a moving
       # major tag after v7, so @v10 does not resolve.
-      - uses: astral-sh/setup-uv@v10.0.1
+      - uses: astral-sh/setup-uv@v10.3.3
       - name: Publish to PyPI
         # Only a tag publishes. A manual run builds every wheel and attests
         # them, which is the rehearsal worth having before the first release.

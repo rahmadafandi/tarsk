@@ -196,6 +196,11 @@ class Task(Generic[P, R]):
         self.spec = spec
         self.app = app
         self.is_async = inspect.iscoroutinefunction(fn)
+        #: Which failures are worth another attempt: any of `retry_on` when it
+        #: is given, and none of `no_retry_on`. Read by the child and never
+        #: sent anywhere, since classes mean nothing outside this code.
+        self.retry_on: Any = None
+        self.no_retry_on: Any = ()
         # Worked out once, at import, rather than on every dispatch.
         self.depends = {
             name: param.default
@@ -435,8 +440,18 @@ class App:
         soft_timeout: float = 0.0,
         backoff_base: float = 1.0,
         backoff_max: float = 64.0,
+        retry_on: "type[BaseException] | tuple[type[BaseException], ...] | None" = None,
+        no_retry_on: "type[BaseException] | tuple[type[BaseException], ...]" = (),
     ) -> Callable[[Callable[P, R]], Task[P, R]]:
         def decorate(fn: Callable[P, R]) -> Task[P, R]:
+            for label, given in (("retry_on", retry_on), ("no_retry_on", no_retry_on)):
+                classes = given if isinstance(given, tuple) else (given,)
+                if given is not None and not all(
+                    isinstance(c, type) and issubclass(c, BaseException) for c in classes
+                ):
+                    raise ValueError(
+                        f"{fn.__qualname__}: {label} takes an exception class or a "
+                        f"tuple of them, got {given!r}")
             t = self.default_timeout if timeout is None else timeout
             if t <= 0:
                 raise ValueError(f"{fn.__qualname__}: timeout must be positive")
@@ -507,6 +522,7 @@ class App:
                 int(backoff_base * 1000), int(backoff_max * 1000),
             )
             task = Task(fn, spec, self)
+            task.retry_on, task.no_retry_on = retry_on, no_retry_on
             self.registry[task_name] = task
             return task
 

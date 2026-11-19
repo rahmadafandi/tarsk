@@ -174,6 +174,26 @@ def test_reject_skips_the_remaining_retries():
     assert sup.stats["tasks_dead_lettered"] == 1, sup.stats
 
 
+def test_a_task_chooses_which_failures_to_retry():
+    sup = Supervisor("tests.demo_app:app", children=1)
+    results = sup.run([("picky", ("os",), {}), ("picky", ("missing",), {}),
+                       ("picky", ("other",), {})])
+    assert [results[i][1][0] for i in range(3)] == [
+        "ConnectionResetError", "FileNotFoundError", "KeyError"], results
+    # Only the one named in retry_on spent its five retries; the other two
+    # were dead on the first failure, under their own names.
+    assert sup.stats["task_retries"] == 5, sup.stats
+    assert sup.stats["tasks_dead_lettered"] == 3, sup.stats
+
+    for bad in ("ValueError", (ValueError, 3)):
+        try:
+            App().task(retry_on=bad)(lambda: None)  # type: ignore[arg-type]
+        except ValueError as why:
+            assert "retry_on" in str(why), why
+        else:
+            raise AssertionError(f"retry_on={bad!r} was accepted")
+
+
 def test_a_duplicate_ack_is_not_counted():
     """The child hosts user code, so it is not a trusted counter of its own work.
 
@@ -476,6 +496,7 @@ if __name__ == "__main__":
     for check in (test_slots_overlap_inside_one_child, test_slots_overlap_sync_handlers_too, test_registry_hash, test_timeout_cap, test_end_to_end,
                   test_retry_then_succeed, test_retries_run_out,
                   test_reject_skips_the_remaining_retries, test_retry_hands_the_job_back,
+                  test_a_task_chooses_which_failures_to_retry,
                   test_a_duplicate_ack_is_not_counted,
                   test_attempt_counts_up_across_retries,
                   test_a_handlers_own_timeout_is_not_the_tasks,

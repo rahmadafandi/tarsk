@@ -184,6 +184,13 @@ def hopeless():
     raise Reject("this payload will never parse")
 
 
+@app.task(name="picky", retries=5, backoff="none", retry_on=OSError,
+          no_retry_on=FileNotFoundError)
+def picky(kind):
+    """Only an OSError is worth another go, and a missing file is not even that."""
+    raise {"os": ConnectionResetError, "missing": FileNotFoundError, "other": KeyError}[kind](kind)
+
+
 @app.task(name="asks_again", retries=3)
 def asks_again(marker):
     path = Path(marker)

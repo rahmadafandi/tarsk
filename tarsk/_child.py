@@ -403,7 +403,12 @@ async def _one(app, wire: Wire, app_spec: str, task_id: int, name: str, payload,
                 f"{name} exceeded timeout of {task.spec.timeout_ms / 1000}s", "", 0), task.is_async
     except Exception as exc:
         # Pre-formatted string — never reconstructed Rust-side (spec §4.2).
-        return ("Nack", task_id, type(exc).__name__, traceback.format_exc(), "", 0), True
+        # A failure the task said is not worth repeating goes the way of a
+        # Reject, under its own name and with its own traceback.
+        again = not isinstance(exc, task.no_retry_on) and (
+            task.retry_on is None or isinstance(exc, task.retry_on))
+        return ("Nack", task_id, type(exc).__name__, traceback.format_exc(),
+                "" if again else "reject", 0), True
     else:
         return ("Ack", task_id, _proto.pack_result(result)), True
 

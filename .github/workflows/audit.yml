@@ -1,0 +1,24 @@
+name: audit
+
+# Known vulnerabilities in what Cargo.lock pins. On a timer and not on every
+# push: an advisory arrives on its own schedule, and one published against a
+# dependency should not turn an unrelated pull request red.
+on:
+  schedule:
+    - cron: "17 5 * * 1"
+  push:
+    branches: [main]
+    paths: [Cargo.lock, .github/workflows/audit.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit

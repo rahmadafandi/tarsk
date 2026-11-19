@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Added
+
+- **`retry_on=` and `no_retry_on=` on a task**, by exception class. A failure that is not
+  worth repeating goes to the dead letters on its first attempt, under its own name, where
+  it used to need a `try` and a `Reject` in every handler.
+- **How long the oldest ready job has waited**, as `tarsk_queue_oldest_ready_seconds{queue}`,
+  an `oldest` column in `tarsk status` and in the console. Depth could not tell a deep queue
+  that is draining from a shallow one nobody is serving. Redis and Postgres; RabbitMQ cannot
+  say, and reports nothing rather than zero.
+- **`/healthz` and `/readyz`** on the metrics address, without a token. The first answers
+  while the supervisor does, the second while the broker does.
+- **`app.depth()`, `app.jobs()`, `app.dead()`, `app.replay_dead()` and `app.purge_dead()`**:
+  what the CLI prints, as typed records, for an admin page or an autoscaler.
+
 ### Changed
 
 - **A worker is no longer held to one broker round trip per job.** Free slots are filled by

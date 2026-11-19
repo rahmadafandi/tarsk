@@ -123,6 +123,7 @@ count, but the only way to bound it at one task is `--slots 1`.
 
 - RabbitMQ is the basic backend: jobs, retries, delays, chains and results, and none of the
   things that need a store every worker can read — cancel, pause, dedup, chords, shared limits
+- Redis Cluster and Sentinel. One Redis node, or a managed one that looks like one
 - Windows runs the suites that need no broker, since neither Redis nor Postgres ships for it.
   Everything else — the channel, recycling, the memory ceiling — is tested there
 

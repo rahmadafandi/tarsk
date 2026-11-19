@@ -33,6 +33,51 @@ blocks it until the inner layers finish, so a plain `with` block wraps the task 
 looks like it should. That costs a thread for the length of the task — the same trade sync
 handlers already make.
 
+An error tracker or a tracer is a middleware of a few lines, and neither needs anything from
+tarsk beyond what is above. Sentry, reporting only the attempt that was the last one:
+
+```python
+class Report:
+    async def execute(self, ctx, call):
+        try:
+            return await call()
+        except Exception:
+            sentry_sdk.set_tag("task", ctx.name)
+            sentry_sdk.set_context("tarsk", {"id": ctx.task_id, "attempt": ctx.attempt})
+            sentry_sdk.capture_exception()
+            raise
+```
+
+OpenTelemetry, with the trace carried from the send to the run in `meta`, which travels
+beside the arguments and so changes no handler's signature:
+
+```python
+class Traced:
+    def before_send(self, ctx):                      # in the producer
+        opentelemetry.propagate.inject(ctx.meta)
+
+    async def execute(self, ctx, call):              # in the worker
+        parent = opentelemetry.propagate.extract(ctx.meta)
+        with tracer.start_as_current_span(ctx.name, context=parent):
+            return await call()
+```
+
+## Testing a task
+
+A task is still the function it decorates. Calling it runs it, here, with no broker:
+
+```python
+def test_charge_rounds_down():
+    assert charge(order_id=7) == 1299
+```
+
+That covers the handler and nothing around it. To run tasks as a worker would — in a child
+process, through the retries, the timeouts and the middleware — without a server, use the
+in-memory broker, which takes a list of jobs, runs them and hands back every outcome.
+[`examples/memory/01_batch.py`](https://github.com/rahmadafandi/tarsk/blob/main/examples/memory/01_batch.py)
+is that in one file. For a dependency that should be something else under test,
+`app.override(pool, fake_pool)` swaps what `Depends(pool)` resolves to.
+
 ## Being asked before being stopped
 
 ```python
@@ -119,6 +164,21 @@ def parse(blob, ctx=Depends(Context)):
 delays the moment someone looks at it. `Retry` is still charged an attempt: a retry that costs
 nothing is an infinite loop with extra steps, and the thing being waited on is usually the
 thing least able to absorb one.
+
+`retry_on=` and `no_retry_on=` say the same thing ahead of time, by exception class:
+
+```python
+@app.task(retries=5, retry_on=(ConnectionError, TimeoutError))
+def fetch(url): ...
+
+@app.task(retries=5, no_retry_on=ValidationError)
+def ingest(row): ...
+```
+
+With `retry_on`, only those failures are tried again; with `no_retry_on`, everything but
+those. A failure that is not retried goes to the dead letters at once, under its own name and
+with its own traceback. Subclasses count, and `no_retry_on` wins where both match. `Retry` and
+`Reject` raised by the handler are unaffected: they are already a decision.
 
 `backoff="exp"` waits one second, then two, doubling to sixty-four, each jittered so a
 dependency coming back is not hit by every retry at once. `backoff_base=` and `backoff_max=`
